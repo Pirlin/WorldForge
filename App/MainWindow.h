@@ -7,6 +7,8 @@ class ContentBrowser;
 class Outliner;
 class StudioWorkspace;
 class Viewport;
+class LiveViewport;
+class ModelingWorkspace;
 class QLabel;
 class QListView;
 class QMenu;
@@ -15,6 +17,7 @@ class QStackedWidget;
 class QStandardItemModel;
 class QTabBar;
 class QToolBar;
+class QToolButton;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -35,6 +38,7 @@ private:
     void createDocks();
     void createStatusBar();
     void resetLayout();
+    void setWorldLive(bool live);
     void switchWorkspace(int index);
     StudioWorkspace *studio(int index);
     void refreshProjects();
@@ -65,9 +69,15 @@ private:
     QLabel *statusReady_ = nullptr;
     QLabel *statusProject_ = nullptr;
     QLabel *statusWorkspace_ = nullptr;
+    QLabel *statusRenderer_ = nullptr;
     QList<QWidget *> statusMetrics_;
     Outliner *outliner_ = nullptr;
     Viewport *viewport_ = nullptr;
+    LiveViewport *liveWorld_ = nullptr;
+    QStackedWidget *worldViews_ = nullptr;
+    QToolButton *worldLiveToggle_ = nullptr;
+    QString worldViewProject_;
+    ModelingWorkspace *modeling_ = nullptr;
     ContentBrowser *browser_ = nullptr;
     QList<QDockWidget *> docks_;
     QList<QStackedWidget *> dockPages_;

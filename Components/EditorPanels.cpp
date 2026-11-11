@@ -848,14 +848,16 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     connect(import, &QToolButton::clicked, this, [this] {
         if (!store_.project())
             return;
-        const auto file = QFileDialog::getOpenFileName(this, tr("Import demo asset"));
+        const auto file = QFileDialog::getOpenFileName(this, tr("Import GLB"), {}, tr("Binary glTF (*.glb)"));
         if (file.isEmpty())
             return;
-        store_.addObject("Static Mesh", "Props");
-        auto object = *store_.selectedObject();
-        object.name = QFileInfo(file).completeBaseName().left(64);
-        store_.updateObject(object, tr("Name imported demo asset"));
-        appendLog(tr("Added a demo record for %1.").arg(QFileInfo(file).fileName()));
+        QString error;
+        if (!store_.importMesh(file, error)) {
+            appendLog(tr("Import failed: %1").arg(error));
+            return;
+        }
+        appendLog(tr("Imported %1.").arg(QFileInfo(file).fileName()));
+        emit meshImported();
     });
     auto *save = textButton("save", tr("Save All"));
     connect(save, &QToolButton::clicked, this, &ContentBrowser::saveRequested);

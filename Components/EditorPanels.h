@@ -75,6 +75,7 @@ signals:
     void closeRequested();
     void floatRequested();
     void saveRequested();
+    void meshImported();
 
 private:
     void rebuild();

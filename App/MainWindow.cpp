@@ -1,9 +1,11 @@
 #include "App/MainWindow.h"
 
 #include "Components/EditorPanels.h"
+#include "Components/LiveViewport.h"
 #include "Components/Viewport.h"
 #include "DesignSystem/Icons.h"
 #include "Workspaces/StudioWorkspace.h"
+#include "Workspaces/ModelingWorkspace.h"
 #include "Workspaces/WorkspaceCatalog.h"
 
 #include <QActionGroup>
@@ -46,6 +48,7 @@
 
 namespace {
 constexpr int World = 1;
+constexpr int Modeling = 2;
 constexpr int LayoutVersion = 2;
 constexpr int StudioLayoutVersion = 3;
 constexpr int ProjectIdRole = Qt::UserRole + 1;
@@ -541,19 +544,50 @@ QWidget *MainWindow::createEditor()
     closeView->setIcon(editorIcon("close"));
     closeView->setIconSize({12, 12});
     closeView->setToolTip(tr("Close viewport"));
-    connect(closeView, &QToolButton::clicked, this, [this, tab] { viewport_->hide(); tab->hide(); });
+    connect(closeView, &QToolButton::clicked, this, [this, tab] { worldViews_->hide(); tab->hide(); });
     tabRow->addWidget(closeView);
     row->addWidget(tab);
     auto *addView = new QToolButton(header);
     addView->setIcon(editorIcon("plus"));
     addView->setToolTip(tr("Show viewport"));
-    connect(addView, &QToolButton::clicked, this, [this, tab] { viewport_->show(); tab->show(); });
+    connect(addView, &QToolButton::clicked, this, [this, tab] { worldViews_->show(); tab->show(); });
     row->addWidget(addView);
+    worldLiveToggle_ = new QToolButton(header);
+    worldLiveToggle_->setText(tr("Live 3D"));
+    worldLiveToggle_->setCheckable(true);
+    connect(worldLiveToggle_, &QToolButton::toggled, this, &MainWindow::setWorldLive);
+    row->addWidget(worldLiveToggle_);
+    auto *cube = new QToolButton(header);
+    cube->setText(tr("Add Cube"));
+    connect(cube, &QToolButton::clicked, this, [this] {
+        store_.addCube();
+        worldLiveToggle_->setChecked(true);
+        if (liveWorld_)
+            liveWorld_->frame();
+    });
+    row->addWidget(cube);
+    auto *modeling = new QToolButton(header);
+    modeling->setText(tr("Edit Mesh"));
+    connect(modeling, &QToolButton::clicked, this, [this] { switchWorkspace(Modeling); });
+    row->addWidget(modeling);
     row->addStretch();
     layout->addWidget(header);
-    viewport_ = new Viewport(store_, editor);
-    layout->addWidget(viewport_, 1);
+    worldViews_ = new QStackedWidget(editor);
+    viewport_ = new Viewport(store_, worldViews_);
+    worldViews_->addWidget(viewport_);
+    layout->addWidget(worldViews_, 1);
     return editor;
+}
+
+void MainWindow::setWorldLive(bool live)
+{
+    if (live && !liveWorld_) {
+        liveWorld_ = new LiveViewport(store_, false, worldViews_);
+        worldViews_->addWidget(liveWorld_);
+        connect(liveWorld_, &LiveViewport::rendererStatusChanged, this, [this] { refreshStatus(); });
+    }
+    worldViews_->setCurrentWidget(live ? static_cast<QWidget *>(liveWorld_) : viewport_);
+    refreshStatus();
 }
 
 void MainWindow::createDocks()
@@ -624,6 +658,11 @@ void MainWindow::createDocks()
     connect(inspector, &Inspector::floatRequested, this, [this] { docks_[1]->setFloating(!docks_[1]->isFloating()); });
     connect(browser_, &ContentBrowser::floatRequested, this, [this] { docks_[2]->setFloating(!docks_[2]->isFloating()); });
     connect(browser_, &ContentBrowser::saveRequested, this, [this] { saveProject(true); });
+    connect(browser_, &ContentBrowser::meshImported, this, [this] {
+        worldLiveToggle_->setChecked(true);
+        if (liveWorld_)
+            liveWorld_->frame();
+    });
     windowMenu_->addSeparator();
     windowMenu_->addAction(tr("Reset panel layout"), this, [this] {
         if (activeWorkspace_ == 0)
@@ -696,9 +735,8 @@ void MainWindow::createStatusBar()
     row->addStretch(1);
     divider();
     row->addWidget(iconLabel("layers", left));
-    auto *renderer = new QLabel(tr("Renderer: Vulkan (RTX)"), left);
-    renderer->setToolTip(tr("Sample renderer status for the frontend preview"));
-    row->addWidget(renderer);
+    statusRenderer_ = new QLabel(left);
+    row->addWidget(statusRenderer_);
     row->addStretch(1);
     bar->addWidget(left, 1);
     statusWorkspace_ = new QLabel(bar);
@@ -708,6 +746,8 @@ void MainWindow::createStatusBar()
 
 void MainWindow::resetLayout()
 {
+    if (activeWorkspace_ == Modeling)
+        return;
     const QList<Qt::DockWidgetArea> areas{Qt::LeftDockWidgetArea, Qt::RightDockWidgetArea, Qt::BottomDockWidgetArea};
     for (qsizetype i = 0; i < docks_.size(); ++i) {
         auto *dock = docks_[i];
@@ -746,7 +786,7 @@ void MainWindow::switchWorkspace(int index)
     if (index == activeWorkspace_)
         return;
     const bool home = index == 0;
-    if (activeWorkspace_ > 0)
+    if (activeWorkspace_ > 0 && activeWorkspace_ != Modeling)
         workspaceLayouts_.insert(activeWorkspace_, saveState(workspaceLayoutVersion(activeWorkspace_)));
     for (auto *dock : docks_)
         dock->hide();
@@ -759,10 +799,16 @@ void MainWindow::switchWorkspace(int index)
     }
     workspaceActions_[index]->setChecked(true);
     for (auto *dock : docks_)
-        dock->toggleViewAction()->setEnabled(!home);
+        dock->toggleViewAction()->setEnabled(!home && index != Modeling);
 
     if (home) {
         pages_->setCurrentIndex(0);
+    } else if (index == Modeling) {
+        if (!modeling_) {
+            modeling_ = new ModelingWorkspace(store_, pages_);
+            pages_->addWidget(modeling_);
+        }
+        pages_->setCurrentWidget(modeling_);
     } else {
         const auto &workspace = workspaces().at(index);
         QStringList titles{tr("Scene Outliner"), tr("Details"), tr("Content Browser")};
@@ -794,6 +840,8 @@ void MainWindow::switchWorkspace(int index)
     }
     if (index != World)
         play_->setChecked(false);
+    else if (!liveWorld_ && store_.selectedMesh())
+        worldLiveToggle_->setChecked(true);
     refreshStatus();
 }
 
@@ -819,6 +867,15 @@ void MainWindow::refreshProjects()
             projectList_->setCurrentIndex(item->index());
     }
     const bool hasProject = active != nullptr;
+    const auto id = active ? active->id : QString();
+    if (worldViewProject_ != id) {
+        worldViewProject_ = id;
+        worldLiveToggle_->setChecked(active && std::ranges::any_of(active->objects, [](const SceneObject &object) {
+            return !object.meshAsset.isEmpty();
+        }));
+        if (liveWorld_)
+            liveWorld_->frame();
+    }
     renameProject_->setEnabled(hasProject);
     deleteProject_->setEnabled(hasProject);
     openWorld_->setEnabled(hasProject);
@@ -834,6 +891,9 @@ void MainWindow::refreshStatus()
     statusReady_->setText(play_->isChecked() ? tr("Simulating") : tr("Ready"));
     statusProject_->setText(tr("Project: %1%2").arg(projectName, store_.isDirty() ? "*" : ""));
     statusWorkspace_->setText(workspace.name);
+    statusRenderer_->setText(activeWorkspace_ == World && worldLiveToggle_->isChecked()
+        ? (liveWorld_ && liveWorld_->hasRenderedFrame() ? tr("Renderer: Vulkan") : tr("Live 3D"))
+        : activeWorkspace_ == Modeling ? tr("Mesh authoring") : tr("Reference preview"));
     setWindowTitle(tr("WorldForge — %1%2 — %3").arg(projectName, store_.isDirty() ? "*" : "", workspace.name));
     save_->setEnabled(project != nullptr || store_.isDirty());
     play_->setEnabled(activeWorkspace_ == World && project != nullptr);
@@ -937,7 +997,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
     }
     QSettings settings;
     settings.setValue("window/geometry", saveGeometry());
-    if (activeWorkspace_ > 0)
+    if (activeWorkspace_ > 0 && activeWorkspace_ != Modeling)
         workspaceLayouts_.insert(activeWorkspace_, saveState(workspaceLayoutVersion(activeWorkspace_)));
     for (auto it = workspaceLayouts_.cbegin(); it != workspaceLayouts_.cend(); ++it)
         settings.setValue(workspaceLayoutKey(it.key()), it.value());

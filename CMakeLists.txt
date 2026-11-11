@@ -33,6 +33,8 @@ if(NOT WORLDFORGE_BUILD_EDITOR)
     return()
 endif()
 
+find_path(Vulkan_INCLUDE_DIR NAMES vulkan/vulkan.h
+    HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{LOCALAPPDATA}/WorldForge/Vulkan/Vulkan-Headers/include")
 find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg)
 qt_standard_project_setup()
 
@@ -47,6 +49,7 @@ set(editor_sources
     Workspaces/WorkspaceCatalog.h Workspaces/WorkspaceCatalog.cpp
     Workspaces/StudioWorkspace.h Workspaces/StudioWorkspace.cpp
     Workspaces/StudioViews.h Workspaces/StudioViews.cpp
+    Workspaces/ModelingWorkspace.h Workspaces/ModelingWorkspace.cpp
 )
 set(concept_art
     Docs/file_000000000a4481f5b152fe135f0875fb.png
@@ -68,9 +71,6 @@ set(concept_art
 
 find_program(WORLDFORGE_GLSLANG NAMES glslang glslangValidator
     HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{LOCALAPPDATA}/WorldForge/Vulkan/glslang-16.6.0/bin")
-if(NOT Vulkan_INCLUDE_DIR AND EXISTS "$ENV{LOCALAPPDATA}/WorldForge/Vulkan/Vulkan-Headers/include/vulkan/vulkan.h")
-    set(Vulkan_INCLUDE_DIR "$ENV{LOCALAPPDATA}/WorldForge/Vulkan/Vulkan-Headers/include")
-endif()
 if(Vulkan_INCLUDE_DIR AND WORLDFORGE_GLSLANG)
     foreach(shader Scene.vert Scene.frag)
         set(output "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader}.spv")

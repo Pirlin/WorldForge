@@ -9,6 +9,7 @@
 #include <QtEndian>
 
 #include <bit>
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -192,7 +193,7 @@ private:
         const int count = indices ? indices->count : positions.count;
         require(count % 3 == 0 && mesh_.faces.size() + count/3 <= limit,
                 QStringLiteral("GLB index count does not describe complete triangles within the geometry limit."));
-        const int material = integer(primitive.value("material")) + 1;
+        const auto material = qint64(integer(primitive.value("material"))) + 1;
         require(material >= 0 && std::size_t(material) < mesh_.materials.size(), QStringLiteral("GLB material is missing."));
         const auto determinant = matrix.determinant();
         require(matrix.isAffine() && std::isfinite(determinant) && determinant != 0,

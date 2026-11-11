@@ -72,10 +72,12 @@ Mesh makeCube()
     const std::array<std::array<VertexIndex, 4>, 6> faces{{{3,2,1,0}, {4,5,6,7}, {0,1,5,4},
                                                            {1,2,6,5}, {2,3,7,6}, {3,0,4,7}}};
     const std::array<Point2, 4> uv{{{0,0}, {1,0}, {1,1}, {0,1}}};
-    for (const auto &indices : faces) {
+    for (std::size_t faceIndex = 0; faceIndex < faces.size(); ++faceIndex) {
+        const auto &indices = faces[faceIndex];
         MeshFace face;
         for (std::size_t i = 0; i < indices.size(); ++i)
-            face.corners.push_back({indices[i], uv[i]});
+            face.corners.push_back({indices[i], {(uv[i][0]*0.9f + float(faceIndex%3))/3,
+                                                 (uv[i][1]*0.9f + float(faceIndex/3))/2}});
         cube.faces.push_back(std::move(face));
     }
     return cube;
