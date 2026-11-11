@@ -1,0 +1,160 @@
+{
+  "activeProject": "mythic-valley",
+  "selection": "castle-main",
+  "projects": [
+    {
+      "id": "mythic-valley",
+      "name": "MythicValley",
+      "objects": [
+        {
+          "id": "landscape",
+          "name": "Landscape",
+          "type": "Landscape",
+          "group": "Environment",
+          "material": "M_Valley_Grass"
+        },
+        {
+          "id": "foliage",
+          "name": "Foliage",
+          "type": "Foliage",
+          "group": "Environment",
+          "material": "M_Valley_Grass"
+        },
+        {
+          "id": "rocks",
+          "name": "Rocks",
+          "type": "Folder",
+          "group": "Environment",
+          "material": ""
+        },
+        {
+          "id": "river",
+          "name": "Water",
+          "type": "Folder",
+          "group": "Environment",
+          "material": "M_Silverwater"
+        },
+        {
+          "id": "sun",
+          "name": "DirectionalLight",
+          "type": "Directional Light",
+          "group": "Lighting",
+          "material": ""
+        },
+        {
+          "id": "sky",
+          "name": "SkyAtmosphere",
+          "type": "Sky Atmosphere",
+          "group": "Lighting",
+          "material": ""
+        },
+        {
+          "id": "sky-light",
+          "name": "SkyLight",
+          "type": "Sky Light",
+          "group": "Lighting",
+          "material": ""
+        },
+        {
+          "id": "fog",
+          "name": "ExponentialHeightFog",
+          "type": "HeightFog",
+          "group": "Lighting",
+          "material": ""
+        },
+        {
+          "id": "castle-main",
+          "name": "Castle_Main",
+          "type": "Static Mesh",
+          "group": "Ruins",
+          "material": "M_Castle_Stone",
+          "position": [
+            12568,
+            420,
+            3620
+          ],
+          "rotation": [
+            0,
+            -15,
+            0
+          ]
+        },
+        {
+          "id": "castle-tower",
+          "name": "Castle_Tower_A",
+          "type": "Static Mesh",
+          "group": "Ruins",
+          "material": "M_Castle_Stone"
+        },
+        {
+          "id": "castle-tower-b",
+          "name": "Castle_Tower_B",
+          "type": "Static Mesh",
+          "group": "Ruins",
+          "material": "M_Castle_Stone"
+        },
+        {
+          "id": "castle-wall",
+          "name": "Castle_Wall_A",
+          "type": "Static Mesh",
+          "group": "Ruins",
+          "material": "M_Castle_Moss"
+        },
+        {
+          "id": "archway",
+          "name": "Archway",
+          "type": "Static Mesh",
+          "group": "Ruins",
+          "material": "M_Castle_Moss"
+        },
+        {
+          "id": "statue-left",
+          "name": "Statue_Knight_L",
+          "type": "Static Mesh",
+          "group": "Ruins",
+          "material": "M_Castle_Stone"
+        },
+        {
+          "id": "statue-right",
+          "name": "Statue_Knight_R",
+          "type": "Static Mesh",
+          "group": "Ruins",
+          "material": "M_Castle_Stone"
+        },
+        {
+          "id": "hero-knight",
+          "name": "Hero_Knight",
+          "type": "Character",
+          "group": "Props",
+          "material": "M_Knight_Armor"
+        },
+        {
+          "id": "player-start",
+          "name": "PlayerStart",
+          "type": "PlayerStart",
+          "group": "Gameplay",
+          "material": ""
+        },
+        {
+          "id": "navmesh",
+          "name": "NavMeshBoundsVolume",
+          "type": "NavMeshVolume",
+          "group": "Gameplay",
+          "material": ""
+        },
+        {
+          "id": "spawner",
+          "name": "AI_Spawner",
+          "type": "AISpawner",
+          "group": "Gameplay",
+          "material": ""
+        }
+      ]
+    },
+    {
+      "id": "forge-sandbox",
+      "name": "Forge Sandbox",
+      "objects": []
+    }
+  ]
+}

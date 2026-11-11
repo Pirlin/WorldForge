@@ -1,0 +1,110 @@
+{
+  "project": "WorldForge",
+  "schemaVersion": "3.0",
+  "status": "proposed only",
+  "platformTargets": {
+    "editor": [
+      "Windows",
+      "macOS",
+      "Linux"
+    ],
+    "initialPlayer": [
+      "Windows"
+    ],
+    "futurePlayer": [
+      "Linux",
+      "macOS",
+      "other approved targets"
+    ]
+  },
+  "languages": {
+    "mandatoryInitial": [
+      "C++20",
+      "GLSL/SPIR-V"
+    ],
+    "future": [
+      "C#"
+    ],
+    "optionalNonRuntime": [
+      "Python"
+    ]
+  },
+  "releases": [
+    {
+      "phase": "F0",
+      "name": "First Light",
+      "requires": [
+        "Qt shell",
+        "Vulkan cube",
+        "ECS IDs",
+        "Inspector/Outliner",
+        "save/reopen",
+        "undo",
+        "CI"
+      ],
+      "evidence": "reproducible demo"
+    },
+    {
+      "phase": "F1",
+      "name": "Real 3D authoring",
+      "requires": [
+        "GLB import",
+        "asset registry",
+        "PBR basics",
+        "first Player"
+      ],
+      "evidence": "playable scene"
+    },
+    {
+      "phase": "F2",
+      "name": "Indie production",
+      "requires": [
+        "physics",
+        "animation",
+        "audio",
+        "UI",
+        "gameplay",
+        "Windows export",
+        "AI basic"
+      ],
+      "evidence": "small shipped original game"
+    },
+    {
+      "phase": "F3",
+      "name": "Integrated studio",
+      "requires": [
+        "modeling modes",
+        "character pipeline",
+        "VFX",
+        "cinematics",
+        "plugin SDK",
+        "AI retrieval"
+      ],
+      "evidence": "outside creators completing tasks"
+    },
+    {
+      "phase": "F4",
+      "name": "Large-world beta",
+      "requires": [
+        "streaming",
+        "HLOD",
+        "traffic",
+        "crowds",
+        "Living City district",
+        "profiling"
+      ],
+      "evidence": "route performance benchmark"
+    },
+    {
+      "phase": "F5",
+      "name": "AAA research platform",
+      "requires": [
+        "advanced realism",
+        "simulation",
+        "creator agents",
+        "large-world developer trials"
+      ],
+      "evidence": "independent benchmark and reliability review"
+    }
+  ]
+}

@@ -1,0 +1,573 @@
+{
+  "Modeling": {
+    "navigator": "Model Outliner",
+    "inspector": "Details",
+    "items": [
+      ["VT-42_Raven","Static Mesh",null,[["Body","Folder",null,[["Hull_Main","Mesh"],["Hull_Top","Mesh"],["Hull_Bottom","Mesh"],["Cockpit","Mesh"],["Canopy_Frame","Mesh"],["Canopy_Glass","Mesh"]]],["Wing_L","Folder",null,[["Wing_L_Root","Mesh"],["Wing_L_Panel","Mesh"],["Wing_L_Tip","Mesh"]]],["Wing_R","Folder",null,[["Wing_R_Root","Mesh"],["Wing_R_Panel","Mesh"],["Wing_R_Tip","Mesh"]]],["Engine","Folder",null,[["Engine_L","Mesh"],["Engine_R","Mesh"]]],["LandingGear","Folder",null,[["Gear_Front","Mesh"],["Gear_L","Mesh"],["Gear_R","Mesh"]]],["Details","Folder",null,[["Antenna","Mesh"],["Sensor_Array","Mesh"]]]]]
+    ],
+    "properties": [
+      ["Modifier Stack",[["",{"stack":["Subdivision (Catmull-Clark)","Bevel (Edges)","Boolean (Subtract)","Mirror (X)"],"add":["Subdivision (Catmull-Clark)","Bevel (Edges)","Boolean (Subtract)","Mirror (X)","Decimate"]}]],true],
+      ["Transform",[["Location",{"vector":[0,1.25,2.48]}],["Rotation",{"vector":[0,0,0]}],["Scale",{"vector":[1,1,1]}]],true],
+      ["Mesh",[["Mesh Asset",["SM_Cockpit","SM_VT42_Raven","SM_Wing_L","SM_Wing_R","SM_Engine"]],["Statistics","6,352 vertices  /  12,640 edges"],["Faces","6,320 faces  /  12,416 triangles"]],true],
+      ["Smoothing & Normals",[["Smoothing Groups",["Auto (Angle)","Flat","Smooth"]],["Angle Threshold",{"value":60,"min":0,"max":180,"decimals":0,"step":1}],["Auto Smooth",true],["Weighted Normals",true]],true],
+      ["Materials (1)",[["Element 0",["M_Cockpit_Glass","M_Raven_Alloy","M_Dark_Metal"]]],true]
+    ],
+    "surface": ["VT-42_Raven · Cockpit","art"],
+    "tools": [
+      ["Content Browser","split",[["Content","folders",[["Content",[["Environment"],["Characters"],["Vehicles",[["VT-42_Raven",[["Models"],["Materials"],["Textures"],["LODs"],["Variants"]]]]],["Props"],["Weapons"],["VFX"]]]]],["Models","gallery",[["SM_VT42_Raven","Static Mesh",[480,704,76,66]],["SM_Cockpit","Static Mesh",[569,704,76,66]],["SM_Wing_L","Static Mesh",[658,704,76,66]],["SM_Wing_R","Static Mesh",[747,704,76,66]],["SM_Engine","Static Mesh",[836,704,76,66]],["SM_LandingGear","Static Mesh",[925,704,76,66]]],[83,105],true],["UV (Cockpit)","image",[1015,708,184,186]]],"horizontal",[150,620,237]],
+      ["UV Editor","image",[1015,708,184,186]],
+      ["Tool Settings","table",["Tool","Setting","Value"],[["Bevel","Segments","3"],["Snap","Increment","0.25"],["Mirror","Axis","X"]]],
+      ["Modeling History","table",["Operation","Object"],[["Select edges","Cockpit"],["Apply bevel","Cockpit"],["Update normals","VT-42_Raven"]]]
+    ],
+    "selection": "Cockpit",
+    "dockSizes": [245,343,285],
+    "commandRows": [
+      ["Object","Vertex",{"mode":"Edge","selected":true},"Face","|","Extrude","Inset","Bevel","Loop Cut","Bridge","Knife","Weld",["Mirror","Mirror X","Mirror Y","Mirror Z"]],
+      ["Select","Move","Rotate","Scale","|",["Local","Global"],["Pivot","Median","Individual Origins"],["Snap","Vertex","Grid"],["Normals","Face","Vertex"],["Shaded","Wireframe","MatCap"]]
+    ],
+    "settings": ["Modeling Settings",[["Tool Settings",[["Element",["Edge","Vertex","Face","Object"]],["Tool",["Select","Extrude","Bevel","Inset","Loop Cut","Bridge","Knife","Weld"]],["Bevel Width",0.12],["Segments",3],["Symmetry",["Off","X","Y","Z"]]],true]]],
+    "commandsInViewport": true,
+    "viewportControls": [["Perspective","Orthographic","Top","Front"],["Lit","Unlit","Wireframe"],["Show","Grid","Statistics","Selection Outline"],"|",["0.25","0.5","1.0","2.0"]]
+  },
+  "Sculpting": {
+    "navigator": "Sculpt Outliner",
+    "inspector": "Details",
+    "items": [
+      ["StoneGuardian","SculptAsset",null,[["Sculpt","Folder",null,[["Head","SculptMesh"],["Mane","SculptMesh"],["Horns","SculptMesh"],["Beard","SculptMesh"],["Body","SculptMesh"],["Armor","SculptMesh"],["Base","SculptMesh"]]],["Sculpt Layers (Head)","Folder",null,[["Detail_Pores","Layer"],["Armor_EdgeWear","Layer"],["Cracks","Layer"],["Surface_Noise","Layer"],["PrimaryDetail","Layer"],["SecondaryForms","Layer"],["Blockout","Layer"]]],["Masks","Folder",null,[["Mask_Eyes","Mask"],["Mask_Mane","Mask"],["Mask_Cracks","Mask"]]],["References","Folder",null,[["StoneGuardian_Concept","Image"],["Anatomy_Ref","Image"]]],["Sculpt Tools","Folder",null,[]]]]
+    ],
+    "properties": [
+      ["Active Brush",[["Preset",["Clay","Sculpt","Smooth","Grab","Crease","Inflate","Flatten","Scrape","Snake Hook"]]],true],
+      ["Symmetry",[["Enable Symmetry",true],["Axis",["X","Y","Z"]],["Radial",false],["Segments",8]],true],
+      ["Stroke",[["Spacing",{"value":0.1,"min":0,"max":1,"decimals":2,"step":0.01}],["Jitter",{"value":0,"min":0,"max":1,"decimals":2,"step":0.01}],["Stabilize",true],["Amount",{"value":0.3,"min":0,"max":1,"decimals":2,"step":0.01}]],true],
+      ["Falloff",[["Curve",["Smooth","Linear","Sharp","Flat"]]],true],
+      ["Brush Settings",[["Radius",{"value":64,"min":1,"max":512,"decimals":0,"step":1}],["Strength",{"value":0.75,"min":0,"max":1,"decimals":2,"step":0.01}],["Hardness",{"value":0.6,"min":0,"max":1,"decimals":2,"step":0.01}]],true],
+      ["Dynamesh / Remesh",[["Dynamesh",true],["Resolution",512],["Voxel Remesh",false]],true],
+      ["Subdivision / Multiresolution",[["Subdivision Level",4],["Multiresolution",false]],true],
+      ["Selected Sculpt Layer",[["Layer",["PrimaryDetail","Cracks","SecondaryForms"]],["Opacity",{"value":1,"min":0,"max":1,"decimals":2,"step":0.01}]],true]
+    ],
+    "surface": ["StoneGuardian_Sculpt","art"],
+    "tools": [
+      ["Content Browser","split",[["StoneGuardian / Sculpt","gallery",[["StoneGuardian","Sculpt Mesh",[534,734,67,65]],["SG_Head","Sculpt Mesh",[613,734,67,65]],["SG_Mane","Sculpt Mesh",[692,734,67,65]],["SG_Horns","Sculpt Mesh",[771,734,67,65]],["SG_Beard","Sculpt Mesh",[850,734,67,65]],["SG_Armor","Sculpt Mesh",[929,734,67,65]]],[84,105],true],["Alphas","gallery",[["Soft Round","",[1035,737,57,55]],["Stone","",[1105,737,57,55]],["Crackle","",[1175,737,57,55]],["Pores","",[1245,737,57,55]]],[67,79],false]],"horizontal",[675,290]],
+      ["Sculpt Layers","table",["Layer","Blend","Opacity"],[["PrimaryDetail","Add","100%"],["Cracks","Add","72%"],["SecondaryForms","Normal","100%"]]],
+      ["Brushes","gallery",[["Clay","",[1035,737,57,55]],["Smooth","",[1105,737,57,55]],["Crease","",[1175,737,57,55]],["Flatten","",[1245,737,57,55]]]],
+      ["History","table",["Action","Layer"],[["Sculpt stroke","PrimaryDetail"],["Paint mask","Mask_Eyes"]]]
+    ],
+    "selection": "Head",
+    "dockSizes": [266,350,250],
+    "commandRows": [
+      ["Sculpt","Smooth","Grab","Clay","Crease","Inflate","Flatten","Scrape","Snake Hook","Layer","Mask",["Symmetry X","Symmetry Y","Symmetry Z","Off"]],
+      [{"field":"Radius","value":64,"min":1,"max":512,"decimals":0,"suffix":" px"},{"field":"Strength","value":0.75,"min":0,"max":1,"decimals":2,"suffix":""},{"field":"Spacing","value":0.1,"min":0,"max":1,"decimals":2,"suffix":""},["Alpha","Soft Round","Stone","Crackle"],"|",{"check":"Dynamesh","checked":true},{"check":"Voxel Remesh","checked":false},["Subdiv: 4","Subdiv: 3","Subdiv: 2"]]
+    ],
+    "settings": ["Sculpt Settings",[["Sculpt Settings",[["Display",["MatCap","Lit","Wireframe"]],["Pressure",true],["Preserve Detail",true]],true]]],
+    "commandsInViewport": true,
+    "viewportControls": [["Perspective","Orthographic"],["MatCap","Lit","Wireframe"],["Show","Mask","Wireframe"],"|",["0.25","0.5","1.0"]]
+  },
+  "Texture": {
+    "navigator": "Texture Set / Asset Outliner",
+    "inspector": "Details",
+    "items": [
+      ["SK_Knight_Helmet_A","Skeletal Mesh",null,[["Mesh (3)","Folder",null,[["Helmet","Mesh"],["Cloth","Mesh"],["Leather","Mesh"]]],["Texture Sets (5)","Folder",null,[["Helmet","4K (4096²)"],["Trim","4K (4096²)"],["Cloth","4K (4096²)"],["Leather","4K (4096²)"],["Emblem","4K (4096²)"]]],["Materials (5)","Folder",null,[["M_Helmet_Base","Material"],["M_Trim_Gold","Material"],["M_Cloth_Cape","Material"],["M_Leather_Straps","Material"],["M_Emblem_Crest","Material"]]],["LOD Settings","Folder",null,[["LOD0","62,448 tris"],["LOD1","31,228 tris"],["LOD2","15,612 tris"],["LOD3","7,806 tris"]]]]]
+    ],
+    "properties": [
+      ["Active Brush",[["Preset",["Soft Round","Hard Round","Grunge","Stencil"]],["Size",{"value":64,"min":1,"max":512,"decimals":0,"step":1}],["Flow",{"value":85,"min":0,"max":100,"decimals":0,"step":1,"suffix":"%"}],["Hardness",{"value":0.75,"min":0,"max":1,"decimals":2,"step":0.01}],["Spacing",{"value":10,"min":0,"max":100,"decimals":0,"step":1,"suffix":"%"}],["Jitter",{"value":5,"min":0,"max":100,"decimals":0,"step":1,"suffix":"%"}]],true],
+      ["Material Instance",[["Material",["M_Helmet_Base (Instance)","M_Trim_Gold","M_Cloth_Cape"]]],true],
+      ["Channel Preview",[["",{"view":["Texture channels","gallery",[["Base Color","",[1356,369,55,49]],["Roughness","",[1434,369,55,49]],["Metallic","",[1512,369,55,49]],["Normal","",[1590,369,55,49]],["AO","",[1356,442,55,46]],["Height","",[1434,442,55,46]],["Emissive","",[1512,442,55,46]],["Mask","",[1590,442,55,46]]],[67,71],false],"height":151}]],true],
+      ["Export Preset",[["Format",["PBR (Game - ORM)","Metallic / Roughness","Texture Maps"]],["Albedo (Base Color)",true],["Normal",true],["ORM",true],["Emissive",true],["Resolution",["4096 × 4096 (4K)","2048 × 2048","8192 × 8192"]]],true],
+      ["Texture Set Settings",[["Texture Set","Helmet"],["Padding",["16 px","8 px","32 px"]],["Color Space",["sRGB (Albedo/Emissive)","Linear"]]],true],
+      ["Baking Settings",[["Bake from High Poly",true],["Use Cage",true],["Map Sources","HP_Helmet_A"],["Curvature",true]],false],
+      ["Shader Preview",[["Shader",["PBR Standard","Unlit","MatCap"]]],false]
+    ],
+    "surface": ["SK_Knight_Helmet_A","art"],
+    "tools": [
+      ["Layers","split",[["Layer Stack","layers",[["Decal Crest","Overlay",100,[338,665,28,22]],["Gold Trim","Normal",100,[338,694,28,22]],["Edge Wear","Add",68,[338,723,28,22]],["Dirt","Multiply",52,[338,752,28,22]],["Scratches","Add",75,[338,781,28,22]],["Dust Pass","Normal",40,[338,810,28,22]],["Mask - Painted Area","Normal",100,[338,839,28,22]],["Base Metal","Normal",100,[338,868,28,22]]]],["Smart Materials","gallery",[["Worn Metal","Material",[692,669,59,61]],["Polished Metal","Material",[769,669,59,61]],["Gilded Metal","Material",[846,669,59,61]],["Brushed Steel","Material",[923,669,59,61]],["Weathered Iron","Material",[692,760,59,61]],["Ancient Bronze","Material",[769,760,59,61]],["Painted Metal","Material",[846,760,59,61]],["Engraved Metal","Material",[923,760,59,61]]],[76,88],true],["UV / Texture Preview","image",[1013,662,294,223]]],"horizontal",[360,325,320]],
+      ["Smart Materials","gallery",[["Worn Metal","Material",[692,669,59,61]],["Polished Metal","Material",[769,669,59,61]],["Gilded Metal","Material",[846,669,59,61]],["Brushed Steel","Material",[923,669,59,61]]]],
+      ["Masks","table",["Mask","Layer"],[["Painted Area","Decal Crest"],["Curvature","Edge Wear"],["Ambient Occlusion","Dirt"]]],
+      ["Channels","table",["Channel","Format"],[["Base Color","RGBA8"],["Normal","RGB8"],["Roughness","R8"],["Metallic","R8"],["AO","R8"]]],
+      ["History","table",["Action","Layer"],[["Add decal","Decal Crest"],["Paint stroke","Gold Trim"],["Bake maps","Helmet"]]]
+    ],
+    "selection": "/SK_Knight_Helmet_A/Texture Sets (5)/Helmet",
+    "dockSizes": [234,339,300],
+    "commandRows": [
+      ["Paint","Fill","Projection","Erase","Smudge","Blur","Clone","Color Picker","Polygon Fill","Stencil",["Symmetry X","Symmetry Y","Symmetry Z","Off"]],
+      [{"field":"Size","value":64,"min":1,"max":512,"decimals":0,"suffix":""},{"field":"Flow","value":85,"min":0,"max":100,"decimals":0,"suffix":"%"},{"field":"Hardness","value":0.75,"min":0,"max":1,"decimals":2,"suffix":""},{"field":"Spacing","value":10,"min":0,"max":100,"decimals":0,"suffix":"%"},{"field":"Jitter","value":5,"min":0,"max":100,"decimals":0,"suffix":"%"},{"check":"Pressure Size","checked":true},{"check":"Pressure Flow","checked":true}]
+    ],
+    "settings": ["Texture Settings",[["Document",[["Resolution",["4096","2048","8192"]],["Color Space",["sRGB","Linear"]],["Pressure Size",true],["Pressure Flow",true]],true]]],
+    "commandsInViewport": true,
+    "viewportControls": [["Perspective","Orthographic"],["Lit","Unlit"],"|","Base Color","Roughness","Metallic","Normal","AO","Height","Emissive",["RGB","Red","Green","Blue"]]
+  },
+  "Material": {
+    "navigator": "Material Library",
+    "inspector": "Inspector",
+    "items": [
+      ["Project Materials","Folder",null,[["Architecture","Folder",null,[]],["Environment","Folder",null,[]],["Characters","Folder",null,[]],["Props","Folder",null,[]],["Vehicles","Folder",null,[]],["Weapons","Folder",null,[]],["VFX","Folder",null,[]],["Surfaces","Folder",null,[]]]],
+      ["Favorites","Folder",null,[["M_Rock_Moss","PBR Material"]]],
+      ["Engine Library","Folder",null,[["PBR Materials","Folder",null,[]],["Smart Materials","Folder",null,[]],["Procedural","Folder",null,[]],["Substance (Import)","Folder",null,[]],["Megascans (Import)","Folder",null,[]]]]
+    ],
+    "properties": [
+      ["Base Properties",[["Shader Model",["PBR (Lit)","Unlit","Clear Coat"]],["Workflow",["Metallic / Roughness","Specular / Gloss"]],["Two Sided",false],["Transparent",false]],true],
+      ["Material Maps",[["Base Color","T_Rock_Moss_Base"],["Normal","T_Rock_Normal"],["Roughness","T_Rock_Roughness"],["Metallic","T_Rock_Metallic"],["Ambient Occlusion","T_Rock_AO"],["Height / Displacement","T_Rock_Height"]],true],
+      ["Surface Parameters",[["Roughness",{"value":0.52,"min":0,"max":1,"decimals":2,"step":0.01}],["Metallic",{"value":0.08,"min":0,"max":1,"decimals":2,"step":0.01}],["Specular",{"value":0.5,"min":0,"max":1,"decimals":2,"step":0.01}],["Emissive",{"value":0,"min":0,"max":1,"decimals":2,"step":0.01}]],true],
+      ["Advanced",[["Ray Tracing",true],["Use Displacement",false]],false]
+    ],
+    "surface": ["Material Preview","art"],
+    "tools": [
+      ["Material Assets","gallery",[["M_Rock_Moss","PBR",[31,762,80,78]],["M_Rock_Wet","PBR",[139,762,80,78]],["M_Stone_Wall","PBR",[247,762,80,78]],["M_Cliff","PBR",[355,762,80,78]],["M_Gravel","PBR",[463,762,80,78]],["M_Dirt","PBR",[571,762,80,78]],["M_Sand","PBR",[679,762,80,78]],["M_Wood_Oak","PBR",[787,762,80,78]],["M_Wood_Worn","PBR",[895,762,80,78]],["M_Metal_Steel","PBR",[1003,762,80,78]],["M_Metal_Rust","PBR",[1111,762,80,78]],["M_Concrete","PBR",[1219,762,80,78]]],[91,110],true],
+      ["Procedural","table",["Function","Output"],[["Detail Noise","Grayscale"],["Height Blend","Mask"]]],
+      ["Smart Materials","table",["Material","Workflow"],[["Rock Moss","PBR"],["Oxidized Steel","PBR"]]],
+      ["Functions","table",["Node","Type"],[["Multiply","Math"],["Texture Sample","Texture"]]]
+    ],
+    "companion": ["Material Graph","graph",["Base Color","Normal Texture","Roughness","Multiply","Detail Noise","PBR Material"],{"positions":[[4,7],[4,86],[4,165],[177,9],[176,222],[343,90]],"edges":[[0,3],[3,5],[1,5],[2,5],[4,5]],"colors":["#552789","#552789","#552789","#552789","#552789","#552789"],"pins":[["Texture","RGB"],["Texture","Normal"],["Texture","Channel R"],["A","B"],["Scale","Strength"],["Base Color","Normal","Roughness","Metallic","AO"]]}],
+    "selection": "M_Rock_Moss",
+    "dockSizes": [221,335,188],
+    "commandRows": [
+      ["Preview",["PBR (Ray Traced)","PBR (Raster)","Unlit"],["Studio HDRI","Outdoor","Neutral"],["Ultra","High","Draft"],["Sphere","Cube","Plane"]]
+    ],
+    "settings": ["Material Settings",[["Preview",[["Lighting",["Studio HDRI","Outdoor"]],["Quality",["Ultra","High","Draft"]],["Live Preview",true]],true]]]
+  },
+  "Character": {
+    "navigator": "Character Library",
+    "inspector": "Inspector",
+    "items": [
+      ["Project Characters","Folder",null,[["Hero_Knight","Character","hero-knight"],["Hero_Archer","Character"],["Hero_Mage","Character"],["Hero_Rogue","Character"]]],
+      ["NPCs","Folder",null,[]],
+      ["Enemies","Folder",null,[]],
+      ["Creatures","Folder",null,[]],
+      ["Humanoids","Folder",null,[]],
+      ["Monsters","Folder",null,[]],
+      ["Cinematics","Folder",null,[]],
+      ["Demos","Folder",null,[]]
+    ],
+    "properties": [
+      ["Transform",[["Position X",0],["Rotation Y",0],["Scale",1]],true],
+      ["Character Properties",[["Type",["Humanoid","Creature","NPC"]],["Gender",["Male","Female"]],["Height (m)",{"value":1.82,"min":1,"max":3,"decimals":2,"step":0.01}],["Weight (kg)",{"value":78,"min":35,"max":150,"decimals":0,"step":1}],["Body Type",["Athletic","Heavy","Slim"]]],true],
+      ["Mesh & LOD",[["Skeletal Mesh","SK_Hero_Knight"],["LOD Count",4],["LOD 0","128,540 triangles"],["LOD 1","64,280 triangles"],["LOD 2","32,410 triangles"]],true],
+      ["Materials",[["Armor",["Knight Armor","Travel Gear","Training Armor"]],["Cape",true]],false],
+      ["Hair & Grooming",[["Hair",["Swept","Short","Long"]],["Roughness",{"value":0.35,"min":0,"max":1,"decimals":2,"step":0.01}]],false],
+      ["Animation",[["Preview Pose",["A-Pose","T-Pose","Combat"]]],false]
+    ],
+    "surface": ["Character Viewport","art"],
+    "tools": [
+      ["Appearance","gallery",[["Neutral","Expression",[578,706,88,123]],["Angry","Expression",[684,706,88,123]],["Focused","Expression",[790,706,88,123]],["Surprised","Expression",[896,706,88,123]],["Talking","Expression",[1002,706,88,123]],["Smirk","Expression",[1108,706,88,123]],["Determined","Expression",[1214,706,88,123]]],[92,136],true],
+      ["Body","table",["Control","Value"],[["Body Type","Athletic"],["Height","1.82 m"],["Weight","78 kg"]]],
+      ["Clothing","table",["Slot","Asset"],[["Chest","Knight Armor"],["Back","Cloth Cape"],["Head","Knight Helm"]]],
+      ["Materials","table",["Slot","Material"],[["Skin","M_Hero_Skin"],["Armor","M_Knight_Armor"]]]
+    ],
+    "selection": "Hero_Knight",
+    "dockSizes": [245,333,245],
+    "commandRows": [
+      ["Edit","Mesh","Hair","Cloth","LookDev","LOD","|",["Pose: A-Pose","Pose: T-Pose","Pose: Combat"],["Perspective","Orthographic"],["High Quality","Draft"]]
+    ],
+    "library": ["Character Presets","gallery",[["Knight","",[20,568,76,66]],["Warrior","",[114,568,76,66]],["Archer","",[208,568,76,66]],["Mage","",[20,669,76,66]],["Rogue","",[114,669,76,66]],["Paladin","",[208,669,76,66]],["Viking","",[20,774,76,66]],["Assassin","",[114,774,76,66]],["Sorceress","",[208,774,76,66]]],[72,84],false],
+    "companion": ["Character Previews","split",[["Turnaround","image",[975,139,345,146]],["Mesh and Skeleton","image",[977,301,343,162]],["UVs and Face Detail","image",[976,476,344,162]]],"vertical",[140,158,158]],
+    "settings": ["Character Settings",[["Viewport",[["Show Skeleton",false],["Show UVs",true],["Quality",["High Quality","Draft"]]],true]]]
+  },
+  "Rigging": {
+    "navigator": "Rig Hierarchy",
+    "inspector": "Inspector",
+    "items": [
+      ["Hero_Knight","Skeletal Rig","hero-knight",[["Root","Bone",null,[["Pelvis","Bone",null,[["Spine_01","Bone",null,[["Spine_02","Bone",null,[["Spine_03","Bone",null,[["Chest","Bone",null,[["Clavicle_L","Bone",null,[["UpperArm_L","Bone",null,[["LowerArm_L","Bone",null,[["Hand_L","Bone"]]]]]]],["Clavicle_R","Bone"],["Neck","Bone",null,[["Head","Bone"]]]]]]]]]]],["Thigh_L","Bone",null,[["Calf_L","Bone",null,[["Foot_L","Bone"],["Toe_L","Bone"]]]]],["Thigh_R","Bone"]]]]],["IK","Folder",null,[]],["FK","Folder",null,[]],["Controls","Folder",null,[]],["Constraints","Folder",null,[]],["Deformers","Folder",null,[]]]]
+    ],
+    "properties": [
+      ["Bone Properties",[["Name","Hand_L"],["Parent",["LowerArm_L","UpperArm_L","Root"]],["Length (m)",0.217],["Position X",0],["Rotation X",0],["Scale",1]],true],
+      ["Constraints (2)",[["",{"stack":["Parent Constraint","IK Constraint"]}]],true],
+      ["IK / FK Setup",[["IK Chain",["Arm_L_IK","Leg_L_IK","Arm_R_IK"]],["IK Solver",["Two Bone (Analytic)","FABRIK","CCD"]],["Pole Vector",["PoleArm_L","PoleArm_R","None"]],["Blend (FK ↔ IK)",{"value":0,"min":0,"max":1,"decimals":2,"step":0.01}]],true],
+      ["Retargeting",[["Source Rig","Hero_Knight_Rig"]],false],
+      ["Deformers",[["Auto Normalize",true],["Mirror Weights",true]],false]
+    ],
+    "surface": ["Rig Viewport","art"],
+    "tools": [
+      ["Skin Weights","split",[["Weight Paint","image",[304,654,158,148]],["Bone Influences","table",["Bone","Influence"],[["LowerArm_L","0.742"],["UpperArm_L","0.218"],["Hand_L","0.032"],["Clavicle_L","0.008"]]],["Pose Library","gallery",[["T-Pose","",[1021,690,40,76]],["A-Pose","",[1072,690,40,76]],["Relaxed","",[1123,690,40,76]],["Combat","",[1174,690,40,76]],["Run","",[1225,690,40,76]],["Jump","",[1276,690,40,76]]],[63,95],false]],"horizontal",[170,315,425]],
+      ["Bone Influences","table",["Bone","Influence"],[["LowerArm_L","0.742"],["UpperArm_L","0.218"]]],
+      ["Constraints","graph",["Foot Control","Two Bone IK","Foot Bone"]],
+      ["Retargeting","table",["Source","Target"],[["Hero_Knight_Rig","Humanoid Skeleton"]]]
+    ],
+    "selection": "Hand_L",
+    "dockSizes": [236,333,263],
+    "commandRows": [
+      ["Rig","Skin Weights","Constraints","Retarget","Bake","Validate","|",["Pose: T-Pose","Pose: A-Pose","Pose: Combat"],["Perspective","Orthographic"],["Rig Controls","Skeleton","Weights"]]
+    ],
+    "companion": ["Rig Previews","split",[["Skeleton","image",[1008,130,312,150]],["Wireframe","image",[1008,294,312,150]],["Weight Map","image",[1008,456,312,140]]],"vertical",[1,1,1]],
+    "settings": ["Rig Settings",[["Weight Painting",[["Brush Size",{"value":0.25,"min":0,"max":1,"decimals":2,"step":0.01}],["Strength",{"value":0.75,"min":0,"max":1,"decimals":2,"step":0.01}],["Normalize",true],["Mirror",true]],true]]]
+  },
+  "Animation": {
+    "navigator": "Animation Library",
+    "inspector": "Inspector",
+    "items": [
+      ["Hero_Knight","Animation Rig","hero-knight",[["Locomotion","Folder",null,[["Idle","Animation"],["Idle_Battle","Animation"],["Walk","Animation"],["Run","Animation"],["Sprint","Animation"]]],["Actions","Folder",null,[["Attack","Folder",null,[["Attack_01","Animation"],["Attack_02","Animation"],["Attack_Combo","Animation"]]],["Defend","Folder",null,[]],["Dodge","Folder",null,[]],["Interact","Folder",null,[]],["Emote","Folder",null,[]]]],["Cinematic","Folder",null,[]],["Montage","Folder",null,[]],["Additive","Folder",null,[]],["Aim","Folder",null,[]],["Custom","Folder",null,[]]]]
+    ],
+    "properties": [
+      ["Animation Properties",[["Length (s)",3.2],["Frame Rate",["60 FPS","30 FPS","24 FPS"]],["Total Frames",192],["Root Motion",true],["Additive",false],["Loop",false]],true],
+      ["Root Motion",[["Mode",["From Animation","In Place"]],["Lock X",false],["Lock Y",false],["Lock Z",true]],true],
+      ["Compression",[["Algorithm",["ACL (High Quality)","Lossless"]],["Error Threshold",{"value":0.02,"min":0,"max":0.1,"decimals":2,"step":0.01}],["Compression Ratio","6.4 : 1"]],true],
+      ["Notify Events (4)",[["Start","Sword_Attack"]],false],
+      ["Retargeting",[["Rig","Hero_Knight"]],false]
+    ],
+    "surface": ["Animation Viewport","art"],
+    "tools": [
+      ["Sequencer","split",[["Animation Timeline","timeline",["Root Motion","Body","Left Arm","Right Arm","Left Leg","Right Leg"]],["Analysis","split",[["Animation Curves","metrics",["RightArm_Rotation.X","RightArm_Rotation.Y","RightArm_Rotation.Z"]],["Animation State Machine","graph",["Idle","Walk","Run","Attack"]]],"horizontal",[5,4]]],"vertical",[250,150]],
+      ["Dope Sheet","timeline",["Transform","Body","Left Arm","Right Arm","Root Motion"]],
+      ["Curves","metrics",["Rotation.X","Rotation.Y","Position.Z"]],
+      ["State Machine","graph",["Idle","Locomotion","Attack"]]
+    ],
+    "selection": "Attack_Combo",
+    "dockSizes": [225,292,410],
+    "commandRows": [
+      ["Keyframe","Non-Linear","Motion Capture","Procedural","|",["Playback: 60 FPS","30 FPS","24 FPS"],["Display: Lit","Unlit","Skeleton"]]
+    ],
+    "companion": ["Animation Preview","split",[["Pose Preview","image",[1130,161,235,136]],["Animation Layers","table",["Layer","Weight"],[["Base (Locomotion)","100%"],["Upper Body (Attack)","100%"],["Additive (Breathing)","35%"],["Facial (Expression)","60%"]]]],"vertical",[3,2]],
+    "settings": ["Animation Settings",[["Playback",[["Start Frame",0],["End Frame",120],["Blend Weight",{"value":0.85,"min":0,"max":1,"decimals":2,"step":0.01}]],true]]]
+  },
+  "VFX": {
+    "navigator": "VFX Asset Library",
+    "inspector": "Inspector",
+    "items": [
+      ["Project VFX","Folder",null,[["Magic","Folder",null,[["Spell_Burst","Effect"],["Spell_Circle","Effect"],["Magic_Trail","Effect"],["Teleport","Effect"],["Explosion_Magic","Effect"]]],["Fire","Folder",null,[["Fire_Burst","Emitter"],["Fire_Trail","Emitter"],["Fire_Wall","Emitter"]]],["Smoke","Folder",null,[["Smoke_Puff","Emitter"],["Smoke_Column","Emitter"],["Smoke_Dense","Emitter"]]],["Water","Folder",null,[]],["Energy","Folder",null,[]],["Weather","Folder",null,[]],["Environment","Folder",null,[]],["Hits & Impacts","Folder",null,[]],["Misc","Folder",null,[]]]]
+    ],
+    "properties": [
+      ["Emitter Properties",[["Emitter Type",["GPU (Particle)","CPU (Particle)"]],["Spawn Rate",5000],["Burst Count",3],["Loop",true]],true],
+      ["Particle Properties",[["Lifetime",{"value":2.5,"min":0,"max":8,"decimals":2,"step":0.01}],["Initial Size",{"value":0.5,"min":0,"max":1,"decimals":2,"step":0.01}],["Size Over Life",{"value":1,"min":0,"max":1,"decimals":2,"step":0.01}],["Initial Velocity",{"value":12,"min":0,"max":30,"decimals":2,"step":0.01}],["Randomness",{"value":0.75,"min":0,"max":1,"decimals":2,"step":0.01}]],true],
+      ["Rendering",[["Render Mode",["Sprite","Ribbon","Mesh"]],["Material","M_VFX_MagicCore"],["Blend Mode",["Additive","Translucent"]],["Sort Mode",["View Depth","None"]],["Soft Particles",true],["Depth Fade",true],["Motion Blur",false]],true],
+      ["Collision",[["Enabled",false]],false]
+    ],
+    "surface": ["Effect Viewport","art"],
+    "tools": [
+      ["Effect Variations","split",[["Previews","split",[["Variants","gallery",[["Default","",[278,562,72,66]],["Large","",[365,562,72,66]],["Wide","",[452,562,72,66]],["Ground","",[539,562,72,66]],["Air Burst","",[626,562,72,66]],["Empowered","",[713,562,72,66]],["Frozen","",[800,562,72,66]],["Arcane","",[887,562,72,66]]],[76,90]],["Simulation Preview","image",[989,559,238,103]]],"horizontal",[7,3]],["Effect Controls","split",[["Emitter Timeline","timeline",["Emitter_Core","Emitter_Sparks","Emitter_Debris","Emitter_Smoke","Light_Flash","Shockwave"]],["Curve Editor","metrics",["Size","Opacity","Emissive"]]],"horizontal",[56,44]]],"vertical",[132,192]],
+      ["Timeline","timeline",["Core","Sparks","Smoke"]],
+      ["Curves","metrics",["Size","Opacity","Emissive"]]
+    ],
+    "companion": ["Particle Graph","graph",["Emitter","Particle Spawn","Noise","Force","Color Over Life","Render"],{"positions":[[3,4],[160,10],[4,115],[4,215],[162,167],[333,95]],"edges":[[0,1],[2,1],[3,1],[1,5],[4,5]],"colors":["#653193","#215c86","#215c86","#215c86","#68358a","#69318c"],"pins":[["Spawn Rate","Lifetime","Loop"],["Initialize","Set Velocity","Set Size"],["Noise Scale"],["Turbulence","Vortex","Gravity"],["Gradient"],["Sprite","Mesh","Ribbon"]]}],
+    "selection": "Explosion_Magic",
+    "dockSizes": [225,307,343],
+    "commandRows": [
+      ["Emitter","Particle Graph","Simulation","Render","Decal","Post FX","Compositing","|",["Preview: High Quality","Draft","Ultra"]]
+    ],
+    "settings": ["VFX Settings",[["Preview",[["GPU Simulation",true],["Quality",["Ultra","High","Draft"]],["Draw Bounds",false]],true]]]
+  },
+  "Audio": {
+    "navigator": "Audio Asset Library",
+    "inspector": "Inspector",
+    "items": [
+      ["Project Audio","Folder",null,[["SFX","Folder",null,[["Sword_Swing.wav","Sound"],["Sword_Impact.wav","Sound"],["Footstep_Stone.wav","Sound"],["Footstep_Grass.wav","Sound"],["Explosion_Large.wav","Sound"],["Debris_Fall.wav","Sound"]]],["Ambience","Folder",null,[["Forest_Wind.wav","Sound"],["River_Ambience.wav","Sound"],["Cave_Ambience.wav","Sound"],["City_Crowd.wav","Sound"]]],["Music","Folder",null,[["Battle_Theme.ogg","Music"],["Exploration.ogg","Music"],["Tension_Loop.ogg","Music"],["Victory_Sting.ogg","Music"]]],["Voice","Folder",null,[["Hero_Lines","Folder",null,[]],["NPC_Lines","Folder",null,[]]]],["System_UI","Folder",null,[]]]]
+    ],
+    "properties": [
+      ["Audio Properties",[["Asset Type",["Sound (WAV)","Music (OGG)"]],["Sample Rate","48,000 Hz"],["Bit Depth","24-bit"],["Channels","Stereo"],["Duration","3.206 s"],["Loop",false]],true],
+      ["Playback",[["Volume (dB)",{"value":0,"min":-60,"max":12,"decimals":2,"step":0.01}],["Pitch",{"value":1,"min":0.5,"max":2,"decimals":2,"step":0.01}],["Start Time",{"value":0,"min":0,"max":3.206,"decimals":3,"step":0.01}],["End Time",{"value":3.206,"min":0,"max":3.206,"decimals":3,"step":0.01}],["Spatialize",true],["3D Blend",{"value":1,"min":0,"max":1,"decimals":2,"step":0.01}],["Attenuation",["Explosion_Attenuation","Linear","Logarithmic"]],["Priority",64]],true],
+      ["Reverb Sends",[["Mix",{"value":0.25,"min":0,"max":1,"decimals":2,"step":0.01}]],false],
+      ["Effects (2)",[["EQ",true],["Compressor",true]],false]
+    ],
+    "surface": ["Audio Preview","art"],
+    "tools": [
+      ["Waveform","split",[["Waveform & Spatial","split",[["Waveform Timeline","waveform",["L","R"]],["Spatial Preview","metrics",["Attenuation","Distance"]]],"horizontal",[7,3]],["Mixing","split",[["Audio Mixer","mixer",["Master","SFX","Ambience","Music","Voice","UI"]],["Audio Bus & Routing","graph",["SFX Bus","GameMix","Master"]],["Audio Effects","metrics",["EQ","Compressor"]]],"horizontal",[4,3,3]]],"vertical",[160,155]],
+      ["Spectrogram","metrics",["L","R"]],
+      ["Analyzer","metrics",["Spectrum","Peak"]],
+      ["Bus Routing","graph",["SFX","Music","Master"]]
+    ],
+    "companion": ["Audio Graph","graph",["Audio Clip","Low Pass","Reverb","Mixer","Output"],{"positions":[[6,6],[6,109],[6,207],[182,92],[358,92]],"edges":[[0,3],[1,3],[2,3],[3,4]],"colors":["#542784","#502b76","#502b76","#542784","#542784"],"pins":[["Explosion_Large"],["Cutoff: 8.0 kHz"],["Size: 0.75"],["Volume","Pitch","Send (Reverb)"],["Master"]]}],
+    "selection": "Explosion_Large.wav",
+    "dockSizes": [226,306,323],
+    "commandRows": [
+      ["Edit","Mix","Spatial","Profiler","|",["Platform: PC (Windows)","Linux","macOS"],["Playback: Real-Time","Scrub"]]
+    ],
+    "settings": ["Audio Settings",[["Audio Device",[["Sample Rate",["48,000 Hz","44,100 Hz"]],["Preview Output",["Master","SFX","Music"]]],true]]]
+  },
+  "Cinematic": {
+    "navigator": "Cinematic Sequences",
+    "inspector": "Inspector",
+    "items": [
+      ["Project Cinematics","Folder",null,[["EldenVale_Cinematics","Folder",null,[["CIN_Intro","Sequence"],["CIN_Prologue","Sequence"],["CIN_HeroAwakening","Sequence",null,[["SH_001 Establishing","Shot"],["SH_002 Approach","Shot"],["SH_003 CloseUp (Hero)","Shot"],["SH_004 Reveal Relic","Shot"],["SH_005 Reaction","Shot"],["SH_006 End","Shot"]]],["CIN_CastleSiege","Sequence"],["CIN_FinalBattle","Sequence"]]],["Trailers","Folder",null,[]],["Cutscenes","Folder",null,[]],["InGame_Cinematics","Folder",null,[]]]]
+    ],
+    "properties": [
+      ["Shot Properties",[["Start Time","00:01:18:00"],["End Time","00:01:30:00"],["Duration","00:00:12:00"],["Shot Type",["Close Up","Wide","Medium"]],["Camera","Cam_03 (Cine Camera)"]],true],
+      ["Camera Settings",[["Focal Length (mm)",{"value":35,"min":12,"max":140,"decimals":1,"step":0.5}],["Aperture (f)",{"value":2.8,"min":1.2,"max":22,"decimals":2,"step":0.01}],["Focus Distance (m)",{"value":2.4,"min":0.2,"max":20,"decimals":2,"step":0.01}],["Depth of Field",true],["Filmback",["Full Frame (36 × 24 mm)","Super 35"]]],true],
+      ["Look & Color Grading",[["Exposure",{"value":0.2,"min":-3,"max":3,"decimals":2,"step":0.01}],["Contrast",{"value":1.15,"min":0.5,"max":2,"decimals":2,"step":0.01}]],false],
+      ["Post Processing",[["Bloom",true],["Vignette",true]],false]
+    ],
+    "surface": ["Cinematic Viewport","art"],
+    "tools": [
+      ["Sequencer","split",[["Camera Cuts and Tracks","timeline",["Camera Cuts","Cam_03 Transform","Focus Distance","Hero_Knight","Theme_Rise"]],["Finishing","split",[["Look & Color Grading","metrics",["Lift","Gamma","Gain"]],["Film (Post Process)","metrics",["Bloom","Vignette"]],["Shot Preview (Final Look)","image",[1107,753,550,92]]],"horizontal",[4,3,5]]],"vertical",[205,150]],
+      ["Curve Editor","metrics",["Focus Distance","Field of View","Exposure"]],
+      ["Shot Manager","table",["Shot","Type","Camera"],[["SH_001","Establishing","Cam_01"],["SH_003","Close Up","Cam_03"],["SH_004","Reveal","Cam_04"]]]
+    ],
+    "selection": "SH_003 CloseUp (Hero)",
+    "dockSizes": [243,315,357],
+    "commandRows": [
+      ["Sequence","Shot","Camera","Take","Render Queue","|",["Preview: Full Quality","Draft"],["Cine Camera (Cam_03)","Perspective"]]
+    ],
+    "companion": ["Camera Previews","split",[["Camera Preview (Cam_03)","image",[1087,154,260,143]],["Shot Composition","image",[1117,338,204,111]]],"vertical",[1,1]],
+    "settings": ["Cinematic Settings",[["Output",[["Frame Rate",["24 FPS","25 FPS","30 FPS"]],["Resolution",["1920 × 1080","3840 × 2160"]],["Format",["PNG Sequence","Preview"]]],true]]]
+  },
+  "Programming": {
+    "navigator": "Project Explorer",
+    "inspector": "Inspector",
+    "items": [
+      ["EldenVale (Project)","Folder",null,[["Source","Folder",null,[["EldenVale","Folder",null,[["Public","Folder",null,[["HeroCharacter.h","C++ Header"],["HeroAbility.h","C++ Header"],["CombatComponent.h","C++ Header"],["HealthComponent.h","C++ Header"]]],["Private","Folder",null,[["HeroCharacter.cpp","C++ Source"],["CombatComponent.cpp","C++ Source"],["HealthComponent.cpp","C++ Source"]]],["Core","Folder",null,[]],["Systems","Folder",null,[]],["AI","Folder",null,[]],["Physics","Folder",null,[]],["UI","Folder",null,[]]]]]],["Content","Folder",null,[]],["Config","Folder",null,[["InputBindings.json","Configuration"]]],["Plugins","Folder",null,[]],["ThirdParty","Folder",null,[]]]]
+    ],
+    "properties": [
+      ["Class Information",[["Inheritance","ACharacter"],["Module","EldenVale"],["Header","HeroCharacter.h"],["Source","HeroCharacter.cpp"],["Access","Public"]],true],
+      ["Properties (5)",[["CombatComp","UCombatComponent*"],["HealthComp","UHealthComponent*"],["AbilityComp","UHeroAbility*"],["BaseMoveSpeed",600],["MaxHealth",100]],true],
+      ["Functions (8)",[["",{"stack":["BeginPlay()","Tick(float DeltaTime)","SetupPlayerInputComponent()","HandleHealthChanged()"]}]],true],
+      ["Editor",[["Language",["C++","JSON","Plain Text"]],["Tab Width",4],["Line Wrap",false]],false]
+    ],
+    "surface": ["Source Editor","code"],
+    "tools": [
+      ["Debugger","split",[["Call Stack","table",["Function","Location"],[["AHeroCharacter::BeginPlay()","HeroCharacter.cpp:18"],["AActor::BeginPlay()","Actor.cpp:1200"],["UWorld::BeginPlay()","World.cpp:4020"]]],["Variables","table",["Name","Type","Value"],[["this","AHeroCharacter*","HeroCharacter"],["CombatComp","UCombatComponent*","Combat"],["DeltaTime","float","0.01667"]]],["Profiler","metrics",["CPU (Game Thread)","Tick","Input"]]],"horizontal",[38,34,28]],
+      ["Build Output","log",["[1/4] Compiling EldenVale...","[2/4] HeroCharacter.cpp","[3/4] CombatComponent.cpp","[4/4] HealthComponent.cpp","Sample log · Compilation is pending engine integration."]],
+      ["Problems","table",["Severity","File","Message"],[["Info","HeroCharacter.cpp","Frontend sample loaded"],["Warning","EldenVale","Engine SDK is unbound"]]],
+      ["Breakpoints","table",["File","Line","State"],[["HeroCharacter.cpp","18","Enabled"],["CombatComponent.cpp","24","Disabled"]]]
+    ],
+    "selection": "HeroCharacter.cpp",
+    "dockSizes": [235,290,287],
+    "sourceTabs": ["HeroCharacter.cpp","HeroCharacter.h","CombatComponent.cpp","HealthComponent.cpp"],
+    "commandRows": [
+      ["New Script","Open","Save","Save All","|",["Build Target: Windows (x64)","Linux (x64)"],["Configuration: Development","Debug","Release"],"|","Compile","Run","Debug"]
+    ],
+    "settings": ["Class Viewer",[["Symbols",[["Base Class","ACharacter"],["Show Inherited",true]],true]]]
+  },
+  "Visual Scripting": {
+    "navigator": "Blueprint Asset Library",
+    "inspector": "Inspector",
+    "items": [
+      ["Project: EldenVale","Folder",null,[["Blueprints","Folder",null,[["Characters","Folder",null,[["BP_HeroCharacter","Blueprint"],["BP_EnemyAI","Blueprint"],["BP_NPC","Blueprint"],["BP_Boss","Blueprint"]]],["Gameplay","Folder",null,[["BP_Ability","Asset"],["BP_Weapon","Asset"],["BP_Item","Asset"],["BP_Interactable","Asset"]]],["Systems","Folder",null,[["BP_GameMode","Asset"],["BP_PlayerState","Asset"],["BP_SaveSystem","Asset"]]],["UI","Folder",null,[["BP_HUD","Asset"],["BP_MainMenu","Asset"]]],["Misc","Folder",null,[]]]]]]
+    ],
+    "properties": [
+      ["Blueprint Class",[["Parent Class",["Character","Actor","Pawn"]]],true],
+      ["Components",[["",{"stack":["CapsuleComponent (Collision)","Mesh (Skeletal Mesh)","Camera (Camera)","CharacterMovement (Movement)"]}]],true],
+      ["Variables (4)",[["MoveSpeed",600],["JumpHeight",420],["bIsSprinting",false],["Stamina",78.25]],true],
+      ["Functions (4)",[["",{"stack":["EventGraph","ConstructionScript","UpdateStamina","CanSprint"]}]],true],
+      ["Event Dispatchers",[["OnStaminaChanged",true],["OnJumped",true]],false]
+    ],
+    "surface": ["BP_HeroCharacter · Event Graph","graph",["Event Tick","Get Axis Value","Branch","Add Movement Input","Event Input Action (Jump)","Jump","Play Montage"],{"positions":[[2,8],[1,116],[190,16],[388,12],[5,225],[190,225],[390,195]],"edges":[[0,2],[1,2],[2,3],[4,5],[5,6]],"colors":["#74313d","#3d6928","#45546b","#205b80","#74313d","#205b80","#205b80"],"pins":[["Delta Seconds"],["Axis Name","MoveForward"],["True","Condition","False"],["Target: self","World Direction","Scale Value"],["Pressed","Released"],["Target: self"],["Montage","Play Rate","Start Section"]]}],
+    "tools": [
+      ["Compiler Results","split",[["Compiler Results","log",["✓ Sample compile of BP_HeroCharacter successful [in 312 ms]","[Info] No errors, 0 warnings","[Info] Generated class: BP_HeroCharacter_C"]],["Debug / Simulation","table",["Variable","Value","Type"],[["MoveSpeed","600.000","float"],["JumpHeight","420.000","float"],["bIsSprinting","false","bool"],["Stamina","78.250","float"]]],["Preview (BP_HeroCharacter)","image",[947,730,402,150]]],"horizontal",[38,31,31]],
+      ["Find Results","table",["Node","Graph"],[["Add Movement Input","Event Graph"],["Play Montage","Event Graph"]]],
+      ["Variables","table",["Name","Type","Value"],[["MoveSpeed","Float","600"],["bIsSprinting","Bool","False"]]]
+    ],
+    "selection": "BP_HeroCharacter",
+    "dockSizes": [228,312,217],
+    "commandRows": [
+      ["New Blueprint","Open","Save","Save All","Compile","Find","Class Settings","Class Defaults","Simulation","|",["Play (Selected)","Play in Editor"]],
+      ["Event Graph","Construction Script","Functions","Macros","Variables","Components"]
+    ],
+    "settings": ["Details",[["Blueprint",[["Editable",true],["Show Exposed Pins",true]],true]]]
+  },
+  "AI": {
+    "navigator": "AI Asset Library",
+    "inspector": "Inspector",
+    "items": [
+      ["Project: EldenVale","Folder",null,[["AI","Folder",null,[["Behavior Trees","Folder",null,[["BT_Guard","Behavior Tree"],["BT_Enemy_Melee","Behavior Tree"],["BT_Enemy_Ranged","Behavior Tree"],["BT_Boss","Behavior Tree"]]],["State Machines","Folder",null,[["SM_Alertness","State Machine"],["SM_Combat","State Machine"],["SM_Patrol","State Machine"]]],["EQS Queries","Folder",null,[["EQS_FindCover","Query"],["EQS_FindTarget","Query"],["EQS_PatrolPoint","Query"]]],["Perception","Folder",null,[["AISense_Default","Profile"]]],["Navigation","Folder",null,[["NavData_Main","NavMesh"],["NavArea_LowCost","Area"],["NavArea_HighCost","Area"]]]]]]]
+    ],
+    "properties": [
+      ["Behavior Tree Properties",[["Tick Interval (s)",{"value":0.2,"min":0.01,"max":2,"decimals":2,"step":0.01}],["Restart on Fail",true],["Blackboard Asset","BB_Guard"],["AI Controller Class","AIC_Guard"]],true],
+      ["Blackboard (BB_Guard)",[["TargetActor","Object"],["LastHeardLocation","Vector"],["Alertness","Float"],["IsInCombat","Boolean"]],true],
+      ["Perception",[["Sight",true],["Sight Radius",2000],["FOV",120],["Hearing",true],["Hearing Radius",1500],["Damage",false]],true],
+      ["Navigation",[["Navigation Data","NavData_Main"]],false]
+    ],
+    "surface": ["AI Scene Preview","art"],
+    "tools": [
+      ["AI Simulation","split",[["Simulation and Queries","split",[["Agents","table",["ID","State","Current Task"],[["#104","Patrol","Move to Next Point"],["#103","Investigate","Investigate Noise"],["#102","Chase","Chase Target"]]],["Blackboard (Live)","table",["Key","Value"],[["TargetActor","Enemy_01"],["Alertness","0.95"],["IsInCombat","true"]]],["EQS Query Preview","image",[1011,500,335,176]]],"horizontal",[44,24,32]],["Navigation and State","split",[["Perception","table",["Sense","Target"],[["Sight","Enemy_01"],["Hearing","Footsteps"]]],["State Machine","graph",["Idle","Suspicious","Alerted"]],["Navigation (NavData_Main)","image",[816,730,414,144]]],"horizontal",[24,32,44]]],"vertical",[166,151]],
+      ["Blackboard","table",["Key","Type","Value"],[["TargetActor","Object","Enemy_01"],["Alertness","Float","0.95"]]],
+      ["Decision Log","log",["BT_Guard started","Selector → Patrol","Sample behavior playback"]]
+    ],
+    "companion": ["Behavior Tree (BT_Guard)","graph",["Selector","Enemy Visible?","Chase Target","Heard Noise?","Investigate","Patrol Route"],{"positions":[[170,4],[4,110],[4,193],[172,110],[172,193],[342,110]],"edges":[[0,1],[0,3],[0,5],[1,2],[3,4]],"colors":["#53268a","#245f7d","#245f7d","#245f7d","#245f7d","#245f7d"],"pins":[["Root"],["Condition"],["Task"],["Condition"],["Task"],["Wait (1 s)","Move to Next Point"]]}],
+    "selection": "BT_Guard",
+    "dockSizes": [225,307,332],
+    "commandRows": [
+      ["Behavior Tree","State Machine","EQS","Navigation","Perception","Blackboard","Utility AI","Simulation"]
+    ],
+    "settings": ["AI Settings",[["Simulation",[["Population",50],["Show Debug",true],["Draw NavMesh",true]],true]]]
+  },
+  "Physics": {
+    "navigator": "Physics Bodies",
+    "inspector": "Body Properties",
+    "items": [
+      ["Castle_Main","Scene mesh","castle-main"],
+      ["Crate_A","Rigid Body"],
+      ["Ground","Collider"],
+      ["Hinge_01","Constraint"]
+    ],
+    "properties": [
+      ["Body",[["Motion",["Static","Dynamic","Kinematic"]],["Mass (kg)",22.5],["Gravity",true]]],
+      ["Collision",[["Shape",["Box","Sphere","Convex Hull"]],["Friction",0.5],["Restitution",0.2],["CCD",false]]]
+    ],
+    "surface": ["Simulation Monitor","metrics",["Broad Phase","Contacts","Solver"]],
+    "tools": [
+      ["Contacts","table",["Body A","Body B","State"],[["Crate_A","Ground","Resting"],["Hinge_01","Castle_Main","Linked"]]],
+      ["Constraints","graph",["Rigid Body","Hinge Joint","World Anchor"]],
+      ["Solver Log","log",["Demo body set loaded","Simulation requires engine integration."]]
+    ]
+  },
+  "Multiplayer": {
+    "navigator": "Multiplayer Project",
+    "inspector": "Inspector",
+    "items": [
+      ["Project: EldenVale","Folder",null,[["Multiplayer","Folder",null,[["Sessions","Folder",null,[["SessionConfig_Main","Session"],["SessionConfig_Ranked","Session"],["SessionConfig_Coop","Session"]]],["Network","Folder",null,[["NetworkSettings","Asset"],["ReplicationProfiles","Asset"],["NetSerializer","Asset"]]],["Gameplay","Folder",null,[["MP_GameMode","Asset"],["MP_PlayerController","Asset"],["MP_Character","Asset"]]],["Lobby","Folder",null,[["LobbyManager","Asset"],["Matchmaking","Asset"]]],["Servers","Folder",null,[["DedicatedServer","Asset"],["ServerBuildConfig","Asset"]]]]]]]
+    ],
+    "properties": [
+      ["Session Properties",[["Default Game Mode","MP_GameMode"],["Max Players",16],["Listen Server",false],["Presence (Online)",true],["Region",["Auto","US East","Europe","Asia"]]],true],
+      ["Replication",[["Replication Graph","RPGraph_Main"],["Net Update Rate",30],["Relevancy Distance",15000],["Cull Distance",30000],["Dormancy",["Adaptive","Awake","Dormant"]]],true],
+      ["Prediction & Reconciliation",[["Client Prediction",true]],false],
+      ["Bandwidth Limits",[["Rate (KB/s)",128]],false]
+    ],
+    "surface": ["Multiplayer Viewport","art"],
+    "tools": [
+      ["Replication","split",[["Replication Monitor","split",[["Replication Graph (RPGraph_Main)","graph",["Root","Always Relevant","Spatial Grid","Replication Output"]],["Network Statistics (Live)","metrics",["Ping","In","Out"]]],"horizontal",[1,1]],["Session Diagnostics","split",[["Connected Clients","table",["Player","Role","Ping"],[["Player_01","Host","0 ms"],["Player_02","Client","48 ms"],["Player_03","Client","42 ms"]]],["Multiplayer Log","log",["[Net] Hosting sample session","[Rep] Replication graph ready","[Net] Sample clients connected"]],["Network Emulation","table",["Parameter","Value"],[["Latency","80 ms"],["Jitter","10 ms"],["Packet Loss","2.0%"]]]],"horizontal",[38,40,22]]],"vertical",[175,145]],
+      ["Packet Timeline","metrics",["Incoming","Outgoing","Loss"]],
+      ["Network Log","log",["[Net] Session preview initialized","[Net] Three demo clients"]]
+    ],
+    "selection": "SessionConfig_Main",
+    "dockSizes": [220,313,335],
+    "commandRows": [
+      ["Session","Replication","Networking","Prediction","Latency","Matchmaking","Dedicated Server","Backend","|",["Launch Clients","2 Clients","3 Clients","4 Clients"]]
+    ],
+    "companion": ["Session Manager","table",["Setting","Value"],[["Session Name","EldenVale_Test"],["Game Mode","MP_GameMode"],["Max Players","16"],["Visibility","Public"],["Dedicated Server","Enabled"]]],
+    "settings": ["Multiplayer Settings",[["Network Emulation",[["Enable",true],["Latency (ms)",80],["Jitter (ms)",10],["Packet Loss",{"value":0.02,"min":0,"max":1,"decimals":2,"step":0.01}]],true]]]
+  },
+  "UI": {
+    "navigator": "Widget Hierarchy",
+    "inspector": "Widget Properties",
+    "items": [
+      ["Eldenvale HUD","Canvas"],
+      ["HealthBar","Progress Bar"],
+      ["QuestTracker","Panel"],
+      ["InventoryButton","Button"],
+      ["Minimap","Image"]
+    ],
+    "properties": [
+      ["Layout",[["Anchor",["Top Left","Top Right","Center","Stretch"]],["Width",280],["Height",64]]],
+      ["Appearance",[["Opacity",1],["Visible",true],["Style",["Default","Dark","High Contrast"]]]]
+    ],
+    "surface": ["HUD Preview","art"],
+    "tools": [
+      ["Widget Events","table",["Widget","Event","Binding"],[["InventoryButton","Clicked","Open Inventory"],["HealthBar","Changed","Player.Health"],["QuestTracker","Updated","Quest.State"]]],
+      ["Style Tokens","table",["Token","Value"],[["Accent","#7C3AED"],["Panel","#141823"],["Text","#EEF0F5"]]]
+    ]
+  },
+  "Testing": {
+    "navigator": "UI Test Project",
+    "inspector": "UI Inspector",
+    "items": [
+      ["Project: EldenVale","Folder",null,[["UITesting","Folder",null,[["Test Suites","Folder",null,[["UI_SmokeTests","Suite"],["UI_Regression","Suite"],["UI_Accessibility","Suite"],["UI_Localization","Suite"],["UI_Performance","Suite"]]],["Test Maps","Folder",null,[["UI_TestMap","Asset"],["Menu_TestMap","Asset"],["InGame_TestMap","Asset"]]],["Recordings","Folder",null,[["LoginFlow.rec","Asset"],["InventoryFlow.rec","Asset"],["SettingsFlow.rec","Asset"]]],["Baselines","Folder",null,[["MainMenu.ref","Asset"],["Inventory.ref","Asset"],["HUD.ref","Asset"]]]]]]]
+    ],
+    "properties": [
+      ["Properties",[["Interactable",true],["Visible",true],["Enabled",true],["Focus Order",0],["Navigation",["Auto","Explicit"]]],true],
+      ["Test Hooks",[["Test ID","btn_continue"],["Automation Tag","MainMenu.Continue"],["Expected State",["Enabled","Disabled"]]],true],
+      ["Assertions (3)",[["Is Visible",true],["Is Interactable",true],["Has Correct Text (Continue)",true]],true],
+      ["Accessibility",[["Focusable by Keyboard",true],["Screen Reader Label","Continue"]],false]
+    ],
+    "surface": ["UI Test Viewport (Playtest)","art"],
+    "tools": [
+      ["Automated Tests","split",[["Testing Controls","split",[["Automated Tests (UI_SmokeTests)","table",["Test Name","Result","Duration"],[["UI_MainMenu_Opens","Passed","84 ms"],["UI_ContinueButton_Interactable","Passed","56 ms"],["UI_Settings_Opens","Passed","112 ms"],["UI_Inventory_Opens","Passed","138 ms"],["UI_HUD_Displays","Passed","70 ms"]]],["UI Test Recorder","table",["Action","Target","Time"],[["Mouse Move","(640,360)","0.00 s"],["Click","Button_Continue","0.62 s"],["Wait","1.0s","1.62 s"],["Key Press","Esc","3.02 s"]]],["Input Simulation","table",["Device","Mode"],[["Keyboard & Mouse","Simulated"],["Random Within Range","20 ms"],["Hold Duration","50 ms"]]]],"horizontal",[5,3,3]],["Validation","split",[["Visual Test (Screenshot Comparison)","image",[14,734,560,132]],["UI Performance (Live)","metrics",["UI CPU (ms)","UI Draws"]],["Accessibility Checks","table",["Check","Status"],[["Color Contrast (AA)","Pass"],["Focusable by Keyboard","Pass"],["Screen Reader Labels","Pass"]]]],"horizontal",[5,3,3]]],"vertical",[165,145]],
+      ["Visual Tests","table",["Baseline","Current Run","Match"],[["MainMenu.ref","MainMenu","99.9%"]]],
+      ["Accessibility","table",["Check","Result"],[["Color Contrast","Pass"],["Target Size","Pass"]]],
+      ["Test Log","log",["UI_SmokeTests loaded","Sample run · 18 passed · 0 failed"]]
+    ],
+    "selection": "UI_SmokeTests",
+    "dockSizes": [230,300,332],
+    "commandRows": [
+      ["Playtest","Automated Tests","Visual Tests","Accessibility","Localization","Performance","Input","Device Matrix"],
+      [["Game View","Scene View"],["1920 × 1080 (16:9)","3840 × 2160","1280 × 720"],["Platform: PC (Windows)","Linux"],["Input: Keyboard & Mouse","Gamepad"]]
+    ],
+    "settings": ["Test Settings",[["Run",[["Capture Screenshot",true],["Retry Failures",true],["Input Simulation",true]],true]]]
+  },
+  "Profiler": {
+    "navigator": "Capture Sessions",
+    "inspector": "Capture Settings",
+    "items": [
+      ["Frame Capture 018","Capture"],
+      ["CPU Thread","Track"],
+      ["GPU Queue","Track"],
+      ["Memory","Track"]
+    ],
+    "properties": [
+      ["Capture",[["Interval (ms)",16.67],["Frames",120],["Record GPU",true]]],
+      ["Display",[["Units",["Milliseconds","Microseconds","Frames"]],["Show Markers",true]]]
+    ],
+    "surface": ["Frame Timing","metrics",["CPU","GPU","Frame Budget"]],
+    "tools": [
+      ["Event Timeline","timeline",["Game Thread","Render Thread","GPU Queue"]],
+      ["Memory Counters","table",["Counter","Sample"],[["RAM","24.6 GB"],["VRAM","7.8 GB"]]]
+    ]
+  },
+  "Build": {
+    "navigator": "Build Profiles",
+    "inspector": "Build Queue",
+    "items": [
+      ["Project: EldenVale","Folder",null,[["Build Profiles","Folder",null,[["Windows_Release","Profile"],["Windows_Debug","Profile"],["Console_PS5","Profile"],["Console_Xbox","Profile"],["macOS_Release","Profile"],["Linux_SteamDeck","Profile"],["Android","Profile"],["iOS","Profile"]]],["Distribution","Folder",null,[["Steam","Store"],["Epic Games Store","Store"],["GOG","Store"],["Microsoft Store","Store"],["App Store","Store"],["Google Play","Store"]]],["Automation","Folder",null,[["Nightly_Build","Asset"],["CI_Release","Asset"],["Patch_Build","Asset"]]]]]
+    ],
+    "properties": [
+      ["Windows_Release (EldenVale)",[["Stage","Cooking Assets (Textures)"],["Progress (%)",{"value":64,"min":0,"max":100,"decimals":0}],["Elapsed","4 min 12 s"]],true],
+      ["Build Summary",[["Platform","Windows (x64)"],["Configuration","Release"],["Target","Shipping (Game)"],["Version","1.0.0"],["Estimated Size","24.8 GB"],["Estimated Time","14 min 32 s"]],true]
+    ],
+    "surface": ["Build Configuration (Windows)","build"],
+    "tools": [
+      ["Build Size Analysis","split",[["Build Size Analysis","size",[["Textures",7.6],["Meshes",2.1],["Audio",1.6],["Animations",1.1],["Materials",0.9],["Others",11.5]]],["Target Platforms","table",["Platform","Target"],[["Windows (x64)","Release"],["PlayStation 5","Release"],["Xbox Series X|S","Release"],["macOS","Release"],["Linux (Steam Deck)","Release"]]],["Build Artifacts","table",["Artifact","Size"],[["EldenVale.exe","152 MB"],["EldenVale-Windows.pak","24.6 GB"],["Manifest.json","112 KB"],["BuildReport.html","430 KB"]]],["Quick Actions","table",["Action"],[["Run Built Game"],["Open Output Folder"],["View Build Report"],["Upload to Steam"],["Create Patch from Build"]]]],"horizontal",[27,24,28,21]],
+      ["Build Output","log",["Sample build queue","Compile and package operations require the engine."]],
+      ["Artifacts","table",["Artifact","Stage"],[["EldenVale.exe","Sample"],["EldenVale-Windows.pak","Sample"]]]
+    ],
+    "selection": "Windows_Release",
+    "dockSizes": [229,365,225],
+    "commandRows": [
+      ["Settings","Assets & Cooking","Packaging","Signing","Distribution","Automation","|",["Build","Package","Distribute","Create Patch"]]
+    ],
+    "configuration": [
+      ["Settings",[["Target Platform",["Windows (x64)","Linux (x64)","macOS"]],["Build Configuration",["Release","Debug","Development"]],["Output Directory","Builds/Windows/Release"],["Executable Name","EldenVale.exe"],["Version","1.0.0"],["Auto Increment",true],["Build Mode",["Full Build","Incremental","Patch Only"]]],true],
+      ["Optimization",[["Preset",["High (Shipping)","Balanced","Fast"]],["Link Time Optimization",true],["Strip Debug Symbols",true],["Optimize Meshes & Textures",true],["Enable Shader Optimization",true]],true],
+      ["Options",[["Include Editor",false],["Generate Crash Reports",true],["Enable Analytics",true],["Compress Packages",true]],true]
+    ],
+    "cooking": ["Asset Cooking (42,318 Assets)","table",["Asset Type","Count","Cooked","Size (Raw)","Size (Cooked)","Status"],[["Textures","12,480","8,234","18.7 GB","7.6 GB","Cooking"],["Meshes","8,221","8,221","5.4 GB","2.1 GB","Done"],["Materials","4,730","4,730","1.6 GB","0.9 GB","Done"],["Animations","3,912","3,912","4.2 GB","1.6 GB","Done"],["Audio","6,481","6,481","3.9 GB","1.1 GB","Done"]]],
+    "companion": ["Build Log","log",["[Build] Starting build: Windows_Release","[Build] Configuration: Release","[Build] Discovering assets…","[Cook] Found 42,318 assets","[Cook] Textures: 8,234 / 12,480","[Cook] Meshes: complete","[Cook] Materials: complete","[Preview] Sample build log"]],
+    "settings": ["Queue Settings",[["Queue",[["Concurrent Builds",1],["Auto Open Build Log",true]],true]]]
+  },
+  "Asset Hub": {
+    "navigator": "Asset Collections",
+    "inspector": "Asset Properties",
+    "items": [],
+    "properties": [
+      ["Asset",[["Collection",["Project","Favorites","Shared"]],["Tag","environment"],["Favorite",false]]],
+      ["Import",[["Scale",1],["Generate Thumbnails",true],["Conflict Policy",["Rename","Replace","Skip"]]]]
+    ],
+    "surface": ["Asset Inventory","assets"],
+    "tools": [
+      ["Dependencies","table",["Asset","Dependency"],[["SM_Castle_Main","M_Castle_Stone"],["Hero_Knight","M_Knight_Armor"]]],
+      ["Import Queue","log",["No assets queued","Select a project asset to inspect its stable ID."]]
+    ]
+  },
+  "Team": {
+    "navigator": "Team Members",
+    "inspector": "Collaboration Settings",
+    "items": [
+      ["Project Lead","Owner"],
+      ["Environment Artist","Editor"],
+      ["Gameplay Developer","Editor"],
+      ["QA Reviewer","Viewer"]
+    ],
+    "properties": [
+      ["Workspace",[["Role",["Owner","Editor","Viewer"]],["Branch","main"],["Auto Refresh",true]]],
+      ["Activity",[["Filter",["All","Assets","Reviews"]],["Show Offline",false]]]
+    ],
+    "surface": ["Team Activity","table",["Member","Activity","Status"],[["Environment Artist","Updated Ruins collection","Demo"],["Gameplay Developer","Reviewed input graph","Demo"],["QA Reviewer","Reviewed smoke report","Demo"]]],
+    "tools": [
+      ["Change History","table",["Change","Owner","Branch"],[["WF-128","Environment Artist","main"],["WF-127","Gameplay Developer","main"]]],
+      ["Reviews","log",["Sample activity only","Live source control and collaboration are pending."]]
+    ]
+  },
+  "Settings": {
+    "navigator": "Preferences",
+    "inspector": "Setting Values",
+    "items": [
+      ["Appearance","Category"],
+      ["Editor","Category"],
+      ["Viewport","Category"],
+      ["Input","Category"]
+    ],
+    "properties": [
+      ["Preferences",[["Theme",["WorldForge Dark","System"]],["UI Scale",["100%","125%","150%","200%"]],["Tooltips",true]]],
+      ["Editor",[["Autosave Preview",true],["Autosave Interval",10],["Default Workspace",["World Editor","Home"]]]]
+    ],
+    "surface": ["Preferences Overview","table",["Category","Scope"],[["Appearance","Theme and density"],["Editor","Workspace and local previews"],["Viewport","Navigation and overlays"],["Input","Shortcuts and controls"]]],
+    "tools": [
+      ["Shortcuts","table",["Command","Shortcut"],[["Save","Ctrl+S"],["Undo","Ctrl+Z"],["Redo","Ctrl+Y"],["Play Preview","F5"]]],
+      ["About","log",["WorldForge Engine · Frontend prototype","Preference controls are preview values."]]
+    ]
+  }
+}

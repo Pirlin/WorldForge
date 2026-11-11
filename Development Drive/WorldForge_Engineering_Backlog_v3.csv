@@ -1,0 +1,18 @@
+Ticket,Work item,Phase,Dependencies,Acceptance
+WF-ENG-001,Initialize CMake/vcpkg repository and CI,F0,none,Clean C++ build and CTest on baseline host
+WF-ENG-002,"Native Qt shell, theme, docks and status line",F0,ENG-001,Workspace arrangement persists; tested 1080p/4K
+WF-ENG-003,"Vulkan first light triangle, cube, camera",F0,"ENG-001,ENG-002",No blocking validation errors on test GPU
+WF-ENG-004,GUID ECS scene and document persistence,F0,ENG-001,"Unit-tested scene IDs, relations and migrations"
+WF-ENG-005,Outliner/Inspector selection and commands,F0,"ENG-002,ENG-004",Identical selection across UI; undo/redo
+WF-ENG-006,Atomic save/reopen and recovery,F0,"ENG-004,ENG-005",Crash-injection restore; two reopen cycles
+WF-ENG-007,Asset registry and GLB reimport,F1,"ENG-003,ENG-006","Stable asset IDs, material/mesh references"
+WF-ENG-008,Standalone player without Qt,F1,"ENG-003,ENG-007",Example scene runs on clean machine
+WF-ENG-009,Jolt rigid body sample,F2,ENG-008,Floor/cube simulation acceptance
+WF-AI-001,Read-only canonical project query API,F1,"ENG-004,ENG-007","ID-accurate, permission-filtered results"
+WF-AI-002,Typed tool gateway and approval/rollback,F2,"AI-001,ENG-006",Reviewed scene action applies/reverts
+WF-AI-003,SQLite metadata and FTS retrieval,F2,AI-001,Known corpus exact target retrieval
+WF-AI-004,Interchangeable model adapter and budget,F2,"AI-002,AI-003",Bounded plan and tested edit
+WF-LC-001,"World cell, road/lane data and terrain",F4,ENG-007,Traversable consistent street cell
+WF-LC-002,Original playable car+mission street,F4,"LC-001,ENG-009",Mission complete/reload/packaged on Windows
+WF-RENDER-001,Measured PBR and lighting reference,F2,"ENG-003,ENG-007",Named hardware and visual regression
+WF-RENDER-002,Streaming/HLOD and graphics research,F4,"LC-001,RENDER-001",Documented traversal and frame-time results

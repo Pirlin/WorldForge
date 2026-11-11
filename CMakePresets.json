@@ -1,0 +1,40 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "core",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/core",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "WORLDFORGE_BUILD_EDITOR": "OFF"
+      }
+    },
+    {
+      "name": "editor",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/editor",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "editor-audit",
+      "inherits": "editor",
+      "binaryDir": "${sourceDir}/build/editor-audit",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "WORLDFORGE_BUILD_EDITOR_AUDIT": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "core", "configurePreset": "core" },
+    { "name": "editor", "configurePreset": "editor" },
+    { "name": "editor-audit", "configurePreset": "editor-audit" }
+  ],
+  "testPresets": [
+    { "name": "core", "configurePreset": "core", "output": { "outputOnFailure": true } },
+    { "name": "editor-audit", "configurePreset": "editor-audit", "output": { "outputOnFailure": true } }
+  ]
+}
