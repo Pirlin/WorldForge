@@ -1,0 +1,72 @@
+#pragma once
+
+#include "Engine/World/WorldSimulation.h"
+
+#include <string>
+
+namespace worldforge {
+
+// A looping path that traffic vehicles follow at a fixed speed.
+struct TrafficRoute {
+    std::vector<Point3> points;
+    float speed = 7;
+};
+
+struct TrafficVehicle {
+    std::size_t body = 0;
+    std::size_t route = 0;
+    std::size_t next = 1;
+    std::size_t reached = 0;   // Waypoints reached since Play started.
+    int laps = 0;
+    float stalled = 0;         // Seconds spent without progress toward the next waypoint.
+    float lastDistance = 0;
+};
+
+// Walk to the start marker, reach the waypoint, then interact at the target.
+struct Mission {
+    enum class State { Waiting, Travel, Interact, Complete };
+    std::string name;
+    std::string goal;
+    Point3 start{}, waypoint{}, target{};
+    bool hasWaypoint = false;
+    float startRadius = 2;
+    float waypointRadius = 2;
+    float targetRadius = 1.6f;
+    State state = State::Waiting;
+};
+
+struct Gameplay {
+    std::vector<TrafficRoute> routes;
+    std::vector<TrafficVehicle> vehicles;
+    std::vector<Mission> missions;
+
+    // Puts vehicles on their routes and sets the bodies they drive.
+    void start(WorldSimulation &world);
+    // Advances traffic and missions before one WorldSimulation::step().
+    void update(WorldSimulation &world, std::optional<std::size_t> player, bool interact);
+    std::string objective() const;
+    bool missionsComplete() const;
+    // The point the player should head for next, if a mission is in progress.
+    std::optional<Point3> missionTarget() const;
+    // True once every vehicle has completed at least one lap.
+    bool trafficLooped() const;
+    bool empty() const { return routes.empty() && missions.empty(); }
+};
+
+// Drives the player through the active mission for automated checks: walks the planned path to each
+// mission target and interacts when it arrives.
+struct Autopilot {
+    std::vector<Point3> path;
+    std::optional<Point3> goal;
+    int replan = 0;
+    bool stuck = false;
+    // Returns true when the player should walk forward toward `yaw`. Sets `interact` at the mission target.
+    bool drive(const WorldSimulation &world, std::size_t player, const Gameplay &gameplay, float &yaw, bool &interact);
+};
+
+// Shortest walkable path in the ground plane around static colliders that block a body of the given
+// radius between heights `low` and `high`. Returns {} when no path exists.
+std::vector<Point3> findPath(const WorldSimulation &world, Point3 from, Point3 to, float radius, float low,
+                             float high, std::optional<std::size_t> ignore = std::nullopt);
+
+}

@@ -4,7 +4,7 @@
 
 This review covers polygon modeling, its viewport and commands, modifiers, UV handoff, the boundary with other creation workspaces, and Blender automation. The source checkout was pinned to Blender 5.2.3 LTS, commit `e13b728c6880d3084d9d57c30031ed5df8b39dee`, matching the local application in the supplied screenshots. The review traced representative operations through the relevant subsystems and enumerated registered operators in eight namespaces. Exhaustive line review of Blender and execution of every registered operator are separate tasks. [Pinned Blender source](https://github.com/blender/blender/tree/e13b728c6880d3084d9d57c30031ed5df8b39dee)
 
-WorldForge has a Qt workspace shell and a Qt-independent scene document supporting entity commands. Modeling currently uses a reference-image viewport, demo mesh hierarchy, and preview controls. Real mesh data, component picking, topology edits, modifier evaluation, and UV editing are missing. Those features need an asset document and geometry engine in addition to the scene document. [Current studio configuration](../Data/studios.json), [Viewport](../Components/Viewport.cpp), [Scene document](../Engine/Scene/SceneDocument.h)
+WorldForge Modeling now uses a live Vulkan viewport with mesh component picking, topology edits, modifiers, UV editing, and PBR texture preview. The Model Outliner organizes mesh instances by their saved scene group. Details edits the selected instance's transforms and visibility, and the selected asset's materials, geometry, and modifiers. Linked instances share asset-level edits. [Modeling workspace](../Workspaces/ModelingWorkspace.cpp) · [Project store](../State/ProjectStore.cpp) · [Live viewport](../Components/LiveViewport.cpp)
 
 ## The Modeling interface
 
@@ -21,7 +21,21 @@ The second screenshot shows how Blender makes more tools accessible without fill
 | Right column | Outliner above Properties. Properties changes with the object, mode, and active tool. Give object transforms, mesh attributes, material slots, and the modifier stack dedicated sections. Show one editable tool settings surface and an optional Adjust Last Operation panel. |
 | Canvas | Full-height editable mesh view by default. Assets and diagnostics open on demand. UV Editing uses a linked 2D/3D split with explicit selection-sync behavior. Sculpting uses a brush shelf. Animation uses a time editor under its preview. Those panels belong where the corresponding work happens. |
 
-## Source trace
+## Outliner, Details, and materials
+
+| Workflow | Blender | Maya | WorldForge Modeling |
+|---|---|---|---|
+| Scene organization | The Outliner shows collections and objects. Its filters control which object, data, and restriction columns appear. | The Outliner displays the scene DAG. Options expose shape nodes, assigned materials, and filters. | Collapsible scene groups, name search, visibility, and nested mesh parenting. Drag onto a mesh to parent it, or use Set Parent or Unparent. Parenting preserves world placement. |
+| Instance attributes | Object Properties exposes transforms, relations, visibility, and viewport display. | Channel Box exposes common channels. Attribute Editor provides fuller controls and connected-node tabs. | Details shows the parent, editable local channels, and read-only world values. Object Mode Move, Rotate, and Scale move an assembly. Mesh data and modifier operations belong to the asset and apply to linked instances. |
+| Geometry attributes | Mesh Properties exposes data such as UV maps, attributes, and vertex groups. | Shape and construction history nodes are inspected through Attribute Editor. | Mesh Data exposes topology inspection, saved revolve profiles, LOD, and collision proxy controls. UV Editing provides a dedicated 2D/3D workflow. |
+| Material assignment | Material Properties presents slots and face assignment and selection actions. Shader Editor handles shader networks. | Attribute Editor exposes shading attributes. Hypershade browses and builds shading networks and previews materials. | Details shows the active material slot, the number of assigned faces, and populated map channels. Users can create a slot, assign selected faces, select a slot's faces, and edit its preview settings. |
+| Texture workflow | Image Texture nodes feed shader inputs. UV Editor handles coordinate placement. | File texture nodes expose image sampling and tiling. Hypershade and UV Editor provide complementary previews. | Embedded PNG/JPEG maps cover base color, normal, metallic/roughness, occlusion, and emission. Material Preview uses the active UV layout. |
+
+Blender references. [Outliner source](https://github.com/blender/blender/blob/e13b728c6880d3084d9d57c30031ed5df8b39dee/scripts/startup/bl_ui/space_outliner.py) · [Object Properties source](https://github.com/blender/blender/blob/e13b728c6880d3084d9d57c30031ed5df8b39dee/scripts/startup/bl_ui/properties_object.py) · [Mesh Properties source](https://github.com/blender/blender/blob/e13b728c6880d3084d9d57c30031ed5df8b39dee/scripts/startup/bl_ui/properties_data_mesh.py) · [Material Properties source](https://github.com/blender/blender/blob/e13b728c6880d3084d9d57c30031ed5df8b39dee/scripts/startup/bl_ui/properties_material.py)
+
+Maya references. [Outliner](https://help.autodesk.com/cloudhelp/2025/ENU/Maya-Basics/files/GUID-4B9A9A3A-83C5-445A-95D5-64104BC47406.htm) · [Attribute Editor](https://help.autodesk.com/cloudhelp/2026/ENU/Maya-Basics/files/GUID-67A58D31-4722-4769-B3E6-1A35B5B53BED.htm) · [Hypershade](https://help.autodesk.com/cloudhelp/2025/ENU/Maya-LightingShading/files/GUID-EA5E2F6E-574A-4DBA-B3BE-01FDD5381FAD.htm) · [File texture node](https://help.autodesk.com/cloudhelp/2025/ENU/Maya-LightingShading/files/GUID-309A77DA-F5ED-4474-8413-317D7AB241E6.htm)
+
+## Modeling source trace
 
 | Subsystem | Blender source and what the code shows |
 |---|---|

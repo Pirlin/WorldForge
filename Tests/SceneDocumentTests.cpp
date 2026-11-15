@@ -1,5 +1,17 @@
 #include "Engine/Scene/SceneDocument.h"
+#include "Engine/Geometry/Mesh.h"
+#include "Engine/Geometry/MeshTopology.h"
+#include "Engine/Geometry/MeshModifiers.h"
+#include "Engine/Geometry/MeshRemesh.h"
+#include "Engine/Geometry/SculptBrush.h"
+#include "Engine/Geometry/MeshUv.h"
+#include "Engine/World/WorldSimulation.h"
+#include "Engine/World/PlayableScene.h"
+#include <algorithm>
+#include <sstream>
+#include <fstream>
 
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -17,8 +29,29 @@ void require(bool condition, const char *message)
 }
 }
 
-int main()
+int main(int argc,char *argv[])
 {
+    if (argc == 2) {
+        PlayableScene sample;
+        sample.horizon = {0.68f,0.77f,0.88f};
+        sample.zenith = {0.23f,0.44f,0.73f};
+        sample.fog = {0.71f,0.8f,0.9f};
+        sample.fogDensity = 0.025f;
+        sample.fogFalloff = 0.045f;
+        sample.localFogCenter = {3,0,1};
+        sample.localFogRadius = 6;
+        sample.localFogDensity = 0.06f;
+        sample.simulation.terrains.push_back({{},{}});
+        sample.simulation.terrains.front().field.paint(2,0,4,2);
+        sample.foliage.push_back({4,42});
+        sample.simulation.bodies.push_back({{0,0,1},{0.3f,0.3f,0.85f},{},0,true});
+        auto &avatar = sample.simulation.bodies.front();
+        avatar.shape = BoxBody::Shape::Capsule;
+        avatar.lockRotation = true;
+        avatar.friction = 0.05f;
+        std::ofstream output(argv[1]);
+        return writePlayable(output,sample) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     const auto example = Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAC");
     require(example && example->toString() == "a1723291-8a22-47dc-b098-1f6718cffaac", "GUID canonicalizes");
     require(!Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAX"), "Invalid GUID rejected");
@@ -113,5 +146,550 @@ int main()
     auto endOfRevisions = std::get<SceneDocument>(SceneDocument::open(exhausted));
     require(endOfRevisions.apply({Guid::generate(), project, scene, exhausted.revision, RemoveEntity{child}}).error
         == SceneError::RevisionExhausted, "Revision overflow rejected");
-    std::cout << "Scene document contracts passed\n";
+    const auto cube = makeCube();
+    require(validateMesh(cube).empty() && cube.vertices.size() == 8 && cube.faces.size() == 6, "Valid editable cube");
+    for (const auto kind : {Primitive::Cube,Primitive::Plane,Primitive::Sphere,Primitive::Cylinder,
+                            Primitive::Cone,Primitive::Torus,Primitive::Circle}) {
+        const auto primitive = makePrimitive(kind,{2,3,4},17,11);
+        require(primitive && validateMesh(*primitive).empty(), "Parametric primitive validates");
+        const bool flat = kind == Primitive::Plane || kind == Primitive::Circle;
+        for (int axis = 0; axis < 3; ++axis) {
+            float low = primitive->vertices.front()[axis], high = low;
+            for (const auto &vertex : primitive->vertices) {
+                low = std::min(low,vertex[axis]);
+                high = std::max(high,vertex[axis]);
+            }
+            require(std::abs(high-low-(flat && axis == 2 ? 0.0f : float(axis+2))) < 0.0001f,
+                    "Primitive has exact requested dimensions");
+        }
+        const MeshTopology topology(*primitive);
+        require(!topology.edgeFaces.empty(), "Primitive has real polygon edges");
+        for (const auto &[edge,faces] : topology.edgeFaces)
+            require(faces.size() == (flat ? 1 : 2), "Primitive has the expected open or manifold topology");
+    }
+    require(!makePrimitive(Primitive::Sphere,{0,1,1}) && !makePrimitive(Primitive::Torus,{1,1,1},129),
+            "Invalid primitive dimensions and excessive segments are rejected");
+    auto disconnected = cube;
+    disconnected.vertices.push_back({-0.49f,-0.5f,-0.5f});
+    const auto falloff = connectedFalloff(disconnected,{0},1.5f);
+    require(falloff[0] == 1 && falloff[1] > 0 && falloff[1] < 1 && falloff[2] == 0 && falloff.back() == 0,
+            "Soft selection follows connected distance and ignores nearby disconnected vertices");
+    const auto symmetry = mirroredVerticesX(cube,0.0001f);
+    require(symmetry[0] == 1 && symmetry[1] == 0 && symmetry[7] == 6 && symmetry[6] == 7,
+            "X symmetry matches corresponding vertices in both directions");
+    auto extruded = cube;
+    require(!extrudeFace(extruded, 99, 0.25f).empty() && extruded == cube, "Invalid face leaves geometry intact");
+    require(extrudeFace(extruded, 1, 0.25f).empty() && extruded.vertices.size() == 12
+        && extruded.faces.size() == 10 && extruded.vertices.back()[2] == 0.75f, "Face extrusion creates cap and sides");
+    const std::array<std::size_t,2> adjacentFaces{1,2};
+    auto region = cube, individual = cube;
+    require(extrudeFaces(region,adjacentFaces,0.25f,false).empty()
+        && region.vertices.size() == 14 && region.faces.size() == 12, "Region extrusion shares cap edges and emits only border walls");
+    require(extrudeFaces(individual,adjacentFaces,0.25f,true).empty()
+        && individual.vertices.size() == 16 && individual.faces.size() == 14, "Individual extrusion creates separate cap rims");
+    const std::array<std::size_t,1> top{1};
+    auto inset = cube;
+    require(!insetFaces(inset,top,0.6f).empty() && inset == cube, "Oversized inset is rejected atomically");
+    require(insetFaces(inset,top,0.1f).empty() && inset.faces.size() == 10
+        && std::abs(inset.vertices[8][0]+0.4f) < 0.0001f && inset.vertices[8][2] == 0.5f,
+        "Inset preserves the face plane and shrinks the cap");
+    auto beveled = cube;
+    require(!bevelFace(beveled, 1, 0.6f).empty() && beveled == cube, "Excess bevel rejected atomically");
+    require(bevelFace(beveled, 1, 0.1f).empty() && beveled.faces.size() == 10
+        && beveled.vertices[4][2] < 0.5f && beveled.vertices[8][2] == 0.5f, "Perimeter bevel creates a chamfer");
+    auto cut = cube;
+    require(cutQuadLoop(cut, 1, 0).empty() && cut.faces.size() == 10 && cut.vertices.size() == 12,
+        "Quad loop cut splits a ring and reuses shared midpoints");
+    auto multiple = cube;
+    require(cutQuadLoop(multiple,1,0,2,0.25f).empty() && multiple.vertices.size() == 16 && multiple.faces.size() == 14,
+        "Multiple loop cuts maintain a continuous shared ring");
+    require(std::ranges::any_of(multiple.vertices,[](const auto &vertex) {
+        return std::abs(vertex[0]-0.25f) < 0.0001f;
+    }),"Loop slide positions cuts away from the midpoint");
+    Mesh concave;
+    concave.vertices = {{0,0,0},{2,0,0},{2,2,0},{1,1,0},{0,2,0}};
+    concave.faces.push_back({{{0,{0,0}},{1,{1,0}},{2,{1,1}},{3,{0.5f,0.5f}},{4,{0,1}}}});
+    const auto triangles = faceTriangles(concave,concave.faces.front());
+    require(triangles.size() == 3 && makePlayVertices(concave).size() == 9, "Concave polygons triangulate for the Player");
+    const std::array<std::size_t,1> firstFace{0};
+    require(triangulateFaces(concave,firstFace).empty() && concave.faces.size() == 3
+        && std::ranges::all_of(concave.faces,[](const auto &face) { return face.corners.size() == 3; }),
+        "Authored triangulation preserves the three triangles");
+    auto subdivided = cube;
+    require(subdivideFaces(subdivided,top).empty() && subdivided.vertices.size() == 13
+        && subdivided.faces.size() == 9 && subdivided.faces[2].corners.size() == 5,
+        "Subdivision inserts shared midpoints in adjacent unselected faces");
+    const MeshTopology subdividedTopology(subdivided);
+    require(std::ranges::all_of(subdividedTopology.edgeFaces,[](const auto &entry) { return entry.second.size() == 2; }),
+        "Subdivision creates no boundary or T-junction on a closed cube");
+    auto open = cube;
+    const std::array<MeshEdge,4> opening{{{4,5},{5,6},{6,7},{4,7}}};
+    require(deleteFaces(open,top).empty() && open.faces.size() == 5
+        && fillBoundary(open,opening).empty() && open.faces.size() == 6, "Delete and fill reopen and close a cube");
+    Mesh caps = cube;
+    caps.faces = {cube.faces[0],cube.faces[1]};
+    const std::array<MeshEdge,8> capBorders{{{0,1},{1,2},{2,3},{0,3},{4,5},{5,6},{6,7},{4,7}}};
+    require(bridgeBoundaries(caps,capBorders).empty() && caps.faces.size() == 6, "Bridge connects two opposing borders");
+    auto weld = cube;
+    const std::array<VertexIndex,2> pair{0,1};
+    require(!weldVertices(weld,pair,0.1f).empty() && weld == cube, "Weld leaves geometry intact when no vertices qualify");
+    require(weldVertices(weld,pair,0,1).empty() && weld.vertices.size() == 7,
+        "Weld to Active collapses an edge while retaining faces with at least three corners");
+    auto plane = *makePrimitive(Primitive::Plane,{1,1,1});
+    require(triangulateFaces(plane,firstFace).empty(), "Plane triangulates");
+    const std::array<MeshEdge,1> diagonal{{{0,2}}};
+    require(dissolveEdges(plane,diagonal).empty() && plane.faces.size() == 1 && plane.faces.front().corners.size() == 4,
+        "Dissolve restores a triangulated quad");
+    auto shaded = cube;
+    require(setFaceShading(shaded,adjacentFaces,true).empty() && shaded.faces[1].corners[0].normal != Point3{}
+        && setFaceShading(shaded,adjacentFaces,false).empty() && shaded == cube, "Smooth and flat shading change stored corner normals");
+    const std::array<MeshEdge,1> bevelSelection{{{4,5}}};
+    auto edgeBevel = cube;
+    require(bevelEdges(edgeBevel,bevelSelection,0.1f,3).empty()
+        && edgeBevel.faces.size() == 9 && edgeBevel.vertices.size() == 14, "Edge bevel adds three profile strips");
+    const MeshTopology bevelTopology(edgeBevel);
+    require(std::ranges::all_of(bevelTopology.edgeFaces,[](const auto &entry) { return entry.second.size() == 2; }),
+        "Edge bevel leaves a watertight cube");
+    auto vertexBevel = cube;
+    const std::array<VertexIndex,1> corner{0};
+    require(bevelVertices(vertexBevel,corner,0.1f).empty() && vertexBevel.faces.size() == 7 && vertexBevel.vertices.size() == 10,
+        "Vertex chamfer adds a cap and replaces its corner");
+    auto slid = cube;
+    require(slideVertex(slid,0,1,0.25f).empty() && slid.vertices[0][0] == -0.25f
+        && slideEdge(slid,{4,5},-0.25f).empty() && slid.vertices[4] != cube.vertices[4], "Vertex and edge slides follow neighboring edges");
+    auto split = cube;
+    require(splitFaces(split,top).empty() && split.vertices.size() == 12 && split.faces.size() == 6,
+        "Split duplicates a region boundary without changing its appearance");
+    auto grid = cube;
+    require(deleteFaces(grid,top).empty() && gridFillBoundary(grid,opening,1).empty()
+        && grid.faces.size() == 6, "Grid fill makes a quad across a four-edge opening");
+    auto knife = cube;
+    require(knifeFace(knife,1,{{4,5},0.5f},{{6,7},0.5f}).empty()
+        && knife.faces.size() == 7 && knife.vertices.size() == 10 && knife.faces[2].corners.size() == 5,
+        "Knife splits a face and inserts matching vertices in neighbors");
+    auto bisected = cube;
+    auto pathMesh = cube;
+    std::set<MeshEdge> knifeSeams{{4,5}};
+    const std::array<MeshKnifeSegment,2> cutPath{{{1,{{6,7},0.5f},{{4,5},0.5f}},
+                                                 {2,{{4,5},0.5f},{{0,1},0.5f}}}};
+    require(knifePath(pathMesh,cutPath,&knifeSeams).empty() && pathMesh.vertices.size() == 11 && pathMesh.faces.size() == 8,
+        "Two-face Knife path reuses one vertex on the shared edge");
+    const MeshTopology pathTopology(pathMesh);
+    require(knifeSeams.size() == 2 && !knifeSeams.contains({4,5})
+        && std::ranges::all_of(knifeSeams,[&](auto edge) { return pathTopology.edgeFaces.contains(edge); }),
+        "Knife preserves a marked UV seam as two connected segments");
+    require(std::ranges::all_of(pathTopology.edgeFaces,[](const auto &entry) { return entry.second.size() == 2; }),
+        "Multi-face Knife keeps the cut connected on a closed mesh");
+    auto wrongPath = cutPath;
+    wrongPath.back().start.fraction = 0.25f;
+    auto rejectedPath = cube;
+    require(!knifePath(rejectedPath,wrongPath).empty() && rejectedPath == cube,
+        "A discontinuous Knife path is rejected without editing the mesh");
+    auto angledCut = *makePrimitive(Primitive::Plane,{2,2,1});
+    const std::array<MeshKnifeSegment,2> sameFaceCut{{
+        {0,{{0,1},0.5f},{{1,2},0.5f}},
+        {0,{{1,2},0.5f},{{2,3},0.5f}}
+    }};
+    require(knifePath(angledCut,sameFaceCut).empty() && angledCut.faces.size() == 3
+        && angledCut.vertices.size() == 7 && MeshTopology(angledCut).edgeFaces.at({4,5}).size() == 2
+        && MeshTopology(angledCut).edgeFaces.at({5,6}).size() == 2,
+        "Multi-Cut can turn along multiple segments on one original face");
+    auto beveledLoop = cube;
+    require(bevelEdges(beveledLoop,opening,0.1f,3).empty() && beveledLoop.faces.size() == 18
+        && beveledLoop.vertices.size() == 20, "Connected face perimeter bevel creates a three-band profile");
+    const MeshTopology loopTopology(beveledLoop);
+    require(std::ranges::all_of(loopTopology.edgeFaces,[](const auto &entry) { return entry.second.size() == 2; }),
+        "Segmented perimeter bevel keeps the mesh watertight");
+    require(bisectMesh(bisected,0,0).empty() && bisected.vertices.size() == 12 && bisected.faces.size() == 10,
+        "Bisect cuts across all intersected faces");
+    require(triangulateFaces(plane,firstFace).empty() && rotateEdge(plane,{0,2}).empty()
+        && MeshTopology(plane).edgeFaces.contains({1,3}), "Rotate Edge flips a quad's diagonal");
+    const auto spinProfile = makeRetopologyQuad({{{1,0,-1},{2,0,-1},{2,0,1},{1,0,1}}},{0,-1,0});
+    require(bool(spinProfile),"Spin boundary fixture is valid");
+    const std::array<MeshEdge,1> spinSide{{{1,2}}};
+    auto partialSpin = *spinProfile;
+    require(spinEdges(partialSpin,spinSide,2,{0,0,0},90,4).empty() && partialSpin.faces.size() == 5
+        && partialSpin.vertices.size() == 12 && MeshTopology(partialSpin).edgeFaces.at({1,2}).size() == 2,
+        "Partial Spin attaches four new quads to the source boundary");
+    auto fullSpin = *spinProfile;
+    require(spinEdges(fullSpin,spinSide,2,{0,0,0},-360,8).empty() && fullSpin.faces.size() == 9
+        && fullSpin.vertices.size() == 20 && MeshTopology(fullSpin).edgeFaces.at({4,5}).size() == 2,
+        "Full Spin closes the sweep seam with shared vertices");
+    auto invalidSpin = cube;
+    require(!spinEdges(invalidSpin,spinSide,2,{0,0,0},90,4).empty() && invalidSpin == cube,
+        "Spin rejects interior edges without mutating the mesh");
+    const std::array<Point2,4> latheProfile{{{0,-1},{1,-1},{1,1},{0,1}}};
+    const std::array<Point2,3> arc{{{1,0},{1,1},{0,1}}};
+    const std::array<float,3> weights{1,std::sqrt(0.5f),1};
+    const auto rationalArc = sampleNurbsProfile(arc,weights,2,8);
+    require(rationalArc && rationalArc->front() == arc.front() && rationalArc->back() == arc.back()
+        && std::abs((*rationalArc)[4][0]-std::sqrt(0.5f)) < 0.0001f
+        && std::abs((*rationalArc)[4][1]-std::sqrt(0.5f)) < 0.0001f,
+        "A rational quadratic NURBS evaluates the midpoint of a circular arc");
+    Mesh lathe;
+    require(revolveProfile(lathe,latheProfile,2,360,16).empty()
+        && lathe.vertices.size() == 34 && lathe.faces.size() == 48
+        && std::ranges::all_of(MeshTopology(lathe).edgeFaces,[](const auto &edge) { return edge.second.size() == 2; })
+        && faceNormal(lathe,lathe.faces.front())[2] < -0.9f,
+        "A full revolve shares pole and seam vertices and keeps outward winding");
+    const auto savedLathe = lathe;
+    auto invalidProfile = latheProfile;
+    invalidProfile[1][0] = -1;
+    require(!revolveProfile(lathe,invalidProfile,2,360,16).empty() && lathe == savedLathe,
+        "Invalid revolve input leaves the destination unchanged");
+    const auto unitPlane = *makePrimitive(Primitive::Plane,{2,2,1});
+    auto connectedVertices = unitPlane;
+    require(connectVertices(connectedVertices,0,2).empty() && connectedVertices.vertices == unitPlane.vertices
+        && MeshTopology(connectedVertices).edgeFaces.at({0,2}).size() == 2,
+        "Connect vertices preserves the polygon corners and inserts a shared diagonal");
+    auto connectedEdges = unitPlane;
+    std::set<MeshEdge> connectSeams{{0,1}};
+    require(connectEdges(connectedEdges,{0,1},{2,3},&connectSeams).empty()
+        && connectedEdges.vertices.size() == 6 && connectedEdges.faces.size() == 2
+        && connectSeams == std::set<MeshEdge>{{0,4},{1,4}},
+        "Connect edge midpoints interpolates new corners and carries marked seams forward");
+    auto weldedEdges = unitPlane;
+    for (auto position : unitPlane.vertices) {
+        position[0] += 3;
+        weldedEdges.vertices.push_back(position);
+    }
+    auto second = unitPlane.faces.front();
+    for (auto &corner : second.corners)
+        corner.vertex += 4;
+    weldedEdges.faces.push_back(second);
+    require(weldBoundaryEdges(weldedEdges,{4,7},{1,2}).empty()
+        && weldedEdges.vertices.size() == 6 && MeshTopology(weldedEdges).edgeFaces.at({1,2}).size() == 2,
+        "Target Weld joins two boundary edges with opposite winding");
+    auto patch = makeRetopologyQuad({{{0,0,0},{1,0,0},{1,1,0},{0,1,0}}},{0,0,1});
+    require(patch && extendQuadBoundary(*patch,{1,2},{{{2,0,0},{2,1,0}}}).empty()
+        && patch->faces.size() == 2 && MeshTopology(*patch).edgeFaces.at({1,2}).size() == 2,
+        "Retopology extends a quad patch across a shared edge");
+    auto subdivision = cube;
+    require(applyMeshModifier(subdivision,{ModifierKind::Subdivision,true,0,1}).empty()
+        && subdivision.vertices.size() == 26 && subdivision.faces.size() == 24
+        && std::abs(subdivision.vertices[0][0]+0.2777778f) < 0.0001f,
+        "Catmull-Clark subdivision smooths corners and shares new quad edges");
+    require(applyMeshModifier(subdivision,{ModifierKind::Array,true,0,3,2}).empty()
+        && subdivision.faces.size() == 72 && subdivision.vertices.size() == 78,
+        "Array repeats an evaluated mesh without changing material slots");
+    auto solid = *makePrimitive(Primitive::Plane,{1,1,1});
+    require(applyMeshModifier(solid,{ModifierKind::Solidify,true,0,2,0.1f}).empty()
+        && solid.faces.size() == 6 && solid.vertices.size() == 8,
+        "Solidify gives a plane a back surface and four rim faces");
+    const MeshTopology solidTopology(solid);
+    require(std::ranges::all_of(solidTopology.edgeFaces,[](const auto &entry) { return entry.second.size() == 2; }),
+        "Solidify closes the boundary");
+    auto normalWeighted = cube;
+    const auto wrapTarget = *makePrimitive(Primitive::Plane,{4,4,1});
+    auto wrapped = *makePrimitive(Primitive::Plane,{1,1,1});
+    for (auto &vertex : wrapped.vertices)
+        vertex[2] = 1;
+    require(applyMeshModifier(wrapped,{ModifierKind::Shrinkwrap,true,0,2,0.1f},&wrapTarget).empty()
+        && std::ranges::all_of(wrapped.vertices,[](auto vertex) { return std::abs(vertex[2]-0.1f) < 0.0001f; }),
+        "Shrinkwrap projects to nearest target triangles with a normal offset");
+    require(applyMeshModifier(normalWeighted,{ModifierKind::WeightedNormal}).empty()
+        && normalWeighted.faces.front().corners.front().normal != Point3{},
+        "Weighted normal evaluation stores a new corner normal");
+    auto charts = cube;
+    require(!unwrapUvIslands(charts,{},0.02f).empty() && charts == cube,
+        "A closed surface asks for seams and preserves prior UVs");
+    std::set<MeshEdge> allSeams;
+    const MeshTopology cubeTopology(cube);
+    for (const auto &entry : cubeTopology.edgeFaces)
+        allSeams.insert(entry.first);
+    require(unwrapUvIslands(charts,allSeams,0.02f).empty() && charts.vertices == cube.vertices,
+        "Unwrap opens cut islands without changing geometry");
+    const auto chartReport = inspectUvs(charts,allSeams);
+    require(chartReport.islands == 6 && !chartReport.outside && !chartReport.degenerate && !chartReport.overlaps,
+        "Packed unwrap has six distinct islands inside the tile");
+    auto anchored = charts;
+    const UvPins pins{{0,0}};
+    require(unwrapUvIslands(anchored,allSeams,0.02f,pins).empty() && anchored.faces[0] == charts.faces[0]
+        && !inspectUvs(anchored,allSeams).overlaps,
+        "Unwrap holds a pinned chart in place while packing the remaining charts");
+    require(packUvIslands(anchored,allSeams,0.02f,pins).empty() && anchored.faces[0] == charts.faces[0],
+        "Packing preserves pinned coordinates");
+    std::set<MeshEdge> netSeams = allSeams;
+    for (const auto &edge : {MeshEdge{4,5},MeshEdge{5,6},MeshEdge{6,7},MeshEdge{4,7},MeshEdge{0,1}})
+        netSeams.erase(edge);
+    require(unwrapUvIslands(charts,netSeams,0.01f).empty()
+        && inspectUvs(charts,netSeams).islands == 1 && !inspectUvs(charts,netSeams).overlaps,
+        "A connected cube net unwraps as one chart without overlap");
+    auto conflictingPins = cube;
+    require(!unwrapUvIslands(conflictingPins,netSeams,0.01f,{{0,3},{2,0}}).empty() && conflictingPins == cube,
+        "A joined vertex with conflicting UV pins fails without moving either anchor");
+    auto ring = *makePrimitive(Primitive::Plane,{4,3,1});
+    const std::array<std::size_t,1> centerFace{0};
+    require(insetFaces(ring,centerFace,0.75f).empty() && deleteFaces(ring,centerFace).empty(),
+        "Build a planar UV chart around an opening");
+    const auto ringPositions = ring.vertices;
+    require(unwrapUvIslands(ring,{},0.02f).empty() && ring.vertices == ringPositions && ring.faces.size() == 4,
+        "Unwrap a chart with two boundary loops while keeping the mesh opening");
+    const auto ringReport = inspectUvs(ring,{});
+    require(ringReport.islands == 1 && !ringReport.outside && !ringReport.degenerate && !ringReport.overlaps,
+        "Packed UVs preserve a single nonoverlapping ring chart");
+    auto overlapping = charts;
+    for (auto &face : overlapping.faces)
+        for (std::size_t i = 0; i < face.corners.size(); ++i)
+            face.corners[i].uv = cube.faces.front().corners[i].uv;
+    require(inspectUvs(overlapping,allSeams).overlaps > 0, "UV inspection detects coincident triangles");
+    require(packUvIslands(overlapping,allSeams,0.01f).empty() && !inspectUvs(overlapping,allSeams).overlaps,
+        "Packing separates overlapping chart rectangles");
+    auto half = cube;
+    for (auto &vertex : half.vertices)
+        vertex[0] += 0.5f;
+    require(mirrorMeshX(half).empty() && half.vertices.size() == 12 && half.faces.size() == 10,
+        "Mirror welds the plane and removes the interior cap");
+    auto asymmetric = cube;
+    auto sculpt = cube;
+    SculptStroke stroke(sculpt);
+    require(stroke.dab(sculpt,{0.5f,0.5f,0.5f},{0,0,1},0.2f,0.5f,SculptBrush::Draw,true)
+        && sculpt.vertices[6][2] > cube.vertices[6][2] && sculpt.vertices[7][2] == sculpt.vertices[6][2]
+        && sculpt.vertices[2] == cube.vertices[2] && sculpt.faces.size() == cube.faces.size(),
+        "A sculpt dab moves only nearby vertices and mirrors across local X");
+    const auto raised = sculpt.vertices[6][2];
+    require(stroke.dab(sculpt,{0.5f,0.5f,0.5f},{0,0,1},0.2f,0.5f,SculptBrush::Smooth,false)
+        && sculpt.vertices[6][2] < raised && validateMesh(sculpt).empty(),"Sculpt smooth uses neighboring vertices");
+    for (const auto &edges : {std::vector<MeshEdge>{{0,1},{1,2}},std::vector<MeshEdge>{{0,1},{1,2},{1,5}}}) {
+        auto junction = cube;
+        const auto bevelError = bevelEdges(junction,edges,0.12f,3);
+        require(bevelError.empty(),bevelError.c_str());
+        const MeshTopology closed(junction);
+        require(junction.faces.size() > cube.faces.size()+edges.size()
+            && std::ranges::all_of(closed.edgeFaces,[](const auto &edge) { return edge.second.size() == 2; })
+            && std::ranges::all_of(junction.faces,[&](const auto &face) { return !faceTriangles(junction,face).empty(); }),
+            "Adjoining bevels close two-edge runs and three-edge junctions with renderable faces");
+    }
+    auto allBeveled = cube;
+    std::vector<MeshEdge> boxEdges(allSeams.begin(),allSeams.end());
+    const auto boxBevelError = bevelEdges(allBeveled,boxEdges,0.12f,3);
+    require(boxBevelError.empty(),boxBevelError.c_str());
+    require(std::ranges::all_of(MeshTopology(allBeveled).edgeFaces,[](const auto &edge) { return edge.second.size() == 2; }),
+        "Beveling all box edges preserves watertight junctions");
+    auto oversizedBevel = cube;
+    require(!bevelEdges(oversizedBevel,boxEdges,0.8f,3).empty() && oversizedBevel == cube,
+        "An oversized adjoining bevel preserves the original mesh");
+    for (auto &vertex : asymmetric.vertices)
+        if (vertex[0] < 0)
+            vertex[0] = -2;
+    asymmetric.materials.push_back({"Negative side"});
+    asymmetric.faces[5].material = 1;
+    auto positiveMirror = asymmetric, negativeMirror = asymmetric;
+    require(mirrorMeshX(positiveMirror).empty() && mirrorMeshX(negativeMirror,MirrorSide::Negative).empty(),
+        "Crossing Mirror bisects a full mesh from either source side");
+    const MeshTopology mirroredTopology(negativeMirror);
+    require(positiveMirror.faces.size() == 10 && negativeMirror.faces.size() == 10
+        && std::ranges::all_of(mirroredTopology.edgeFaces,[](const auto &edge) { return edge.second.size() == 2; })
+        && std::ranges::count(positiveMirror.faces,1u,&MeshFace::material) == 0
+        && std::ranges::count(negativeMirror.faces,1u,&MeshFace::material) == 2
+        && std::ranges::all_of(positiveMirror.vertices,[](const auto &p) { return std::abs(p[0]) <= 0.5f; })
+        && std::ranges::count_if(negativeMirror.vertices,[](const auto &p) { return std::abs(p[0]) == 2; }) == 8,
+        "Crossing Mirror preserves selected-side materials and welds the new seam");
+    Mesh concaveMirror;
+    concaveMirror.vertices = {{-2,-2,0},{2,-2,0},{2,-1,0},{-1,-1,0},{-1,1,0},{2,1,0},{2,2,0},{-2,2,0}};
+    concaveMirror.faces.push_back({{{0},{1},{2},{3},{4},{5},{6},{7}}});
+    require(mirrorMeshX(concaveMirror,MirrorSide::Positive).empty()
+        && std::ranges::all_of(concaveMirror.vertices,[](const auto &v) { return std::abs(v[1]) >= 1; }),
+        "Mirror triangulates a concave face with multiple cut intervals and preserves its gap");
+    auto cutter = cube;
+    cutter.materials.front().name = "Cutter finish";
+    const auto solidVolume = [](const Mesh &mesh) {
+        double volume = 0;
+        for (const auto &face : mesh.faces) {
+            const auto p = mesh.vertices[face.corners[0].vertex];
+            const auto q = mesh.vertices[face.corners[1].vertex];
+            const auto r = mesh.vertices[face.corners[2].vertex];
+            volume += p[0]*(q[1]*r[2]-q[2]*r[1])+p[1]*(q[2]*r[0]-q[0]*r[2])+p[2]*(q[0]*r[1]-q[1]*r[0]);
+        }
+        return volume/6;
+    };
+    for (const auto &[mode,volume] : {std::pair{BooleanOperation::Difference,0.5},
+             std::pair{BooleanOperation::Union,1.5},std::pair{BooleanOperation::Intersection,0.5}}) {
+        auto result = cube;
+        const auto booleanError = booleanMesh(result,cutter,mode,{0.5f,0,0});
+        require(booleanError.empty(),booleanError.c_str());
+        const MeshTopology topology(result);
+        require(std::abs(solidVolume(result)-volume) < 0.0001
+            && std::ranges::all_of(topology.edgeFaces,[](const auto &edge) { return edge.second.size() == 2; })
+            && std::ranges::any_of(result.faces,[](const auto &face) { return face.material == 1; }),
+            "Boolean modes produce a closed solid of the expected volume and retain cutter materials");
+    }
+    auto failedBoolean = cube;
+    require(!booleanMesh(failedBoolean,cutter,BooleanOperation::Intersection,{2,0,0}).empty() && failedBoolean == cube
+        && !booleanMesh(failedBoolean,*makePrimitive(Primitive::Plane,{1,1,1}),BooleanOperation::Union).empty()
+        && failedBoolean == cube,"Invalid and empty Booleans preserve the source mesh");
+    auto remeshed = cube;
+    const auto remeshError = remeshVoxels(remeshed,0.17f);
+    require(remeshError.empty(),remeshError.c_str());
+    const MeshTopology remeshTopology(remeshed);
+    require(remeshed.faces.size() > cube.faces.size() && std::abs(solidVolume(remeshed)-1) < 0.12
+        && std::ranges::all_of(remeshTopology.edgeFaces,[](const auto &edge) { return edge.second.size() == 2; }),
+        "Voxel Remesh creates a closed sampled surface near the original size");
+    auto cancelled = cube;
+    std::stop_source stop;
+    stop.request_stop();
+    require(!remeshVoxels(cancelled,0.17f,stop.get_token()).empty() && cancelled == cube,
+        "Cancelling voxel reconstruction preserves the source mesh");
+    auto remeshLimit = cube;
+    auto openRemesh = *makePrimitive(Primitive::Plane,{1,1,1});
+    const auto openSource = openRemesh;
+    require(!remeshVoxels(remeshLimit,0.0001f).empty() && remeshLimit == cube
+        && !remeshVoxels(openRemesh,0.17f).empty() && openRemesh == openSource,
+        "Voxel Remesh preserves the source when the preview exceeds the grid limit or the source is open");
+    auto uv = cube;
+    require(unwrapFace(uv, 1).empty() && uv.faces[1].corners[2].uv == Point2{1, 1},
+        "Planar unwrap produces unit-square UVs");
+    require(translateFaceUV(uv, 1, {0.25f, -0.125f}).empty()
+        && uv.faces[1].corners[2].uv == Point2{1.25f, 0.875f}
+        && uv.faces[0] == cube.faces[0] && uv.vertices == cube.vertices, "UV translation only changes the target face");
+    Heightfield terrain;
+    require(terrain.sculpt(0,0,3,2,false) && terrain.height(0,0) == 2 && !terrain.height(99,99),
+            "Heightfield sculpt and height sampling");
+    require(terrain.sculpt(0,0,3,1,true) && terrain.height(0,0).value() < 2, "Terrain smoothing");
+    const auto automatic = terrain.surfaceColor({0,0,0},{0,0,1});
+    require(terrain.paint(0,0,3,2) && terrain.layers[16*Heightfield::side+16] == 2
+        && terrain.surfaceColor({0,0,0},{0,0,1}) != automatic, "Painted terrain layer changes its surface color");
+    require(validateMesh(terrain.mesh()).empty(), "Terrain produces a valid render mesh");
+    const auto firstChunk = terrain.chunk(0,0), nextChunk = terrain.chunk(1,0);
+    constexpr int stride = (Heightfield::side-1)/Heightfield::chunks+1;
+    for (int row = 0; row < stride; ++row)
+        require(firstChunk.vertices[row*stride+stride-1] == nextChunk.vertices[row*stride],
+                "Adjacent streamed chunks share identical edge vertices");
+    require(terrain.chunkInRange(0,0,-14,-14,1) && !terrain.chunkInRange(3,3,-14,-14,1),
+            "Terrain chunks load according to the streaming focus");
+    const auto trees = terrain.foliage(0,0,8,42);
+    require(!trees.faces.empty() && trees == terrain.foliage(0,0,8,42) && trees != terrain.foliage(0,0,8,43),
+            "Foliage placement is deterministic and varies with the seed");
+    WorldSimulation world;
+    world.terrains.push_back({{},{}});
+    world.bodies.push_back({{0,0,5},{0.5f,0.5f,0.5f},{},0,true});
+    for (int i = 0; i < 360; ++i)
+        world.step();
+    require(world.bodies[0].grounded && std::abs(world.bodies[0].position[2]-0.5f) < 0.002f, "Box lands on terrain");
+    for (const auto shape : {BoxBody::Shape::Sphere,BoxBody::Shape::Capsule}) {
+        WorldSimulation curved;
+        curved.terrains.push_back({{},{}});
+        curved.bodies.push_back({{0,0,3},{0.30f,0.30f,0.85f},{},0,true});
+        curved.bodies.front().shape = shape;
+        curved.bodies.front().lockRotation = true;
+        for (int i = 0; i < 220; ++i)
+            curved.step();
+        const float height = shape == BoxBody::Shape::Sphere ? 0.30f : 0.85f;
+        require(curved.bodies.front().grounded && std::abs(curved.bodies.front().position[2]-height) < 0.004f,
+                "Sphere and Z-axis capsule settle at their actual collider heights");
+    }
+    WorldSimulation platform;
+    platform.bodies.push_back({{0,0,0},{4,4,0.01f},{},0,false});
+    platform.bodies.push_back({{0,0,4},{0.1f,0.1f,0.1f},{0,0,-50},0,true});
+    for (int i = 0; i < 60; ++i)
+        platform.step();
+    require(platform.bodies[1].grounded && std::abs(platform.bodies[1].position[2]-0.11f) < 0.002f,
+            "Swept contact stops a fast box at a thin static platform");
+    WorldSimulation streamed;
+    streamed.terrains = {{{},{}},{{},{500,0,0}}};
+    streamed.bodies.push_back({{0,0,2},{0.5f,0.5f,0.5f},{},0,true});
+    streamed.step();
+    streamed.bodies[0].position = {500,0,2};
+    for (int i = 0; i < 180; ++i)
+        streamed.step();
+    require(streamed.bodies[0].grounded && std::abs(streamed.bodies[0].position[2]-0.5f) < 0.002f,
+            "A distant terrain tile supplies collision after entering its streaming range");
+    WorldSimulation spin;
+    spin.gravity = 0;
+    spin.bodies.push_back({{0,0,0},{0.5f,0.25f,0.5f},{},0,true});
+    spin.bodies[0].angularVelocity = {0,0,3};
+    for (int i = 0; i < 60; ++i)
+        spin.step();
+    require(spin.bodies[0].rotation[2] > 0.5f, "A rigid body integrates angular velocity");
+    using Type = WorldSimulation::Joint::Type;
+    for (const auto type : {Type::Fixed,Type::Hinge,Type::Distance}) {
+        WorldSimulation linked;
+        linked.bodies.push_back({{0,0,3},{0.1f,0.1f,0.1f}});
+        linked.bodies.push_back({{0,2,3},{0.2f,0.2f,0.2f},{},0,true});
+        linked.joints.push_back({type,0,1,{0,0,3},{1,0,0}});
+        for (int i = 0; i < 75; ++i)
+            linked.step();
+        const auto &body = linked.bodies[1];
+        require(std::abs(std::hypot(body.position[1],body.position[2]-3)-2) < 0.025f,
+                "Joint holds its bodies together under gravity");
+        if (type == Type::Fixed)
+            require(std::abs(body.position[2]-3) < 0.02f, "Fixed joint holds the initial pose");
+        if (type == Type::Hinge)
+            require(body.position[2] < 2.5f && std::abs(body.rotation[0]) > 0.15f,
+                    "Hinge swings around its configured axis");
+    }
+    PlayableScene playable;
+    playable.simulation.bodies.push_back({{0,0,2},{0.3f,0.3f,0.85f},{},0,true});
+    playable.simulation.bodies[0].lockRotation = true;
+    playable.simulation.bodies[0].shape = BoxBody::Shape::Capsule;
+    playable.simulation.terrains.push_back({terrain,{}});
+    playable.foliage.push_back({8,42});
+    playable.localFogRadius = 13;
+    playable.meshes.push_back({-1,makePlayVertices(cube)});
+    std::stringstream package;
+    require(writePlayable(package,playable), "Serialize a standalone scene package");
+    auto loaded = readPlayable(package);
+    require(loaded && loaded->simulation.terrains[0].field.samples == terrain.samples
+            && loaded->simulation.terrains[0].field.layers == terrain.layers && loaded->localFogRadius == 13
+            && loaded->simulation.bodies.front().shape == BoxBody::Shape::Capsule
+            && loaded->foliage[0].seed == 42 && loaded->meshes[0].vertices.size() == 36,
+            "Standalone package restores terrain, foliage, rigid bodies and render geometry");
+    std::istringstream oversized("WORLDFORGE_PLAY 1\n999999 0 0 0 0 0");
+    require(!readPlayable(oversized), "Reject oversized standalone scene package tables");
+
+    // Version 5 carries UVs, base-color maps, traffic, and missions to the standalone Player.
+    PlayableScene street;
+    street.simulation.bodies.push_back({{0,0,1},{0.3f,0.3f,0.85f},{},0,true});
+    street.simulation.bodies[0].lockRotation = true;
+    street.simulation.bodies.push_back({{0,-0.25f,0},{30,30,0.25f}});
+    street.simulation.bodies.push_back({{-6,-4,0.8f},{2,0.9f,0.7f},{},0,true});
+    street.simulation.bodies.push_back({{0,4,1.5f},{4,0.15f,1.5f}});
+    auto textured = makePlayVertices(cube);
+    textured[1].uv = {0.25f,0.75f};
+    street.meshes.push_back({-1,textured,{},{},0,{0x89,'P','N','G',0,1,2,3,4,5}});
+    street.gameplay.routes.push_back({{{-6,-4,0},{6,-4,0},{6,-8,0},{-6,-8,0}},6});
+    street.gameplay.vehicles.push_back({2,0});
+    Mission mission;
+    mission.name = "Repair \"Run\"";
+    mission.goal = "take the parts to the shop";
+    mission.start = {0,-1,0};
+    mission.target = {0,6,0};
+    street.gameplay.missions.push_back(mission);
+    std::stringstream streetPackage;
+    require(writePlayable(streetPackage,street), "Serialize a street package");
+    auto streetLoaded = readPlayable(streetPackage);
+    require(streetLoaded && streetLoaded->meshes[0].baseColorTexture == street.meshes[0].baseColorTexture
+            && streetLoaded->meshes[0].vertices[1].uv == textured[1].uv
+            && streetLoaded->gameplay.routes.size() == 1 && streetLoaded->gameplay.routes[0].points.size() == 4
+            && streetLoaded->gameplay.vehicles.size() == 1 && streetLoaded->gameplay.missions.size() == 1
+            && streetLoaded->gameplay.missions[0].name == mission.name,
+            "Street package restores UVs, base-color maps, traffic, and missions");
+    const auto around = findPath(street.simulation,{0,0,1},{0,8,1},0.4f,0.15f,1.85f);
+    require(around.size() >= 2 && std::ranges::all_of(around,[](const Point3 &p) { return std::abs(p[0]) > 4 || p[1] > 4.5f; }),
+            "Path planning walks around a wall instead of through it");
+    auto &streetWorld = streetLoaded->simulation;
+    streetLoaded->gameplay.start(streetWorld);
+    for (int step = 0; step < 120*20 && !streetLoaded->gameplay.trafficLooped(); ++step) {
+        streetLoaded->gameplay.update(streetWorld,0,false);
+        streetWorld.step();
+    }
+    require(streetLoaded->gameplay.trafficLooped(), "A traffic vehicle completes its route");
+    Autopilot pilot;
+    for (int step = 0; step < 120*30 && !streetLoaded->gameplay.missionsComplete(); ++step) {
+        float pilotYaw = 0;
+        bool interact = false;
+        const bool forward = pilot.drive(streetWorld,0,streetLoaded->gameplay,pilotYaw,interact);
+        int jumpBuffer = 0;
+        streetLoaded->gameplay.update(streetWorld,0,interact);
+        drivePlayer(streetWorld.bodies[0],{0,0,1},pilotYaw,int(forward),0,false,jumpBuffer);
+        streetWorld.step();
+    }
+    if (!streetLoaded->gameplay.missionsComplete()) {
+        const auto &p = streetWorld.bodies[0].position;
+        std::cerr << "Autopilot ended at " << p[0] << ' ' << p[1] << ' ' << p[2] << " state "
+                  << int(streetLoaded->gameplay.missions[0].state) << " path " << pilot.path.size()
+                  << " stuck " << pilot.stuck << '\n';
+    }
+    require(streetLoaded->gameplay.missionsComplete(), "The autopilot completes a mission around a wall");
+    std::cout << "Scene, mesh and world simulation contracts passed\n";
 }

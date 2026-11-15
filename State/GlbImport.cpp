@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMatrix4x4>
+#include <QObject>
 #include <QQuaternion>
 #include <QSet>
 #include <QtEndian>
@@ -12,6 +13,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <tuple>
 
 namespace {
 namespace wf = worldforge;
@@ -100,9 +103,17 @@ public:
         for (const auto &value : json_.value("materials").toArray()) {
             const auto material = value.toObject();
             const auto pbr = material.value("pbrMetallicRoughness").toObject();
-            mesh_.materials.push_back({material.value("name").toString("Material").toStdString(),
+            auto &slot = mesh_.materials.emplace_back(wf::MeshMaterial{material.value("name").toString("Material").toStdString(),
                 vector<4>(pbr.value("baseColorFactor"), {1,1,1,1}),
                 float(pbr.value("metallicFactor").toDouble(1)), float(pbr.value("roughnessFactor").toDouble(1))});
+            slot.emissive = vector<3>(material.value("emissiveFactor"));
+            const QJsonObject fields[]{pbr.value("baseColorTexture").toObject(),material.value("normalTexture").toObject(),
+                pbr.value("metallicRoughnessTexture").toObject(),material.value("occlusionTexture").toObject(),
+                material.value("emissiveTexture").toObject()};
+            const auto channels = slot.previewTextures();
+            for (unsigned i = 0; i < channels.size(); ++i)
+                if (!fields[i].isEmpty())
+                    readTexture(*channels[i],fields[i]);
         }
         const auto scene = entry(json_.value("scenes").toArray(), integer(json_.value("scene"), 0));
         for (const auto &node : scene.value("nodes").toArray())
@@ -113,6 +124,29 @@ public:
     }
 
 private:
+    void readTexture(std::vector<std::uint8_t> &channel,const QJsonObject &color)
+    {
+        if (integer(color.value("texCoord"),0) != 0 || color.contains("extensions"))
+            return;
+        const auto texture = entry(json_.value("textures").toArray(),integer(color.value("index")));
+        if (!texture.contains("source"))
+            return;
+        const auto image = entry(json_.value("images").toArray(),integer(texture.value("source")));
+        const auto mime = image.value("mimeType").toString();
+        if (!image.contains("bufferView") || (mime != "image/png" && mime != "image/jpeg"))
+            return;
+        const auto view = entry(json_.value("bufferViews").toArray(),integer(image.value("bufferView")));
+        const auto start = integer(view.value("byteOffset"),0);
+        const auto length = integer(view.value("byteLength"));
+        require(integer(view.value("buffer")) == 0 && length > 0 && qint64(start)+length <= bin_.size(),
+            QStringLiteral("GLB material image has an invalid buffer range."));
+        textureBytes_ += std::size_t(length);
+        require(textureBytes_ <= wf::MeshMaterial::maxTextureBytes,QStringLiteral("GLB material images exceed 16 MiB."));
+        const auto *begin = bin_.data()+start;
+        channel.assign(begin,begin+length);
+    }
+
+    std::size_t textureBytes_ = 0;
     Accessor accessor(int id, const QString &shape, int components) const
     {
         const auto field = entry(json_.value("accessors").toArray(), id);
@@ -254,4 +288,167 @@ std::optional<worldforge::Mesh> importGlb(const QByteArray &bytes, QString &erro
         error = message;
         return std::nullopt;
     }
+}
+
+QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &error,bool studioTopology)
+{
+    constexpr qsizetype maxBytes = 64*1024*1024;
+    error = QString::fromStdString(wf::validateMesh(mesh));
+    if (!error.isEmpty())
+        return {};
+    struct Primitive {
+        using Vertex = std::array<float,8>;
+        std::map<Vertex,quint32> indices;
+        std::vector<Vertex> vertices;
+        std::vector<quint32> triangles;
+    };
+    std::map<std::uint32_t,Primitive> primitives;
+    qsizetype bytes = 0;
+    std::size_t vertexCount = 0, triangleCount = 0;
+    for (const auto &face : mesh.faces) {
+        auto &part = primitives[face.material];
+        const auto normal = wf::faceNormal(mesh,face);
+        const auto before = part.triangles.size();
+        wf::visitFaceTriangles(mesh,face,[&](const auto &triangle) {
+            for (const auto index : triangle) {
+                const auto &corner = face.corners[index];
+                const auto p = mesh.vertices[corner.vertex];
+                auto n = QVector3D(corner.normal[0],corner.normal[1],corner.normal[2]).normalized();
+                if (n.isNull())
+                    n = QVector3D(normal[0],normal[1],normal[2]);
+                const Primitive::Vertex vertex{p[0],p[2],-p[1],n.x(),n.z(),-n.y(),corner.uv[0],1-corner.uv[1]};
+                const auto [it,inserted] = part.indices.try_emplace(vertex,quint32(part.vertices.size()));
+                if (inserted) {
+                    part.vertices.push_back(vertex);
+                    bytes += 32;
+                    ++vertexCount;
+                }
+                part.triangles.push_back(it->second);
+                bytes += 4;
+            }
+            ++triangleCount;
+        });
+        if (part.triangles.size() == before) {
+            error = QObject::tr("A mesh face could not be triangulated for GLB export.");
+            return {};
+        }
+        if (bytes > maxBytes || vertexCount > limit || triangleCount > limit) {
+            error = QObject::tr("The expanded GLB exceeds the static mesh interchange limit.");
+            return {};
+        }
+    }
+    const auto append = [](QByteArray &buffer,quint32 value) {
+        char data[4];
+        qToLittleEndian(value,data);
+        buffer.append(data,4);
+    };
+    QByteArray binary;
+    binary.reserve(bytes);
+    QJsonArray views, accessors, entries, materials, images, textures;
+    for (const auto &mat : mesh.materials) {
+        QJsonArray rgba;
+        for (const auto channel : mat.color)
+            rgba.append(double(std::clamp(channel,0.0f,1.0f)));
+        QJsonObject pbr{{"baseColorFactor",rgba},{"metallicFactor",std::clamp(mat.metallic,0.0f,1.0f)},
+            {"roughnessFactor",std::clamp(mat.roughness,0.0f,1.0f)}};
+        QJsonObject material{{"name",QString::fromStdString(mat.name)},
+            {"emissiveFactor",QJsonArray{mat.emissive[0],mat.emissive[1],mat.emissive[2]}}};
+        if (studioTopology)
+            material.insert("extras",QJsonObject{{"worldforgeSlot",materials.size()}});
+        const QString fields[]{"baseColorTexture","normalTexture","metallicRoughnessTexture","occlusionTexture","emissiveTexture"};
+        const auto channels = mat.previewTextures();
+        for (unsigned i = 0; i < channels.size(); ++i) {
+            const auto &imageBytes = *channels[i];
+            if (imageBytes.empty())
+                continue;
+            const QByteArrayView data(reinterpret_cast<const char *>(imageBytes.data()),imageBytes.size());
+            const auto mime = data.startsWith(QByteArrayView("\x89PNG\r\n\x1a\n",8)) ? "image/png"
+                : data.startsWith(QByteArrayView("\xff\xd8\xff",3)) ? "image/jpeg" : nullptr;
+            if (!mime) {
+                error = QObject::tr("A material texture is not a PNG or JPEG.");
+                return {};
+            }
+            views.append(QJsonObject{{"buffer",0},{"byteOffset",binary.size()},{"byteLength",data.size()}});
+            binary.append(data.data(),data.size());
+            binary.append((4-binary.size()%4)%4,'\0');
+            images.append(QJsonObject{{"bufferView",int(views.size()-1)},{"mimeType",mime}});
+            textures.append(QJsonObject{{"source",int(images.size()-1)}});
+            auto &destination = i == 0 || i == 2 ? pbr : material;
+            destination.insert(fields[i],QJsonObject{{"index",int(textures.size()-1)}});
+        }
+        material.insert("pbrMetallicRoughness",pbr);
+        materials.append(material);
+    }
+    for (const auto &[slot,part] : primitives) {
+        QJsonObject attributes;
+        for (const auto &[key,offset,components] : {std::tuple{"POSITION",0,3},std::tuple{"NORMAL",3,3},std::tuple{"TEXCOORD_0",6,2}}) {
+            const auto start = binary.size();
+            std::array<float,3> low{part.vertices.front()[0],part.vertices.front()[1],part.vertices.front()[2]}, high = low;
+            for (const auto &vertex : part.vertices)
+                for (int i = 0; i < components; ++i) {
+                    append(binary,std::bit_cast<quint32>(vertex[offset+i]));
+                    if (offset == 0) {
+                        low[i] = std::min(low[i],vertex[i]);
+                        high[i] = std::max(high[i],vertex[i]);
+                    }
+                }
+            QJsonObject accessor{{"bufferView",int(views.size())},{"componentType",5126},
+                {"count",int(part.vertices.size())},{"type",components == 3 ? "VEC3" : "VEC2"}};
+            if (offset == 0) {
+                accessor.insert("min",QJsonArray{low[0],low[1],low[2]});
+                accessor.insert("max",QJsonArray{high[0],high[1],high[2]});
+            }
+            attributes.insert(key,int(accessors.size()));
+            views.append(QJsonObject{{"buffer",0},{"byteOffset",start},{"byteLength",binary.size()-start},{"target",34962}});
+            accessors.append(accessor);
+        }
+        const auto indexStart = binary.size();
+        for (const auto index : part.triangles)
+            append(binary,index);
+        accessors.append(QJsonObject{{"bufferView",int(views.size())},{"componentType",5125},
+            {"count",int(part.triangles.size())},{"type","SCALAR"}});
+        views.append(QJsonObject{{"buffer",0},{"byteOffset",indexStart},{"byteLength",binary.size()-indexStart},{"target",34963}});
+        entries.append(QJsonObject{{"attributes",attributes},{"indices",int(accessors.size()-1)},{"material",int(slot)},{"mode",4}});
+    }
+    QJsonObject meshEntry{{"name",name},{"primitives",entries}};
+    if (studioTopology) {
+        QJsonArray positions, faces;
+        for (const auto &p : mesh.vertices)
+            positions.append(QJsonArray{p[0],p[1],p[2]});
+        for (const auto &face : mesh.faces) {
+            QJsonArray corners;
+            for (const auto &corner : face.corners)
+                corners.append(QJsonArray{int(corner.vertex),corner.uv[0],corner.uv[1],
+                    corner.normal[0],corner.normal[1],corner.normal[2]});
+            faces.append(QJsonArray{int(face.material),corners});
+        }
+        const auto topology = QJsonDocument(QJsonObject{{"vertices",positions},{"faces",faces}}).toJson(QJsonDocument::Compact);
+        meshEntry.insert("extras",QJsonObject{{"worldforgeTopology",QString::fromUtf8(topology)}});
+    }
+    QJsonObject document{{"asset",QJsonObject{{"version","2.0"},{"generator","WorldForge"}}},{"scene",0},
+        {"scenes",QJsonArray{QJsonObject{{"nodes",QJsonArray{0}}}}},
+        {"nodes",QJsonArray{QJsonObject{{"name",name},{"mesh",0}}}},
+        {"meshes",QJsonArray{meshEntry}},
+        {"materials",materials},{"accessors",accessors},{"bufferViews",views},
+        {"buffers",QJsonArray{QJsonObject{{"byteLength",binary.size()}}}}};
+    if (!images.isEmpty()) {
+        document.insert("images",images);
+        document.insert("textures",textures);
+    }
+    auto json = QJsonDocument(document).toJson(QJsonDocument::Compact);
+    json.append((4-json.size()%4)%4,' ');
+    const auto total = 28+json.size()+binary.size();
+    if (total > maxBytes) {
+        error = QObject::tr("The GLB file would exceed 64 MiB.");
+        return {};
+    }
+    QByteArray output;
+    output.reserve(total);
+    for (const auto value : {0x46546C67u,2u,quint32(total),quint32(json.size()),0x4E4F534Au})
+        append(output,value);
+    output += json;
+    append(output,quint32(binary.size()));
+    append(output,0x004E4942u);
+    output += binary;
+    return output;
 }

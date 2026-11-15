@@ -1,21 +1,40 @@
 #include "App/MainWindow.h"
+#include "App/EditorLog.h"
 
 #include "Components/EditorPanels.h"
 #include "Components/LiveViewport.h"
-#include "Components/Viewport.h"
+#include "Components/ProjectLauncher.h"
+#include "Components/WindowCaption.h"
+#include "State/WorldScene.h"
+#include "State/WorldRuntime.h"
+#include "State/GlbImport.h"
+#include "State/StudioPublishReview.h"
+#include "Components/ForgeAiPanel.h"
 #include "DesignSystem/Icons.h"
 #include "Workspaces/StudioWorkspace.h"
-#include "Workspaces/ModelingWorkspace.h"
+#include "Workspaces/EmbeddedStudio.h"
 #include "Workspaces/WorkspaceCatalog.h"
 
 #include <QActionGroup>
 #include <QCloseEvent>
+#include <QCheckBox>
+#include <QColorDialog>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
+#include <QFileDialog>
+#include <QFile>
+#include <QFileInfo>
+#include <QDir>
+#include <QSaveFile>
+#include <QFormLayout>
 #include <QCursor>
 #include <QDockWidget>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QJsonArray>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListView>
@@ -33,12 +52,15 @@
 #include <QStatusBar>
 #include <QTabBar>
 #include <QTimer>
+#include <memory>
 #include <QToolBar>
 #include <QToolButton>
+#include <QWidgetAction>
 #include <QWindow>
 
 #include <algorithm>
 #include <array>
+#include <sstream>
 
 #ifdef Q_OS_WIN
 #define NOMINMAX
@@ -49,6 +71,17 @@
 namespace {
 constexpr int World = 1;
 constexpr int Modeling = 2;
+constexpr int Sculpting = 3;
+constexpr int Texture = 4;
+constexpr int Material = 5;
+constexpr int Rigging = 7;
+constexpr int Animation = 8;
+
+bool usesLocalPanels(int index)
+{
+    return index == Modeling || index == Sculpting || index == Texture || index == Material
+        || index == Rigging || index == Animation;
+}
 constexpr int LayoutVersion = 2;
 constexpr int StudioLayoutVersion = 3;
 constexpr int ProjectIdRole = Qt::UserRole + 1;
@@ -176,7 +209,7 @@ public:
     explicit HomeHero(QWidget *parent)
         : QWidget(parent), art_(workspaceArt(worldWorkspace()).copy(0, 0, 620, 420))
     {
-        setMinimumHeight(275);
+        setMinimumHeight(215);
     }
 
 protected:
@@ -210,7 +243,7 @@ private:
 };
 }
 
-MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
+MainWindow::MainWindow(QWidget *parent, bool launchCreator) : QMainWindow(parent), launchCreator_(launchCreator)
 {
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowSystemMenuHint
         | Qt::WindowMinMaxButtonsHint | Qt::WindowCloseButtonHint);
@@ -230,25 +263,54 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     setCentralWidget(pages_);
     createDocks();
     createStatusBar();
+    browser_->appendLog(tr("WorldForge editor started."));
+    connect(liveWorld_,&LiveViewport::rendererStatusChanged,this,[this](const QString &status) {
+        if (status.startsWith("Vulkan ·"))
+            browser_->appendLog(status);
+        else
+            browser_->appendMessage(status);
+    });
+    auto *logs = new QTimer(this);
+    logs->setInterval(250);
+    connect(logs,&QTimer::timeout,this,[this] {
+        for (const auto &entry : takeEditorLog())
+            if (entry.level == QtInfoMsg)
+                browser_->appendLog(entry.text);
+            else
+                browser_->appendMessage(entry.text);
+    });
+    logs->start();
+    const auto showPanel = [this](auto show) {
+        switchWorkspace(World);
+        if (activeWorkspace_ == World) {
+            docks_.last()->show();
+            (browser_->*show)();
+        }
+    };
+    windowMenu_->addAction(tr("Output Log"),this,[showPanel] { showPanel(&ContentBrowser::showLog); });
+    windowMenu_->addAction(tr("Message Log"),this,[showPanel] { showPanel(&ContentBrowser::showMessages); });
+    auto *terminal = windowMenu_->addAction(tr("Terminal"),this,[showPanel] { showPanel(&ContentBrowser::showTerminal); });
+    terminal->setShortcut(QKeySequence("Ctrl+`"));
 
     connect(&store_, &ProjectStore::projectsChanged, this, &MainWindow::refreshProjects);
     connect(&store_, &ProjectStore::sceneChanged, this, &MainWindow::refreshStatus);
     connect(&store_, &ProjectStore::selectionChanged, this, &MainWindow::refreshStatus);
     connect(&store_, &ProjectStore::dirtyChanged, this, &MainWindow::refreshStatus);
     connect(&store_, &ProjectStore::editRejected, this, [this](const QString &reason) {
-        browser_->appendLog(reason);
+        browser_->appendMessage(reason);
         statusBar()->showMessage(reason, 5000);
     });
 
     QSettings settings;
-    if (!restoreGeometry(settings.value("window/geometry").toByteArray()))
+    if (!restoreGeometry(settings.value("window/geometry").toByteArray()) || launchCreator_)
         setWindowState(Qt::WindowMaximized);
-    const int savedWorkspace = std::clamp(settings.value("window/workspace", World).toInt(), 0, int(workspaces().size() - 1));
+    const int savedWorkspace = !launchCreator_ && store_.project()
+        ? std::clamp(settings.value("window/workspace", World).toInt(), 0, int(workspaces().size() - 1)) : 0;
     switchWorkspace(savedWorkspace);
     refreshProjects();
 
     if (!store_.loadError().isEmpty()) {
-        browser_->appendLog(store_.loadError());
+        browser_->appendMessage(store_.loadError());
         QTimer::singleShot(0, this, [this] { QMessageBox::warning(this, tr("Project recovery"), store_.loadError()); });
     }
 }
@@ -265,19 +327,52 @@ void MainWindow::createActions()
     renameProject_ = file->addAction(tr("Rename project…"), this, &MainWindow::renameProject);
     deleteProject_ = file->addAction(editorIcon("trash"), tr("Delete project…"), this, &MainWindow::deleteProject);
     file->addSeparator();
-    auto *home = file->addAction(editorIcon("home"), tr("&Project manager"), this, [this] { switchWorkspace(0); });
+    auto *home = file->addAction(editorIcon("home"), tr("&Project manager"), this, [this] {
+        if (launcher_)
+            launcher_->showRecent();
+        switchWorkspace(0);
+    });
     home->setShortcut(QKeySequence::Open);
     openWorld_ = file->addAction(editorIcon("world"), tr("Open World Editor"), this, [this] { switchWorkspace(World); });
+#ifdef Q_OS_WIN
+    file->addAction(tr("Open Studio Workspace"),this,[this] { openEmbeddedStudio(); })
+        ->setProperty("requiresStudioProcess",true);
+    file->addAction(tr("Edit Selected Mesh in Studio"),this,[this] { openEmbeddedStudio(true); })
+        ->setProperty("requiresStudioProcess",true);
+#endif
     save_ = file->addAction(editorIcon("save"), tr("&Save"), this, [this] { saveProject(true); });
     save_->setShortcut(QKeySequence::Save);
+    file->addAction(tr("Export Playable Scene…"),this,[this] {
+        const auto *project = store_.project();
+        if (!project)
+            return;
+        const auto folder = project->configuration.value("location").toString();
+        const auto fileName = QFileDialog::getSaveFileName(this,tr("Export Playable Scene"),
+            QDir(folder).filePath(project->name + ".wfplay"),tr("WorldForge Playable Scene (*.wfplay)"));
+        if (fileName.isEmpty())
+            return;
+        std::ostringstream data;
+        if (!WorldRuntime::exportScene(store_,data)) {
+            QMessageBox::warning(this,tr("Export Playable Scene"),tr("The scene exceeds the Player export limits."));
+            return;
+        }
+        const auto bytes = std::move(data).str();
+        QSaveFile output(fileName);
+        if (!output.open(QIODevice::WriteOnly) || output.write(bytes.data(),qint64(bytes.size())) != qint64(bytes.size())
+            || !output.commit()) {
+            QMessageBox::warning(this,tr("Export Playable Scene"),output.errorString());
+            return;
+        }
+        statusBar()->showMessage(tr("Exported %1").arg(fileName),5000);
+    });
     file->addSeparator();
     file->addAction(tr("E&xit"), QKeySequence::Quit, this, &QWidget::close);
 
     auto *edit = mainMenu_->addMenu(tr("&Edit"));
-    auto *undo = store_.history().createUndoAction(this, tr("&Undo"));
+    auto *undo = undo_ = store_.history().createUndoAction(this, tr("&Undo"));
     undo->setIcon(editorIcon("undo"));
     undo->setShortcuts(QKeySequence::Undo);
-    auto *redo = store_.history().createRedoAction(this, tr("&Redo"));
+    auto *redo = redo_ = store_.history().createRedoAction(this, tr("&Redo"));
     redo->setIcon(editorIcon("redo"));
     redo->setShortcuts(QKeySequence::Redo);
     edit->addAction(undo);
@@ -301,7 +396,7 @@ void MainWindow::createActions()
     help->addAction(tr("About WorldForge"), this, [this] {
         QMessageBox::about(this, tr("WorldForge Editor"), tr("WorldForge Editor 0.1.0\n"
             "C++20 and Qt Widgets frontend prototype.\n"
-            "Scene editing uses local demo data. Play mode is simulated."));
+            "World Editor uses the live Vulkan viewport. The game runtime is pending."));
     });
 
     commands_ = new QToolBar(tr("Commands"), this);
@@ -318,6 +413,10 @@ void MainWindow::createActions()
         static_cast<QToolButton *>(commands_->widgetForAction(action))->setPopupMode(QToolButton::InstantPopup);
         return action;
     };
+    applyStudioUpdate_ = commands_->addAction(editorIcon("box"),tr("Apply Studio Update"));
+    applyStudioUpdate_->setObjectName("applyStudioUpdate");
+    applyStudioUpdate_->setVisible(false);
+    connect(applyStudioUpdate_,&QAction::triggered,this,&MainWindow::publishStudioMesh);
     commands_->addAction(save_);
     for (auto *action : {undo, redo}) {
         commands_->addAction(action);
@@ -325,20 +424,31 @@ void MainWindow::createActions()
         button->setToolButtonStyle(Qt::ToolButtonIconOnly);
     }
     commands_->addSeparator();
-    play_ = new QAction(editorIcon("playFill", QColor("#83eb73")), tr("Play"), this);
-    commands_->addAction(play_);
-    play_->setCheckable(true);
+    play_ = commands_->addAction(editorIcon("playFill", QColor("#85df83")), tr("Play"));
     play_->setShortcut(Qt::Key_F5);
-    connect(play_, &QAction::toggled, this, [this](bool running) {
-        play_->setText(running ? tr("Stop") : tr("Play"));
-        play_->setIcon(editorIcon(running ? "stop" : "playFill", running ? QColor("#e9919e") : QColor("#83eb73")));
-        viewport_->setPreviewRunning(running);
-        browser_->appendLog(running ? tr("Simulated play preview started.") : tr("Simulated play preview stopped."));
-        refreshStatus();
+    play_->setToolTip(tr("Play world · WASD move · Space jump · Esc stop"));
+    simulate_ = commands_->addAction(editorIcon("box"), tr("Simulate"));
+    simulate_->setToolTip(tr("Run scene physics with the editor camera"));
+    stop_ = commands_->addAction(editorIcon("stop"), tr("Stop"));
+    stop_->setShortcut(Qt::Key_Escape);
+    connect(play_, &QAction::triggered, this, [this] { liveWorld_->start(LiveViewport::RunMode::Play); });
+    connect(simulate_, &QAction::triggered, this, [this] { liveWorld_->start(LiveViewport::RunMode::Simulate); });
+    connect(stop_, &QAction::triggered, this, [this] { liveWorld_->stop(); });
+    forgeAi_ = commands_->addAction(editorIcon("spark", QColor("#c49aff")), tr("Forge AI"));
+    forgeAi_->setObjectName("forgeAi");
+    forgeAi_->setToolTip(tr("Describe a barrier edit, preview it, and apply it as one undoable change"));
+    connect(forgeAi_, &QAction::triggered, this, [this] {
+        if (!forgeAiPanel_) {
+            forgeAiPanel_ = new ForgeAiPanel(store_, this);
+            connect(forgeAiPanel_, &ForgeAiPanel::applied, this, [this](const QString &objectId) {
+                store_.select(objectId);
+                statusBar()->showMessage(tr("Forge AI applied the barrier. Undo reverts it as one change."), 6000);
+            });
+        }
+        forgeAiPanel_->show();
+        forgeAiPanel_->raise();
+        forgeAiPanel_->activateWindow();
     });
-    auto *simulate = new QMenu(commands_);
-    simulate->addAction(tr("Toggle simulated play"), this, [this] { play_->trigger(); });
-    dropdown(tr("Simulate"), "box", simulate);
     commands_->addSeparator();
     dropdown(tr("Build"), "hammer", build);
     auto *source = new QMenu(commands_);
@@ -396,33 +506,18 @@ void MainWindow::createNavigation()
     auto *caption = new QHBoxLayout(header);
     caption->setContentsMargins(10, 0, 0, 0);
     caption->setSpacing(0);
-    auto *logo = iconLabel("forge", header, QColor("#ad50ff"), 24);
+    auto *logo = iconLabel("forge", header, QColor("#ad50ff"), 18);
     logo->setObjectName("forgeLogo");
     logo->setAttribute(Qt::WA_TransparentForMouseEvents);
     caption->addWidget(logo);
-    caption->addSpacing(10);
+    caption->addSpacing(7);
     caption->addWidget(mainMenu_);
     caption->addSpacing(8);
     caption->addWidget(commands_);
     caption->addSpacing(18);
     caption->addStretch();
 
-    const auto captionButton = [header, caption](const QString &icon, const QString &label) {
-        auto *button = new QToolButton(header);
-        button->setObjectName(icon == "close" ? "captionClose" : "captionButton");
-        button->setIcon(editorIcon(icon));
-        button->setIconSize({14, 14});
-        button->setFixedSize(38, 36);
-        button->setToolTip(label);
-        button->setAccessibleName(label);
-        caption->addWidget(button);
-        return button;
-    };
-    connect(captionButton("minimize", tr("Minimize")), &QToolButton::clicked, this, &QWidget::showMinimized);
-    connect(captionButton("maximize", tr("Maximize or restore")), &QToolButton::clicked, this, [this] {
-        isMaximized() ? showNormal() : showMaximized();
-    });
-    connect(captionButton("close", tr("Close")), &QToolButton::clicked, this, &QWidget::close);
+    caption->addWidget(new WindowCaption(*this, header->height(), header));
     shellRows->addWidget(header);
 
     auto *bar = new QWidget(shell);
@@ -457,10 +552,40 @@ void MainWindow::createNavigation()
         workspaceActions_.append(action);
     }
     connect(workspaceTabs_, &QTabBar::currentChanged, this, &MainWindow::switchWorkspace);
+    connect(workspaceTabs_, &QTabBar::tabBarClicked, this, [this](int index) {
+        if (index == activeWorkspace_ && pendingStudioWorkspace_ >= 0)
+            switchWorkspace(index);
+    });
 }
 
 QWidget *MainWindow::createHome()
 {
+    if (launchCreator_) {
+        projects_ = new QStandardItemModel(this);
+        launcher_ = new ProjectLauncher(projects_,this);
+        projectList_ = launcher_->recentList();
+        connect(projectList_->selectionModel(),&QItemSelectionModel::currentChanged,this,[this](const QModelIndex &index) {
+            if (index.isValid())
+                store_.switchProject(index.data(ProjectIdRole).toString());
+        });
+        connect(launcher_,&ProjectLauncher::openRequested,this,[this] { if (store_.project()) switchWorkspace(World); });
+        connect(launcher_,&ProjectLauncher::renameRequested,this,&MainWindow::renameProject);
+        connect(launcher_,&ProjectLauncher::deleteRequested,this,&MainWindow::deleteProject);
+        connect(launcher_,&ProjectLauncher::createRequested,this,[this](const QString &name,const QJsonObject &configuration) {
+            QString error;
+            if (!store_.createStarterProject(name,configuration,error)) {
+                launcher_->showError(error);
+                browser_->appendMessage(error);
+                return;
+            }
+            launcher_->showError({});
+            browser_->appendLog(tr("Created project %1.").arg(name.trimmed()));
+            switchWorkspace(World);
+            if (configuration.value("starter").toString() == "terrain")
+                liveWorld_->previewTerrain();
+        });
+        return launcher_;
+    }
     auto *home = new QWidget(this);
     auto *layout = new QVBoxLayout(home);
     layout->setContentsMargins(24, 22, 24, 24);
@@ -472,7 +597,7 @@ QWidget *MainWindow::createHome()
     banner->setSpacing(7);
     banner->addStretch();
     auto *name = new QLabel(tr("WorldForge"), hero);
-    name->setStyleSheet("font-size: 45px; font-weight: 650; color: #f3efff");
+    name->setStyleSheet("font-size: 30px; font-weight: 650; color: #f3efff");
     banner->addWidget(name);
     homeProject_ = new QLabel(hero);
     homeProject_->setTextFormat(Qt::PlainText);
@@ -544,50 +669,261 @@ QWidget *MainWindow::createEditor()
     closeView->setIcon(editorIcon("close"));
     closeView->setIconSize({12, 12});
     closeView->setToolTip(tr("Close viewport"));
-    connect(closeView, &QToolButton::clicked, this, [this, tab] { worldViews_->hide(); tab->hide(); });
+    connect(closeView, &QToolButton::clicked, this, [this, tab] {
+        liveWorld_->stop();
+        liveWorld_->hide();
+        tab->hide();
+        refreshStatus();
+    });
     tabRow->addWidget(closeView);
     row->addWidget(tab);
     auto *addView = new QToolButton(header);
     addView->setIcon(editorIcon("plus"));
     addView->setToolTip(tr("Show viewport"));
-    connect(addView, &QToolButton::clicked, this, [this, tab] { worldViews_->show(); tab->show(); });
+    connect(addView, &QToolButton::clicked, this, [this, tab] { liveWorld_->show(); tab->show(); refreshStatus(); });
     row->addWidget(addView);
-    worldLiveToggle_ = new QToolButton(header);
-    worldLiveToggle_->setText(tr("Live 3D"));
-    worldLiveToggle_->setCheckable(true);
-    connect(worldLiveToggle_, &QToolButton::toggled, this, &MainWindow::setWorldLive);
-    row->addWidget(worldLiveToggle_);
-    auto *cube = new QToolButton(header);
+    auto *frame = new QToolButton(header);
+    frame->setText(tr("Frame Scene"));
+    connect(frame, &QToolButton::clicked, this, [this] { liveWorld_->frame(); });
+    row->addWidget(frame);
+    worldAuthoring_ = new QWidget(header);
+    auto *authoring = new QHBoxLayout(worldAuthoring_);
+    authoring->setContentsMargins(0,0,0,0);
+    authoring->setSpacing(4);
+    row->addWidget(worldAuthoring_);
+    auto *cube = new QToolButton(worldAuthoring_);
     cube->setText(tr("Add Cube"));
     connect(cube, &QToolButton::clicked, this, [this] {
         store_.addCube();
-        worldLiveToggle_->setChecked(true);
-        if (liveWorld_)
-            liveWorld_->frame();
+        liveWorld_->frame();
     });
-    row->addWidget(cube);
-    auto *modeling = new QToolButton(header);
+    authoring->addWidget(cube);
+    auto *terrain = new QToolButton(worldAuthoring_);
+    terrain->setText(tr("Terrain"));
+    terrain->setPopupMode(QToolButton::InstantPopup);
+    auto *terrainMenu = new QMenu(terrain);
+    terrainMenu->addAction(tr("Add Terrain"), this, [this] { store_.addTerrain(); liveWorld_->frame(); });
+    terrainMenu->addAction(tr("Add Rolling Hills with Trees"), this, [this] { store_.addTerrain(true); liveWorld_->previewTerrain(); });
+    terrainMenu->addSeparator();
+    auto *brushSettings = new QWidget(terrainMenu);
+    auto *brushForm = new QFormLayout(brushSettings);
+    brushForm->setContentsMargins(10,4,10,4);
+    auto *radius = new QDoubleSpinBox(brushSettings);
+    radius->setRange(0.5,64);
+    radius->setValue(3);
+    radius->setSuffix(tr(" m"));
+    auto *strength = new QDoubleSpinBox(brushSettings);
+    strength->setRange(0.05,8);
+    strength->setValue(1);
+    brushForm->addRow(tr("Radius"),radius);
+    brushForm->addRow(tr("Strength"),strength);
+    auto *brushOptions = new QWidgetAction(terrainMenu);
+    brushOptions->setDefaultWidget(brushSettings);
+    terrainMenu->addAction(brushOptions);
+    auto *brushes = new QActionGroup(terrainMenu);
+    auto *select = terrainMenu->addAction(tr("Select"), this, [this] { liveWorld_->setTerrainBrush(0,0,false); });
+    brushes->addAction(select);
+    select->setCheckable(true);
+    select->setChecked(true);
+    for (const auto &brush : {QString("Raise"), QString("Lower"), QString("Smooth")}) {
+        const auto configure = [this,radius,strength,brush] {
+            const float power = float(strength->value());
+            liveWorld_->setTerrainBrush(float(radius->value()),brush == "Lower" ? -power : power,brush == "Smooth");
+        };
+        auto *action = terrainMenu->addAction(brush, this, [this, terrain, brush, configure] {
+            configure();
+            terrain->setText(tr("Terrain · %1").arg(brush));
+            statusBar()->showMessage(tr("Click the terrain to apply the brush. Ctrl+Z undoes a stroke."),5000);
+        });
+        brushes->addAction(action);
+        action->setCheckable(true);
+        connect(radius,&QDoubleSpinBox::valueChanged,action,[action,configure] { if (action->isChecked()) configure(); });
+        connect(strength,&QDoubleSpinBox::valueChanged,action,[action,configure] { if (action->isChecked()) configure(); });
+    }
+    auto *layers = terrainMenu->addMenu(tr("Paint Material Layer"));
+    const QStringList layerNames{tr("Automatic"),tr("Grass"),tr("Rock"),tr("Soil")};
+    for (int layer = 0; layer < layerNames.size(); ++layer) {
+        const auto name = layerNames[layer];
+        const auto configure = [this,radius,layer] { liveWorld_->setTerrainLayerBrush(float(radius->value()),layer); };
+        auto *paint = layers->addAction(name,this,[this,terrain,name,configure] {
+            configure();
+            terrain->setText(tr("Terrain · %1").arg(name));
+            statusBar()->showMessage(tr("Click the terrain to paint the selected layer."),5000);
+        });
+        paint->setCheckable(true);
+        brushes->addAction(paint);
+        connect(radius,&QDoubleSpinBox::valueChanged,paint,[paint,configure] { if (paint->isChecked()) configure(); });
+    }
+    connect(select, &QAction::triggered, terrain, [this,terrain] { terrain->setText(tr("Terrain")); });
+    terrain->setMenu(terrainMenu);
+    authoring->addWidget(terrain);
+    auto *atmosphere = new QToolButton(worldAuthoring_);
+    atmosphere->setText(tr("Sky & Fog"));
+    connect(atmosphere,&QToolButton::clicked,this,&MainWindow::editAtmosphere);
+    authoring->addWidget(atmosphere);
+    auto *modeling = new QToolButton(worldAuthoring_);
     modeling->setText(tr("Edit Mesh"));
-    connect(modeling, &QToolButton::clicked, this, [this] { switchWorkspace(Modeling); });
-    row->addWidget(modeling);
+    connect(modeling, &QToolButton::clicked, this, [this] {
+        openEmbeddedStudio(true);
+    });
+    authoring->addWidget(modeling);
+    pauseRuntime_ = new QToolButton(header);
+    pauseRuntime_->setText(tr("Pause"));
+    pauseRuntime_->setCheckable(true);
+    connect(pauseRuntime_,&QToolButton::toggled,this,[this](bool paused) {
+        liveWorld_->pause(paused);
+        pauseRuntime_->setText(paused ? tr("Resume") : tr("Pause"));
+        stepRuntime_->setEnabled(paused);
+    });
+    row->addWidget(pauseRuntime_);
+    stepRuntime_ = new QToolButton(header);
+    stepRuntime_->setText(tr("Step"));
+    stepRuntime_->setToolTip(tr("Advance one 1/120-second physics step"));
+    connect(stepRuntime_,&QToolButton::clicked,this,[this] { liveWorld_->step(); });
+    row->addWidget(stepRuntime_);
     row->addStretch();
     layout->addWidget(header);
-    worldViews_ = new QStackedWidget(editor);
-    viewport_ = new Viewport(store_, worldViews_);
-    worldViews_->addWidget(viewport_);
-    layout->addWidget(worldViews_, 1);
+    liveWorld_ = new LiveViewport(store_, false, editor);
+    liveWorld_->setObjectName("worldLiveViewport");
+    layout->addWidget(liveWorld_, 1);
+    connect(liveWorld_, &LiveViewport::rendererStatusChanged, this, [this] {
+        refreshStatus();
+        updateMetrics();
+    });
+    // Show mission objectives from Play in the status bar and the output log as they change.
+    auto *objectives = new QTimer(this);
+    objectives->setInterval(250);
+    auto lastObjective = std::make_shared<QString>();
+    connect(objectives,&QTimer::timeout,this,[this,lastObjective] {
+        const auto objective = liveWorld_->runtimeObjective();
+        if (objective.isEmpty() || objective == *lastObjective)
+            return;
+        *lastObjective = objective;
+        statusBar()->showMessage(objective);
+        browser_->appendLog(tr("Objective: %1").arg(objective));
+    });
+    connect(liveWorld_,&LiveViewport::runtimeChanged,this,[this,objectives,lastObjective] {
+        lastObjective->clear();
+        if (liveWorld_->runMode() == LiveViewport::RunMode::Play)
+            objectives->start();
+        else
+            objectives->stop();
+    });
+    connect(liveWorld_,&LiveViewport::runtimeChanged,this,[this] {
+        const bool running = liveWorld_->runMode() != LiveViewport::RunMode::Editing;
+        for (auto *dock : docks_)
+            dock->widget()->setEnabled(!running);
+        const QSignalBlocker block(pauseRuntime_);
+        pauseRuntime_->setChecked(false);
+        pauseRuntime_->setText(tr("Pause"));
+        stepRuntime_->setEnabled(false);
+        if (running) {
+            browser_->appendLog(liveWorld_->runMode() == LiveViewport::RunMode::Play ? tr("Play started.") : tr("Simulation started."));
+            statusBar()->showMessage(liveWorld_->runMode() == LiveViewport::RunMode::Play
+                ? tr("WASD to move · Space to jump · E to interact · Esc to stop") : tr("Simulating the runtime copy · Esc to stop"),3000);
+        } else {
+            browser_->appendLog(tr("Stopped. Authored scene restored."));
+        }
+        refreshStatus();
+    });
     return editor;
 }
 
-void MainWindow::setWorldLive(bool live)
+void MainWindow::editAtmosphere()
 {
-    if (live && !liveWorld_) {
-        liveWorld_ = new LiveViewport(store_, false, worldViews_);
-        worldViews_->addWidget(liveWorld_);
-        connect(liveWorld_, &LiveViewport::rendererStatusChanged, this, [this] { refreshStatus(); });
+    if (!store_.project())
+        return;
+    const auto *environment = store_.environment();
+    const auto details = environment ? environment->details : QJsonObject{};
+    const auto initial = readAtmosphere(details);
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Sky, Fog & Gravity"));
+    auto *form = new QFormLayout(&dialog);
+    auto *sky = new QCheckBox(tr("Show gradient sky"),&dialog);
+    sky->setChecked(initial.sky);
+    form->addRow(sky);
+    const auto colorControl = [&dialog,form](const QString &label,QColor value) {
+        auto *button = new QPushButton(value.name(),&dialog);
+        QObject::connect(button,&QPushButton::clicked,button,[button,&dialog,label] {
+            const auto color = QColorDialog::getColor(QColor(button->text()),&dialog,label);
+            if (color.isValid())
+                button->setText(color.name());
+        });
+        form->addRow(label,button);
+        return button;
+    };
+    auto *horizon = colorControl(tr("Horizon"),initial.horizon);
+    auto *zenith = colorControl(tr("Zenith"),initial.zenith);
+    auto *fogColor = colorControl(tr("Fog color"),initial.fogColor);
+    auto *fog = new QDoubleSpinBox(&dialog);
+    fog->setAccessibleName(tr("Fog density"));
+    fog->setRange(0,1);
+    fog->setDecimals(3);
+    fog->setSingleStep(0.01);
+    fog->setValue(initial.fogDensity);
+    form->addRow(tr("Fog density"),fog);
+    auto *falloff = new QDoubleSpinBox(&dialog);
+    falloff->setDecimals(3);
+    falloff->setRange(0,2);
+    falloff->setSingleStep(0.01);
+    falloff->setValue(initial.fogFalloff);
+    form->addRow(tr("Fog height falloff"),falloff);
+    auto *fogHeight = new QDoubleSpinBox(&dialog);
+    fogHeight->setRange(-1000,1000);
+    fogHeight->setValue(initial.fogHeight);
+    fogHeight->setSuffix(tr(" m"));
+    form->addRow(tr("Fog base height"),fogHeight);
+    const auto scalar = [&dialog,form](const QString &name,double minimum,double maximum,double initialValue) {
+        auto *field = new QDoubleSpinBox(&dialog);
+        field->setAccessibleName(name);
+        field->setRange(minimum,maximum);
+        field->setValue(initialValue);
+        form->addRow(name,field);
+        return field;
+    };
+    auto *sunAzimuth = scalar(tr("Default sun azimuth"),-180,180,initial.sunAzimuth);
+    auto *sunElevation = scalar(tr("Default sun elevation"),0,90,initial.sunElevation);
+    sunAzimuth->setSuffix("°");
+    sunElevation->setSuffix("°");
+    auto *shadows = new QCheckBox(tr("Cast sun shadows"),&dialog);
+    shadows->setAccessibleName(tr("Cast sun shadows"));
+    shadows->setChecked(initial.shadows);
+    form->addRow(shadows);
+    auto *center = new QWidget(&dialog);
+    auto *centerLayout = new QHBoxLayout(center);
+    centerLayout->setContentsMargins(0,0,0,0);
+    std::array<QDoubleSpinBox *,3> localCenter{};
+    for (int i = 0; i < 3; ++i) {
+        auto *axis = new QDoubleSpinBox(center);
+        axis->setRange(-100000,100000);
+        axis->setAccessibleName(tr("Local fog center %1").arg(QString("XYZ").at(i)));
+        axis->setValue(initial.localFogCenter[i]);
+        centerLayout->addWidget(axis);
+        localCenter[i] = axis;
     }
-    worldViews_->setCurrentWidget(live ? static_cast<QWidget *>(liveWorld_) : viewport_);
-    refreshStatus();
+    form->addRow(tr("Local fog center XYZ"),center);
+    auto *localRadius = scalar(tr("Local fog radius"),0,500,initial.localFogRadius);
+    localRadius->setSuffix(tr(" m"));
+    localRadius->setToolTip(tr("Set the radius above zero to enable the fog volume."));
+    auto *localDensity = scalar(tr("Local fog density"),0,1,initial.localFogDensity);
+    localDensity->setSingleStep(0.01);
+    auto *gravity = new QDoubleSpinBox(&dialog);
+    gravity->setRange(0,50);
+    gravity->setSuffix(tr(" m/s²"));
+    gravity->setValue(details.value("gravity").toDouble(9.81));
+    form->addRow(tr("Gravity"),gravity);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel,&dialog);
+    connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);
+    connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+    form->addRow(buttons);
+    if (dialog.exec() == QDialog::Accepted)
+        store_.setAtmosphere({{"sky",sky->isChecked()},{"horizon",horizon->text()},{"zenith",zenith->text()},
+                              {"fogColor",fogColor->text()},{"fogDensity",fog->value()},{"fogFalloff",falloff->value()},
+                              {"fogHeight",fogHeight->value()},{"gravity",gravity->value()},
+                              {"sunAzimuth",sunAzimuth->value()},{"sunElevation",sunElevation->value()},
+                              {"shadows",shadows->isChecked()},{"localFogRadius",localRadius->value()},
+                              {"localFogDensity",localDensity->value()},
+                              {"localFogCenter",QJsonArray{localCenter[0]->value(),localCenter[1]->value(),localCenter[2]->value()}}});
 }
 
 void MainWindow::createDocks()
@@ -658,10 +994,14 @@ void MainWindow::createDocks()
     connect(inspector, &Inspector::floatRequested, this, [this] { docks_[1]->setFloating(!docks_[1]->isFloating()); });
     connect(browser_, &ContentBrowser::floatRequested, this, [this] { docks_[2]->setFloating(!docks_[2]->isFloating()); });
     connect(browser_, &ContentBrowser::saveRequested, this, [this] { saveProject(true); });
+    connect(browser_, &ContentBrowser::newStudioAssetRequested, this, [this] {
+        openEmbeddedStudio(false,{},true);
+    });
+    connect(browser_, &ContentBrowser::editStudioAssetRequested, this, [this](const QString &id) {
+        openEmbeddedStudio(true,id);
+    });
     connect(browser_, &ContentBrowser::meshImported, this, [this] {
-        worldLiveToggle_->setChecked(true);
-        if (liveWorld_)
-            liveWorld_->frame();
+        liveWorld_->frame();
     });
     windowMenu_->addSeparator();
     windowMenu_->addAction(tr("Reset panel layout"), this, [this] {
@@ -694,9 +1034,9 @@ void MainWindow::createStatusBar()
     divider();
     row->addSpacing(10);
     row->addWidget(iconLabel("branch", left));
-    auto *branch = new QLabel(tr("Synced (main)"), left);
-    branch->setToolTip(tr("Sample source-control status"));
-    row->addWidget(branch);
+    statusSave_ = new QLabel(left);
+    statusSave_->setToolTip(tr("Local project save status"));
+    row->addWidget(statusSave_);
     row->addSpacing(30);
     divider();
     row->addSpacing(11);
@@ -706,32 +1046,36 @@ void MainWindow::createStatusBar()
     row->addSpacing(31);
     divider();
     const auto metric = [this, left, row](const QString &icon, const QString &label,
-                         const QString &value, int percent, const QString &color) {
+                                         const QString &description, const QString &color) {
         auto *metricGroup = new QWidget(left);
-        metricGroup->setToolTip(tr("Simulated performance reading"));
+        metricGroup->setToolTip(description);
         auto *reading = new QHBoxLayout(metricGroup);
         reading->setContentsMargins(0, 0, 0, 0);
         reading->setSpacing(7);
         reading->addWidget(iconLabel(icon, metricGroup, QColor("#e1e2e8"), 15));
         reading->addWidget(new QLabel(label, metricGroup));
-        auto *amount = new QLabel(value, metricGroup);
+        auto *amount = new QLabel(tr("—"), metricGroup);
         amount->setObjectName("metricValue");
+        amount->setAccessibleName(label + tr(" reading"));
+        amount->setMinimumWidth(label == tr("CPU") || label == tr("GPU") ? 32 : 82);
         reading->addWidget(amount);
         auto *meter = new QProgressBar(metricGroup);
         meter->setTextVisible(false);
         meter->setFixedSize(70, 4);
-        meter->setValue(percent);
+        meter->hide();
         meter->setStyleSheet("QProgressBar{background:#303441;border:0;border-radius:2px}"
             "QProgressBar::chunk{background:" + color + ";border-radius:2px}");
         reading->addWidget(meter);
         row->addStretch(1);
         row->addWidget(metricGroup);
         statusMetrics_.append(metricGroup);
+        metricValues_.append(amount);
+        metricMeters_.append(meter);
     };
-    metric("screen", tr("CPU"), "14%", 25, "#9ee1a6");
-    metric("hardware", tr("GPU"), "38%", 38, "#6be6ed");
-    metric("memory", tr("RAM"), "24.6 / 64 GB", 39, "#39dfe8");
-    metric("memory", tr("VRAM"), "7.8 / 24 GB", 33, "#39dfe8");
+    metric("screen", tr("CPU"), tr("System-wide CPU utilization"), "#9ee1a6");
+    metric("hardware", tr("GPU"), tr("Busiest engine on the viewport's GPU across all processes"), "#6be6ed");
+    metric("memory", tr("RAM"), tr("System physical memory in use"), "#39dfe8");
+    metric("memory", tr("GPU MEM"), tr("Dedicated memory on discrete GPUs or shared memory on integrated GPUs"), "#39dfe8");
     row->addStretch(1);
     divider();
     row->addWidget(iconLabel("layers", left));
@@ -742,11 +1086,49 @@ void MainWindow::createStatusBar()
     statusWorkspace_ = new QLabel(bar);
     statusWorkspace_->setContentsMargins(15, 0, 25, 0);
     bar->addPermanentWidget(statusWorkspace_);
+    auto *sampler = new QTimer(this);
+    sampler->setInterval(1000);
+    connect(sampler, &QTimer::timeout, this, &MainWindow::updateMetrics);
+    sampler->start();
+    updateMetrics();
+}
+
+void MainWindow::updateMetrics()
+{
+    if (metricValues_.size() != 4)
+        return;
+    const auto readings = metrics_.sample(liveWorld_->adapterCounterId(), liveWorld_->dedicatedMemory(), liveWorld_->sharedMemory());
+    const auto update = [this](int index, std::optional<double> percent, const QString &label) {
+        metricValues_[index]->setText(label);
+        metricMeters_[index]->setVisible(percent.has_value());
+        if (percent)
+            metricMeters_[index]->setValue(qRound(std::clamp(*percent, 0.0, 100.0)));
+    };
+    const auto percent = [this](std::optional<double> value) {
+        return value ? QString::number(qRound(*value)) + '%' : tr("—");
+    };
+    const auto memory = [this, &update](int index, std::optional<quint64> used, std::optional<quint64> total) {
+        constexpr double gib = 1024.0*1024*1024;
+        if (used && total && *total)
+            update(index, 100.0*double(*used)/double(*total),
+                   tr("%1 / %2 GiB").arg(double(*used)/gib, 0, 'f', 1).arg(double(*total)/gib, 0, 'f', 1));
+        else
+            update(index, std::nullopt, tr("—"));
+    };
+    update(0, readings.cpu, percent(readings.cpu));
+    update(1, readings.gpu, percent(readings.gpu));
+    memory(2, readings.ramUsed, readings.ramTotal);
+    memory(3, readings.vramUsed, readings.vramTotal);
+    const auto memoryKind = liveWorld_->dedicatedMemory() ? tr("Dedicated VRAM")
+        : liveWorld_->sharedMemory() ? tr("Shared GPU memory") : tr("GPU memory");
+    browser_->setMetrics(tr("System CPU: %1\nViewport GPU: %2\nSystem RAM: %3\n%4: %5\n%6")
+        .arg(metricValues_[0]->text(), metricValues_[1]->text(), metricValues_[2]->text(),
+             memoryKind, metricValues_[3]->text(), liveWorld_->rendererName()));
 }
 
 void MainWindow::resetLayout()
 {
-    if (activeWorkspace_ == Modeling)
+    if (usesLocalPanels(activeWorkspace_))
         return;
     const QList<Qt::DockWidgetArea> areas{Qt::LeftDockWidgetArea, Qt::RightDockWidgetArea, Qt::BottomDockWidgetArea};
     for (qsizetype i = 0; i < docks_.size(); ++i) {
@@ -779,14 +1161,224 @@ StudioWorkspace *MainWindow::studio(int index)
     return created;
 }
 
+void MainWindow::openEmbeddedStudio(bool editSelected,const QString &assetId,bool newAsset,int workspace)
+{
+    const auto *project = store_.project();
+    const auto *asset = assetId.isEmpty() ? store_.selectedMesh() : store_.meshAsset(assetId);
+    if (newAsset && !project)
+        return;
+    if (editSelected && (!project || !asset)) {
+        QMessageBox::information(this,tr("Edit Selected Mesh in Studio"),tr("Select a mesh in the level first."));
+        return;
+    }
+    if (embeddedStudio_ && embeddedStudio_->isRunning() && (newAsset || (editSelected
+        && (studioProjectId_ != project->id || studioAssetId_ != asset->id ||
+            studioAssetRevision_ != asset->mesh || studioSourceRevision_ != asset->studioSourceHash)))) {
+        const auto choice = QMessageBox::question(this,tr("Studio Session Already Open"),
+            tr("Save and close the current session in Studio before opening another asset or revision. "
+               "Return to the current session?"),
+            QMessageBox::Yes | QMessageBox::Cancel,QMessageBox::Yes);
+        if (choice == QMessageBox::Yes)
+            openEmbeddedStudio(false,{},false,workspace);
+        return;
+    }
+    if (!embeddedStudio_) {
+        embeddedStudio_ = new EmbeddedStudio(pages_);
+        pages_->addWidget(embeddedStudio_);
+        connect(embeddedStudio_,&EmbeddedStudio::workspaceReady,this,[this] {
+            if (pendingStudioWorkspace_ >= 0) {
+                const int workspace = pendingStudioWorkspace_;
+                pendingStudioWorkspace_ = -1;
+                showStudioWorkspace(workspace);
+            }
+        });
+        connect(embeddedStudio_,&EmbeddedStudio::sessionClosed,this,[this](const QString &message) {
+            pendingStudioWorkspace_ = -1;
+            if (pages_->currentWidget() == embeddedStudio_)
+                switchWorkspace(World);
+            if (!message.isEmpty())
+                statusBar()->showMessage(message,8000);
+        });
+    }
+    if (newAsset) {
+        const auto projectId = project->id;
+        bool accepted = false;
+        const auto name = QInputDialog::getText(this,tr("New Studio Asset"),tr("Asset name"),
+            QLineEdit::Normal,tr("Studio Mesh"),&accepted).trimmed();
+        if (!accepted || name.isEmpty() || !store_.project() || store_.project()->id != projectId)
+            return;
+        if (!embeddedStudio_->prepareAsset({},{})) {
+            QMessageBox::warning(this,tr("New Studio Asset"),tr("Could not prepare a Studio session."));
+            return;
+        }
+        studioProjectId_ = projectId;
+        studioAssetId_.clear();
+        studioAssetRevision_.clear();
+        studioSourceRevision_.clear();
+        studioNewAssetName_ = name;
+        studioAppliedRevision_.clear();
+    } else if (editSelected && !embeddedStudio_->isRunning()) {
+        QString error;
+        if (!asset->modifiers.empty() || !asset->otherUvSets.isEmpty()) {
+            QMessageBox::information(this,tr("Edit Selected Mesh in Studio"),
+                tr("This preview supports meshes with one UV set and no WorldForge modifiers."));
+            return;
+        }
+        const auto glb = exportGlb(*asset->mesh,asset->name,error,true);
+        if (glb.isEmpty() || !embeddedStudio_->prepareAsset(glb,store_.studioSourcePath(*asset))) {
+            QMessageBox::warning(this,tr("Edit Selected Mesh in Studio"),
+                error.isEmpty() ? tr("Could not prepare the mesh for Studio.") : error);
+            return;
+        }
+        studioProjectId_ = project->id;
+        studioAssetId_ = asset->id;
+        studioAssetRevision_ = asset->mesh;
+        studioSourceRevision_ = asset->studioSourceHash;
+        studioNewAssetName_.clear();
+        studioAppliedRevision_.clear();
+    } else if (!editSelected && !embeddedStudio_->isRunning()) {
+        embeddedStudio_->clearAsset();
+        studioProjectId_.clear();
+        studioAssetId_.clear();
+        studioAssetRevision_.clear();
+        studioSourceRevision_.clear();
+        studioNewAssetName_.clear();
+        studioAppliedRevision_.clear();
+    }
+    pendingStudioWorkspace_ = workspace;
+    if (activeWorkspace_ >= 0) {
+        const QSignalBlocker blocker(workspaceTabs_);
+        workspaceTabs_->setCurrentIndex(activeWorkspace_);
+    }
+    embeddedStudio_->showWorkspace(workspaces().at(workspace).name);
+}
+
+void MainWindow::showStudioWorkspace(int workspace)
+{
+    liveWorld_->stop();
+    if (activeWorkspace_ > 0 && !usesLocalPanels(activeWorkspace_))
+        workspaceLayouts_.insert(activeWorkspace_,saveState(workspaceLayoutVersion(activeWorkspace_)));
+    for (auto *dock : docks_) {
+        dock->hide();
+        dock->toggleViewAction()->setEnabled(false);
+    }
+    activeWorkspace_ = workspace;
+    {
+        const QSignalBlocker blocker(workspaceTabs_);
+        for (const int hidden : {0, 13, 15, 19})
+            workspaceTabs_->setTabVisible(hidden,false);
+        workspaceTabs_->setCurrentIndex(workspace);
+    }
+    workspaceActions_[workspace]->setChecked(true);
+    menuWidget()->show();
+    statusBar()->show();
+    pages_->setCurrentWidget(embeddedStudio_);
+    refreshStatus();
+}
+
+void MainWindow::publishStudioMesh()
+{
+    const auto *project = store_.project();
+    const auto *asset = store_.meshAsset(studioAssetId_);
+    const bool creating = !studioNewAssetName_.isEmpty();
+    if (!project || project->id != studioProjectId_ || (!creating
+        && (!asset || asset->mesh != studioAssetRevision_ || asset->studioSourceHash != studioSourceRevision_))) {
+        QMessageBox::warning(this,tr("Publish Studio Mesh"),
+            tr("Return to the editor, select the current target mesh, then reopen Studio."));
+        return;
+    }
+    const auto name = creating ? studioNewAssetName_ : asset->name;
+    const auto revision = embeddedStudio_->stagedRevision();
+    if (revision.isEmpty()) {
+        QMessageBox::information(this,tr("Publish Studio Mesh"),tr("Use File → Publish to WorldForge inside Studio first."));
+        return;
+    }
+    if (revision == studioAppliedRevision_) {
+        statusBar()->showMessage(tr("This Studio update is already applied."),5000);
+        return;
+    }
+    QFile file(QDir(revision).filePath("mesh.glb"));
+    if (!file.open(QIODevice::ReadOnly) || file.size() > 64 * 1024 * 1024) {
+        QMessageBox::warning(this,tr("Publish Studio Mesh"),tr("Choose a readable GLB no larger than 64 MiB."));
+        return;
+    }
+    const auto glb = file.read(64 * 1024 * 1024 + 1);
+    QFile source(QDir(revision).filePath("source.wfasset"));
+    constexpr qint64 maxStudioSource = 128 * 1024 * 1024;
+    if (!source.open(QIODevice::ReadOnly) || source.size() <= 0 || source.size() > maxStudioSource) {
+        QMessageBox::warning(this,tr("Publish Studio Mesh"),tr("The editable asset is missing or exceeds 128 MiB."));
+        return;
+    }
+    const auto sourceBytes = source.read(maxStudioSource + 1);
+    source.close();
+    file.close();
+    QString error;
+    auto preview = importGlb(glb,error);
+    if (!preview) {
+        QMessageBox::warning(this,tr("Publish Studio Mesh"),error);
+        return;
+    }
+    const auto check = reviewStudioPublish(*project,creating ? nullptr : asset,name,*preview);
+    if (!check.blocker.isEmpty()) {
+        QMessageBox::warning(this,tr("Publish Studio Mesh"),check.blocker);
+        return;
+    }
+    QMessageBox review(check.warnings.isEmpty() ? QMessageBox::Question : QMessageBox::Warning,
+        tr("Publish Studio Mesh"),check.summary(),QMessageBox::Apply | QMessageBox::Cancel,this);
+    review.setObjectName("studioPublishReview");
+    review.setTextFormat(Qt::PlainText);
+    review.setDefaultButton(QMessageBox::Cancel);
+    if (!check.placements.isEmpty())
+        review.setDetailedText(check.placements.join('\n'));
+    if (review.exec() != QMessageBox::Apply) {
+        statusBar()->showMessage(tr("Studio update canceled. %1 is unchanged.").arg(name),5000);
+        return;
+    }
+    const auto *current = store_.meshAsset(studioAssetId_);
+    if (!store_.project() || store_.project()->id != studioProjectId_) {
+        QMessageBox::warning(this,tr("Publish Studio Mesh"),tr("The project changed."));
+        return;
+    }
+    if (creating) {
+        if (!store_.createStudioMesh(name,std::move(*preview),sourceBytes,error)) {
+            QMessageBox::warning(this,tr("Publish Studio Mesh"),error);
+            return;
+        }
+        studioAssetId_ = store_.selectedMesh()->id;
+        studioNewAssetName_.clear();
+    } else if (!current || current->studioSourceHash != studioSourceRevision_
+        || !store_.publishStudioMesh(studioAssetId_,glb,studioAssetRevision_.data(),error,sourceBytes)) {
+        QMessageBox::warning(this,tr("Publish Studio Mesh"),error.isEmpty() ? tr("The project changed.") : error);
+        return;
+    }
+    studioAssetRevision_ = store_.meshAsset(studioAssetId_)->mesh;
+    studioSourceRevision_ = store_.meshAsset(studioAssetId_)->studioSourceHash;
+    studioAppliedRevision_ = revision;
+    refreshStatus();
+    statusBar()->showMessage(tr("Published %1").arg(name),5000);
+}
+
 void MainWindow::switchWorkspace(int index)
 {
     if (index < 0 || index >= workspaces().size() || !pages_)
         return;
-    if (index == activeWorkspace_)
+    const bool leavingStudio = embeddedStudio_ && pages_->currentWidget() == embeddedStudio_;
+    if (usesLocalPanels(index)) {
+        const bool editSelection = activeWorkspace_ == World && store_.selectedMesh()
+            && (index == Modeling || index == Sculpting || index == Texture);
+        openEmbeddedStudio(editSelection,{},false,index);
         return;
+    }
+    pendingStudioWorkspace_ = -1;
+    if (index == activeWorkspace_ && !leavingStudio)
+        return;
+    liveWorld_->stop();
     const bool home = index == 0;
-    if (activeWorkspace_ > 0 && activeWorkspace_ != Modeling)
+    if (launcher_) {
+        menuWidget()->setVisible(!home);
+        statusBar()->setVisible(!home);
+    }
+    if (!leavingStudio && activeWorkspace_ > 0 && !usesLocalPanels(activeWorkspace_))
         workspaceLayouts_.insert(activeWorkspace_, saveState(workspaceLayoutVersion(activeWorkspace_)));
     for (auto *dock : docks_)
         dock->hide();
@@ -799,16 +1391,10 @@ void MainWindow::switchWorkspace(int index)
     }
     workspaceActions_[index]->setChecked(true);
     for (auto *dock : docks_)
-        dock->toggleViewAction()->setEnabled(!home && index != Modeling);
+        dock->toggleViewAction()->setEnabled(!home && !usesLocalPanels(index));
 
     if (home) {
         pages_->setCurrentIndex(0);
-    } else if (index == Modeling) {
-        if (!modeling_) {
-            modeling_ = new ModelingWorkspace(store_, pages_);
-            pages_->addWidget(modeling_);
-        }
-        pages_->setCurrentWidget(modeling_);
     } else {
         const auto &workspace = workspaces().at(index);
         QStringList titles{tr("Scene Outliner"), tr("Details"), tr("Content Browser")};
@@ -838,10 +1424,6 @@ void MainWindow::switchWorkspace(int index)
         if (layout.isEmpty() || !restoreState(layout, workspaceLayoutVersion(index)))
             resetLayout();
     }
-    if (index != World)
-        play_->setChecked(false);
-    else if (!liveWorld_ && store_.selectedMesh())
-        worldLiveToggle_->setChecked(true);
     refreshStatus();
 }
 
@@ -870,16 +1452,13 @@ void MainWindow::refreshProjects()
     const auto id = active ? active->id : QString();
     if (worldViewProject_ != id) {
         worldViewProject_ = id;
-        worldLiveToggle_->setChecked(active && std::ranges::any_of(active->objects, [](const SceneObject &object) {
-            return !object.meshAsset.isEmpty();
-        }));
-        if (liveWorld_)
-            liveWorld_->frame();
+        liveWorld_->frame();
     }
     renameProject_->setEnabled(hasProject);
     deleteProject_->setEnabled(hasProject);
     openWorld_->setEnabled(hasProject);
-    homeProject_->setText(active ? tr("Active project  /  %1").arg(active->name) : tr("Create a project to begin"));
+    if (homeProject_)
+        homeProject_->setText(active ? tr("Active project  /  %1").arg(active->name) : tr("Create a project to begin"));
     refreshStatus();
 }
 
@@ -888,22 +1467,54 @@ void MainWindow::refreshStatus()
     const auto *project = store_.project();
     const QString projectName = project ? project->name : tr("No project");
     const auto &workspace = workspaces()[std::max(activeWorkspace_, 0)];
-    statusReady_->setText(play_->isChecked() ? tr("Simulating") : tr("Ready"));
+    const auto mode = liveWorld_->runMode();
+    const bool running = mode != LiveViewport::RunMode::Editing;
+    statusReady_->setText(mode == LiveViewport::RunMode::Play ? tr("Playing")
+        : running ? tr("Simulating") : project ? tr("Ready") : tr("No project"));
+    statusSave_->setText(store_.isDirty() ? tr("Unsaved") : tr("Local"));
     statusProject_->setText(tr("Project: %1%2").arg(projectName, store_.isDirty() ? "*" : ""));
     statusWorkspace_->setText(workspace.name);
-    statusRenderer_->setText(activeWorkspace_ == World && worldLiveToggle_->isChecked()
-        ? (liveWorld_ && liveWorld_->hasRenderedFrame() ? tr("Renderer: Vulkan") : tr("Live 3D"))
-        : activeWorkspace_ == Modeling ? tr("Mesh authoring") : tr("Reference preview"));
+    statusRenderer_->setText(activeWorkspace_ == World
+        ? (liveWorld_->hasRenderedFrame() ? tr("Renderer: Vulkan") : tr("Vulkan viewport"))
+        : activeWorkspace_ == Modeling ? tr("Mesh authoring")
+        : activeWorkspace_ == Sculpting ? tr("Sculpt authoring")
+        : activeWorkspace_ == Texture || activeWorkspace_ == Material ? tr("Material preview")
+        : activeWorkspace_ == Rigging || activeWorkspace_ == Animation ? tr("Studio authoring")
+        : tr("Reference preview"));
+    statusRenderer_->setToolTip(liveWorld_->rendererName());
     setWindowTitle(tr("WorldForge — %1%2 — %3").arg(projectName, store_.isDirty() ? "*" : "", workspace.name));
-    save_->setEnabled(project != nullptr || store_.isDirty());
-    play_->setEnabled(activeWorkspace_ == World && project != nullptr);
-    if (!play_->isEnabled() && play_->isChecked())
-        play_->setChecked(false);
-    deleteObject_->setEnabled(activeWorkspace_ == World && store_.selectedObject() != nullptr);
+    const bool canRun = activeWorkspace_ == World && project && liveWorld_->isVisible()
+        && liveWorld_->hasRenderedFrame() && !running;
+    play_->setEnabled(canRun);
+    simulate_->setEnabled(canRun);
+    stop_->setVisible(running);
+    stop_->setEnabled(running);
+    worldAuthoring_->setEnabled(!running && project);
+    if (forgeAi_)
+        forgeAi_->setEnabled(!running && project && activeWorkspace_ == World);
+    pauseRuntime_->setVisible(running);
+    stepRuntime_->setVisible(running);
+    undo_->setEnabled(!running && store_.history().canUndo());
+    redo_->setEnabled(!running && store_.history().canRedo());
+    save_->setEnabled(!running && (project != nullptr || store_.isDirty()));
+    const auto *studioAsset = store_.meshAsset(studioAssetId_);
+    const bool studioAssetOpen = project && studioProjectId_ == project->id
+        && embeddedStudio_ && pages_->currentWidget() == embeddedStudio_
+        && (studioAsset || !studioNewAssetName_.isEmpty());
+    applyStudioUpdate_->setVisible(studioAssetOpen);
+    if (studioAssetOpen)
+        applyStudioUpdate_->setToolTip(tr("Apply Studio Update to %1").arg(studioAsset ? studioAsset->name : studioNewAssetName_));
+    deleteObject_->setEnabled(!running && activeWorkspace_ == World && store_.selectedObject() != nullptr);
 }
 
 void MainWindow::createProject()
 {
+    liveWorld_->stop();
+    if (launcher_) {
+        launcher_->showCreator();
+        switchWorkspace(0);
+        return;
+    }
     bool ok = false;
     const auto name = QInputDialog::getText(this, tr("New project"), tr("Project name"),
                                           QLineEdit::Normal, {}, &ok);
@@ -919,6 +1530,7 @@ void MainWindow::createProject()
 
 void MainWindow::renameProject()
 {
+    liveWorld_->stop();
     if (!store_.project())
         return;
     bool ok = false;
@@ -930,6 +1542,7 @@ void MainWindow::renameProject()
 
 void MainWindow::deleteProject()
 {
+    liveWorld_->stop();
     if (!store_.project())
         return;
     const auto name = store_.project()->name;
@@ -944,6 +1557,7 @@ bool MainWindow::saveProject(bool announce)
 {
     QString error;
     if (!store_.save(&error)) {
+        browser_->appendMessage(error);
         QMessageBox::warning(this, tr("Save project"), error);
         return false;
     }
@@ -991,13 +1605,22 @@ bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    if (embeddedStudio_ && embeddedStudio_->isRunning()
+        && QMessageBox::question(this,tr("Close WorldForge"),
+            tr("Close WorldForge and the open Studio session? Unsaved Studio edits can be lost."),
+            QMessageBox::Close | QMessageBox::Cancel,QMessageBox::Cancel) != QMessageBox::Close) {
+        event->ignore();
+        return;
+    }
+    liveWorld_->stop();
     if (store_.isDirty() && !saveProject(false)) {
         event->ignore();
         return;
     }
     QSettings settings;
     settings.setValue("window/geometry", saveGeometry());
-    if (activeWorkspace_ > 0 && activeWorkspace_ != Modeling)
+    if ((!embeddedStudio_ || pages_->currentWidget() != embeddedStudio_)
+        && activeWorkspace_ > 0 && !usesLocalPanels(activeWorkspace_))
         workspaceLayouts_.insert(activeWorkspace_, saveState(workspaceLayoutVersion(activeWorkspace_)));
     for (auto it = workspaceLayouts_.cbegin(); it != workspaceLayouts_.cend(); ++it)
         settings.setValue(workspaceLayoutKey(it.key()), it.value());

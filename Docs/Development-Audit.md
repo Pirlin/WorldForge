@@ -6,6 +6,26 @@ The Development Drive contains the v3 master blueprint in Markdown, PDF, and Wor
 
 The 40 IDs specify workflows organized into 12 groups. The current build exposes 24 prototype destinations. A destination, reference image, or successful UI signal does not satisfy the workflow's acceptance criteria.
 
+## Live authoring milestone
+
+The World runtime loads heightfield and foliage render chunks around the camera or player, and loads collision tiles near dynamic bodies. Terrain edits invalidate chunks whose samples or edge normals changed. The outdoor terrain command generates an editable landscape with seed-based tree placement. The sky and sun render by default in the Vulkan editor. Height fog integrates density along each view ray with directional sun scattering.
+
+Jolt handles oriented boxes, spheres, and Z-axis capsules, plus angular motion and fixed, hinge, and distance joints in Play, Simulate, and the Windows Player. Grass, Rock, and Soil paint persist in the terrain heightfield. The Vulkan editor and Direct3D 11 Player render dynamic directional shadows, shadowed spherical fog, and foliage wind. The standalone scene format stores those settings and reads earlier exports. Its smoke tests read back a frame and exercise the exported avatar on the installed graphics adapter and Direct3D WARP. A separate clean Windows installation still needs a run.
+
+The startup launcher uses artwork from the project creator reference and verifies recent-project opening and project creation with saved configuration. Available starter scenes are Empty Scene and Rolling Hills. The editor selects the GTX 1650 on the development PC, and the Windows Player explicitly selects it when available. The native audit confirms the viewport adapter, warning delivery to the log panes, and live Command Prompt output.
+
+The Outliner hides legacy placeholders while they retain their original type and lack a mesh asset. The scene filter can reveal them, and the undoable World Settings cleanup removes unchanged demo records. Authored objects without rendering support are listed under Unrendered Scene Data.
+
+The status bar and World Editor Profiler sample CPU and physical RAM from Windows. The GPU load and memory counters match the Vulkan adapter's Windows LUID. Local save state and the renderer replace the sample source-control and renderer strings. The native audit verified CPU, RAM, GPU load, and GPU memory readings on Intel UHD and GTX 1650. The memory number is adapter-wide and uses shared memory on the Intel adapter and dedicated memory on the NVIDIA adapter.
+
+The compact Windows editor now applies typed scene commands for entity edits, while preserving the legacy aliases and assigning deterministic GUIDs. Versioned manifests reference checksummed scene generations. The save and reopen tests exercise legacy migration, interrupted saves, schema compatibility, and competing editor writes.
+
+World Editor provides a live Vulkan view for real mesh assets. The native authoring audit covers cube picking, Inspector transforms, resize, undo and redo, and reopening the saved scene. Blender GLB fixtures exercise geometry, UVs, material factors, and stable shared references after reimport. Modeling includes face extrusion, perimeter bevel, a midpoint quad-loop cut, a non-destructive Mirror X modifier for one-sided meshes, and a linked face UV editor. GPU readbacks and the audit results are available in the local build's `authoring-qa` directory.
+
+A run with the Khronos Vulkan API validation layer remains pending. Static mesh import flattens node transforms and renders base color with directional lighting. Textured PBR, rigged import, general-purpose bevel and UV packing, and the other studios' full backend workflows remain open.
+
+The sections below record the original prototype audit before the live authoring milestone.
+
 ## Visual audit
 
 All 17 supplied images were compared pixel by pixel with an application render at each image's native dimensions. The mean absolute RGB difference is the average per channel on a 0–255 scale. Lower values are closer. Exact equality would be 0.

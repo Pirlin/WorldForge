@@ -1,4 +1,6 @@
 #include "Components/EditorPanels.h"
+#include "Components/CommandTerminal.h"
+#include "State/WorldScene.h"
 
 #include "DesignSystem/Icons.h"
 #include "Workspaces/WorkspaceCatalog.h"
@@ -7,6 +9,7 @@
 #include <QActionGroup>
 #include <QCheckBox>
 #include <QClipboard>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDoubleSpinBox>
@@ -19,8 +22,10 @@
 #include <QLineEdit>
 #include <QListView>
 #include <QMenu>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPlainTextEdit>
+#include <QPushButton>
 #include <QScrollArea>
 #include <QSet>
 #include <QSignalBlocker>
@@ -40,11 +45,8 @@ namespace {
 constexpr int IdRole = Qt::UserRole + 1;
 constexpr int AssetNameRole = Qt::UserRole + 2;
 constexpr int AssetTypeRole = Qt::UserRole + 3;
-constexpr int FolderRole = Qt::UserRole + 4;
 constexpr int RowHeightRole = Qt::UserRole + 5;
 const QStringList Groups{"Environment", "Lighting", "Ruins", "Props", "Gameplay"};
-const QStringList Materials{"", "M_Castle_Stone", "M_Castle_Moss", "M_Valley_Grass",
-    "M_Silverwater", "M_Knight_Armor", "M_Default", "M_Castle_Banner"};
 
 QLineEdit *searchBox(const QString &hint, QWidget *parent)
 {
@@ -76,24 +78,6 @@ QString objectIcon(const SceneObject &object)
     return "box";
 }
 
-QIcon thumbnail(const SceneObject &object)
-{
-    static const QHash<QString, QRect> assetCrops{
-        {"castle-main", {795, 737, 65, 69}}, {"castle-tower", {876, 736, 65, 69}},
-        {"castle-tower-b", {957, 736, 65, 69}}, {"castle-wall", {1038, 736, 65, 69}},
-        {"archway", {1119, 736, 65, 69}}, {"statue-left", {1229, 736, 65, 69}},
-        {"statue-right", {1229, 736, 65, 69}}};
-    if (assetCrops.contains(object.id)) {
-        static const QPixmap sheet(":/Docs/file_00000000418c8208a492dcb2b14aaa90.png");
-        return QIcon(sheet.copy(assetCrops[object.id]));
-    }
-    if (object.id == "hero-knight") {
-        static const QPixmap sheet(":/Docs/file_000000003e18820d85b6a524ad596f27.png");
-        return QIcon(sheet.copy(465, 176, 275, 275));
-    }
-    return editorIcon(objectIcon(object), QColor("#a78be6"));
-}
-
 QString selectedGroup(QTreeView *tree)
 {
     const auto current = tree->currentIndex();
@@ -103,6 +87,15 @@ QString selectedGroup(QTreeView *tree)
             return group;
     }
     return "Props";
+}
+
+QString sceneGroup(const SceneObject &object)
+{
+    const bool supported = !object.meshAsset.isEmpty() || object.type == "Empty" || object.type == "Folder"
+        || object.type == "Directional Light" || object.type == "Point Light" || object.type == "Terrain"
+        || object.type == "World Atmosphere" || object.type == "Player Start";
+    return supported ? (object.group.isEmpty() ? QObject::tr("Ungrouped") : object.group)
+                     : QObject::tr("Unrendered Scene Data");
 }
 
 QLabel *mutedLabel(const QString &text, QWidget *parent)
@@ -121,19 +114,6 @@ QToolButton *iconButton(const QString &icon, const QString &label, QWidget *pare
     button->setAccessibleName(label);
     button->setToolTip(label);
     return button;
-}
-
-QPixmap worldCrop(const QRect &rect)
-{
-    static const QPixmap screenshot(":/Docs/file_00000000418c8208a492dcb2b14aaa90.png");
-    return screenshot.copy(rect);
-}
-
-QString assetName(const SceneObject &object)
-{
-    if (object.id == "statue-left" || object.id == "statue-right")
-        return "SM_Statue_Knight";
-    return object.type == "Static Mesh" ? "SM_" + object.name : object.name;
 }
 
 QWidget *section(QVBoxLayout *layout, const QString &title, bool expanded = true)
@@ -197,13 +177,23 @@ Outliner::Outliner(ProjectStore &store, QWidget *parent)
         tree_->collapseAll();
         tree_->expand(model_->index(0, 0));
     });
+    auto *demo = filters->addAction(tr("Show legacy demo placeholders"));
+    demo->setCheckable(true);
+    connect(demo, &QAction::toggled, this, [this](bool show) {
+        showDemo_ = show;
+        rebuild();
+    });
     filter->setMenu(filters);
     row->addWidget(filter);
     auto *add = iconButton("list", tr("Add scene object"), this);
     add->setPopupMode(QToolButton::InstantPopup);
     auto *addMenu = new QMenu(add);
-    for (const QString &type : QStringList{"Static Mesh", "Character", "Point Light", "Empty"}) {
-        addMenu->addAction(type, this, [this, type] { store_.addObject(type, selectedGroup(tree_)); });
+    addMenu->addAction(tr("Cube"), this, [this] { store_.addCube(); });
+    for (const QString &type : QStringList{"Directional Light", "Point Light", "Terrain", "Player Start", "Empty", "Folder"}) {
+        addMenu->addAction(type, this, [this, type] {
+            store_.addObject(type, type.endsWith("Light") ? "Lighting" : type == "Terrain" ? "Environment"
+                : type == "Player Start" ? "Gameplay" : selectedGroup(tree_));
+        });
     }
     add->setMenu(addMenu);
     row->addWidget(add);
@@ -261,12 +251,15 @@ void Outliner::focusSearch()
 void Outliner::rebuild()
 {
     const QSignalBlocker block(tree_->selectionModel());
-    QSet<QString> collapsed = model_->rowCount() == 0 ? QSet<QString>{"Props"} : QSet<QString>{};
+    QSet<QString> collapsed{tr("Unrendered Scene Data")};
     const auto previousRoot = model_->index(0, 0);
     for (int row = 0; row < model_->rowCount(previousRoot); ++row) {
         const auto index = model_->index(row, 0, previousRoot);
+        const auto group = index.siblingAtColumn(1).data().toString();
         if (!tree_->isExpanded(index))
-            collapsed.insert(index.siblingAtColumn(1).data().toString());
+            collapsed.insert(group);
+        else
+            collapsed.remove(group);
     }
     model_->clear();
     model_->setHorizontalHeaderLabels({{}, tr("Name"), tr("Type")});
@@ -292,11 +285,22 @@ void Outliner::rebuild()
     };
     auto *root = item({});
     model_->appendRow(sizedRow({root, item(tr("World (%1)").arg(project->name), editorIcon("globe")), item(tr("World"))}));
-    for (const auto &group : Groups) {
-        auto *folder = item({}, editorIcon("eye"));
+    QStringList groups;
+    const auto listed = [&](const SceneObject &object) {
+        return showDemo_ || !query.isEmpty() || !store_.isLegacyPlaceholder(object);
+    };
+    for (const auto &object : project->objects) {
+        if (!listed(object))
+            continue;
+        if (const auto group = sceneGroup(object); !groups.contains(group))
+            groups.append(group);
+    }
+    groups.sort(Qt::CaseInsensitive);
+    for (const auto &group : groups) {
+        auto *folder = item({});
         const auto folderRow = sizedRow({folder, item(group, editorIcon("folder", QColor("#e3e5ed"))), item(tr("Folder"))});
         for (const auto &object : project->objects) {
-            if (object.group != group || (!object.name.contains(query, Qt::CaseInsensitive)
+            if (!listed(object) || sceneGroup(object) != group || (!object.name.contains(query, Qt::CaseInsensitive)
                 && !object.type.contains(query, Qt::CaseInsensitive) && !group.contains(query, Qt::CaseInsensitive)))
                 continue;
             auto *row = item(object.name, editorIcon(objectIcon(object)));
@@ -306,11 +310,11 @@ void Outliner::rebuild()
             row->setToolTip(object.name);
             if (!object.visible)
                 row->setForeground(QColor("#748199"));
-            const auto type = object.type == "Directional Light" ? "DirectionalLight"
-                : QString(object.type).remove(' ');
+            const auto type = object.type == "Static Mesh" && object.meshAsset.isEmpty()
+                ? tr("No mesh") : object.type;
             folder->appendRow(sizedRow({eye, row, item(type)}));
         }
-        if (folder->rowCount() == 0 && !query.isEmpty()) {
+        if (folder->rowCount() == 0) {
             qDeleteAll(folderRow);
             continue;
         }
@@ -339,8 +343,10 @@ void Outliner::syncSelection()
 Inspector::Inspector(ProjectStore &store, QWidget *parent)
     : QWidget(parent), store_(store), type_(mutedLabel({}, this)), identity_(mutedLabel({}, this)),
       form_(new QWidget(this)), name_(new QLineEdit(this)), group_(new QComboBox(form_)),
-      mesh_(new QComboBox(form_)), lodGroup_(new QComboBox(form_)), lods_(new QSpinBox(form_)),
-      autoLod_(new QCheckBox(form_)), collision_(new QCheckBox(tr("Enabled"), form_)),
+      mesh_(new QComboBox(form_)), materialSlot_(new QComboBox(form_)), meshInfo_(new QLabel(form_)),
+      geometryState_(mutedLabel({}, form_)), materialColor_(new QPushButton(form_)), intensity_(new QDoubleSpinBox(form_)),
+      bodyMode_(new QComboBox(form_)), bounce_(new QDoubleSpinBox(form_)),
+      terrainSize_(new QDoubleSpinBox(form_)),
       visible_(new QCheckBox(tr("Visible in viewport"), form_)), components_(new QTreeView(this)),
       componentModel_(new QStandardItemModel(this))
 {
@@ -369,12 +375,30 @@ Inspector::Inspector(ProjectStore &store, QWidget *parent)
     auto *worldSettings = new QFormLayout(settings);
     auto *projectName = new QLabel(settings);
     auto *worldObjects = new QLabel(settings);
+    auto *worldMeshes = new QLabel(settings);
+    auto *worldRevision = new QLabel(settings);
+    auto *unusedDemo = new QPushButton(settings);
+    unusedDemo->setToolTip(tr("Removes unchanged objects from the original demo. You can undo this operation."));
     worldSettings->addRow(tr("Project"), projectName);
     worldSettings->addRow(tr("Scene objects"), worldObjects);
-    const auto updateWorld = [this, projectName, worldObjects] {
+    worldSettings->addRow(tr("Mesh assets"), worldMeshes);
+    worldSettings->addRow(tr("Scene revision"), worldRevision);
+    worldSettings->addRow(unusedDemo);
+    connect(unusedDemo, &QPushButton::clicked, this, [this] {
+        if (QMessageBox::question(this, tr("Remove demo objects"),
+                tr("Remove the unchanged objects from the original demo? This operation can be undone."),
+                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) == QMessageBox::Yes)
+            store_.removeUnusedDemoObjects();
+    });
+    const auto updateWorld = [this, projectName, worldObjects, worldMeshes, worldRevision, unusedDemo] {
         const auto *project = store_.project();
         projectName->setText(project ? project->name : tr("No project"));
         worldObjects->setNum(project ? int(project->objects.size()) : 0);
+        worldMeshes->setNum(project ? int(project->assets.size()) : 0);
+        worldRevision->setText(project && project->scene ? QString::number(project->scene->revision()) : tr("—"));
+        const int demoCount = int(store_.unusedDemoCount());
+        unusedDemo->setText(tr("Remove demo objects (%1)").arg(demoCount));
+        unusedDemo->setVisible(demoCount > 0);
     };
     connect(&store_, &ProjectStore::projectsChanged, this, updateWorld);
     connect(&store_, &ProjectStore::sceneChanged, this, updateWorld);
@@ -409,39 +433,11 @@ Inspector::Inspector(ProjectStore &store, QWidget *parent)
     header->addLayout(summary);
     header->addWidget(type_);
 
-    auto *commands = new QHBoxLayout;
-    auto *add = new QToolButton(objectHeader);
-    add->setObjectName("primaryTool");
-    add->setIcon(editorIcon("plus"));
-    add->setText(tr("Add Component"));
-    add->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    add->setPopupMode(QToolButton::InstantPopup);
-    auto *addMenu = new QMenu(add);
-    for (const auto &component : QStringList{"PointLightComponent", "AudioComponent", "PhysicsComponent", "ScriptComponent"}) {
-        addMenu->addAction(component, this, [this, component] {
-            const auto *current = store_.selectedObject();
-            if (!current)
-                return;
-            auto next = *current;
-            auto custom = next.details.value("components").toArray();
-            if (custom.contains(QJsonValue(component)))
-                return;
-            custom.append(component);
-            next.details.insert("components", custom);
-            store_.updateObject(next, tr("Add %1").arg(component));
-        });
-    }
-    add->setMenu(addMenu);
-    commands->addWidget(add);
-    commands->addStretch();
-    auto *blueprint = new QToolButton(objectHeader);
-    blueprint->setIcon(editorIcon("graph"));
-    blueprint->setText(tr("Blueprint"));
-    blueprint->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    blueprint->setPopupMode(QToolButton::InstantPopup);
-    auto *blueprintMenu = new QMenu(blueprint);
-    blueprintMenu->addAction(tr("Copy object ID"), copyId, &QToolButton::click);
-    blueprintMenu->addAction(tr("Reset transform"), this, [this] {
+    auto *reset = new QToolButton(objectHeader);
+    reset->setText(tr("Reset Transform"));
+    reset->setIcon(editorIcon("rotate"));
+    reset->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    connect(reset, &QToolButton::clicked, this, [this] {
         if (const auto *current = store_.selectedObject()) {
             auto next = *current;
             next.position = {};
@@ -450,10 +446,10 @@ Inspector::Inspector(ProjectStore &store, QWidget *parent)
             store_.updateObject(next, tr("Reset transform"));
         }
     });
-    blueprint->setMenu(blueprintMenu);
-    commands->addWidget(blueprint);
-    header->addLayout(commands);
-
+    header->addWidget(reset);
+    const auto updateReset = [this, reset] { reset->setEnabled(store_.selectedObject()); };
+    connect(&store_, &ProjectStore::selectionChanged, reset, updateReset);
+    updateReset();
     components_->setObjectName("componentsTree");
     components_->setAccessibleName(tr("Object components"));
     components_->setModel(componentModel_);
@@ -536,69 +532,154 @@ Inspector::Inspector(ProjectStore &store, QWidget *parent)
     }
     grid->setColumnMinimumWidth(0, 81);
 
-    auto *staticMesh = section(sections, tr("Static Mesh"));
-    auto *meshRow = new QHBoxLayout(staticMesh);
-    meshRow->setContentsMargins(19, 4, 7, 2);
-    auto *meshLabel = new QLabel(tr("Static Mesh"), staticMesh);
-    meshLabel->setMinimumWidth(91);
-    meshRow->addWidget(meshLabel);
-    auto *meshPreview = new QLabel(staticMesh);
-    meshPreview->setFixedSize(40, 40);
-    meshPreview->setPixmap(worldCrop({1448, 514, 38, 38}));
-    meshRow->addWidget(meshPreview);
-    mesh_->addItems({"SM_Castle_Main", "SM_Castle_Tower_A", "SM_Castle_Tower_B", "SM_Castle_Wall_A", "SM_Archway", "SM_Statue_Knight"});
+    auto *geometry = section(sections, tr("Geometry"));
+    auto *meshForm = new QFormLayout(geometry);
+    meshForm->setContentsMargins(12, 4, 8, 5);
     mesh_->setAccessibleName(tr("Static mesh asset"));
-    meshRow->addWidget(mesh_, 1);
-    auto *resetMesh = iconButton("rotate", tr("Reset mesh"), staticMesh);
-    connect(resetMesh, &QToolButton::clicked, this, [this] {
-        if (const auto *object = store_.selectedObject()) {
-            auto next = *object;
-            next.details.remove("mesh");
-            store_.updateObject(next, tr("Reset mesh"));
-        }
-    });
-    meshRow->addWidget(resetMesh);
-
-    auto *surface = section(sections, tr("Materials"));
-    auto *materialGrid = new QGridLayout(surface);
-    materialGrid->setContentsMargins(19, 4, 15, 3);
-    materialGrid->setHorizontalSpacing(8);
-    materialGrid->setVerticalSpacing(2);
-    for (int index = 0; index < int(materials_.size()); ++index) {
-        auto *label = new QLabel(tr("Element %1").arg(index), surface);
-        label->setMinimumWidth(88);
-        materialGrid->addWidget(label, index, 0);
-        auto *preview = new QLabel(surface);
-        preview->setFixedSize(40, 34);
-        preview->setPixmap(worldCrop({1448, 583 + 38 * index, 37, 35}));
-        materialGrid->addWidget(preview, index, 1);
-        auto *combo = new QComboBox(surface);
-        for (const auto &material : Materials)
-            combo->addItem(material.isEmpty() ? tr("Unassigned") : material, material);
-        combo->setAccessibleName(index == 0 ? tr("Surface material") : tr("Material element %1").arg(index));
-        materials_[index] = combo;
-        materialGrid->addWidget(combo, index, 2);
-        connect(combo, &QComboBox::activated, this, &Inspector::apply);
+    meshForm->addRow(tr("Mesh asset"), mesh_);
+    meshInfo_->setWordWrap(true);
+    meshForm->addRow(tr("Geometry"), meshInfo_);
+    terrainSize_->setRange(4,1024);
+    foliageDensity_ = new QDoubleSpinBox(geometry);
+    foliageDensity_->setRange(0,48);
+    foliageDensity_->setDecimals(0);
+    foliageDensity_->setAccessibleName(tr("Foliage per chunk"));
+    meshForm->addRow(tr("Trees per chunk"),foliageDensity_);
+    foliageSeed_ = new QDoubleSpinBox(geometry);
+    foliageSeed_->setRange(0,1000000);
+    foliageSeed_->setDecimals(0);
+    foliageSeed_->setAccessibleName(tr("Foliage seed"));
+    meshForm->addRow(tr("Foliage seed"),foliageSeed_);
+    foliageWind_ = new QDoubleSpinBox(geometry);
+    foliageWind_->setRange(0,0.5);
+    foliageWind_->setSingleStep(0.01);
+    foliageWind_->setAccessibleName(tr("Foliage wind strength"));
+    meshForm->addRow(tr("Wind strength"),foliageWind_);
+    for (auto *input : {foliageDensity_,foliageSeed_,foliageWind_}) {
+        input->setKeyboardTracking(false);
+        connect(input,&QDoubleSpinBox::editingFinished,this,&Inspector::apply);
     }
-    materialGrid->setColumnStretch(2, 1);
+    terrainSize_->setSuffix(tr(" m"));
+    terrainSize_->setAccessibleName(tr("Terrain width"));
+    meshForm->addRow(tr("Terrain width"),terrainSize_);
+    connect(terrainSize_,&QDoubleSpinBox::editingFinished,this,&Inspector::apply);
+    geometryState_->setWordWrap(true);
+    meshForm->addRow(geometryState_);
 
-    auto *lodBody = section(sections, tr("LOD"));
-    auto *lodForm = new QFormLayout(lodBody);
-    lodForm->setContentsMargins(19, 4, 15, 6);
-    lodForm->setVerticalSpacing(3);
-    lodForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    lodGroup_->addItems({"LargeProp", "SmallProp", "Character", "None"});
-    lodGroup_->setAccessibleName(tr("LOD Group"));
-    lods_->setRange(1, 8);
-    lods_->setAccessibleName(tr("Number of LODs"));
-    autoLod_->setAccessibleName(tr("Auto Compute LODs"));
-    lodForm->addRow(tr("LOD Group"), lodGroup_);
-    lodForm->addRow(tr("Number of LODs"), lods_);
-    lodForm->addRow(tr("Auto Compute LODs"), autoLod_);
-    collision_->setChecked(true);
-    auto *collisionBody = section(sections, tr("Collision"), false);
-    auto *collisionLayout = new QHBoxLayout(collisionBody);
-    collisionLayout->addWidget(collision_);
+    auto *surface = section(sections, tr("Material"));
+    auto *materialForm = new QFormLayout(surface);
+    materialForm->setContentsMargins(12, 4, 8, 5);
+    materialForm->addRow(tr("Material slot"), materialSlot_);
+    materialForm->addRow(tr("Base color"), materialColor_);
+    materialColor_->setToolTip(tr("Edit the material on this mesh asset and its instances"));
+    connect(materialSlot_, &QComboBox::currentIndexChanged, this, [this] {
+        const auto *asset = store_.selectedMesh();
+        const int index = materialSlot_->currentIndex();
+        const bool valid = asset && index >= 0 && std::size_t(index) < asset->mesh->materials.size();
+        materialColor_->setEnabled(valid);
+        if (!valid) {
+            materialColor_->setText(tr("No material"));
+            return;
+        }
+        const auto &value = asset->mesh->materials[index].color;
+        materialColor_->setText(QColor::fromRgbF(value[0], value[1], value[2]).name().toUpper());
+    });
+    connect(materialColor_, &QPushButton::clicked, this, [this] {
+        const auto *asset = store_.selectedMesh();
+        const int index = materialSlot_->currentIndex();
+        if (!asset || index < 0 || std::size_t(index) >= asset->mesh->materials.size())
+            return;
+        const auto id = asset->id;
+        const auto original = asset->mesh;
+        const auto &value = original->materials[index].color;
+        const auto color = QColorDialog::getColor(QColor::fromRgbF(value[0], value[1], value[2]), this, tr("Material Base Color"));
+        asset = store_.meshAsset(id);
+        if (!color.isValid() || !asset || asset->mesh != original)
+            return;
+        auto candidate = *original;
+        candidate.materials[index].color = {float(color.redF()), float(color.greenF()), float(color.blueF()), value[3]};
+        QString error;
+        if (!store_.updateMesh(id, std::move(candidate), tr("Set Material Base Color"), error))
+            QMessageBox::warning(this, tr("Material"), error);
+    });
+    auto *light = section(sections, tr("Light"));
+    auto *lightForm = new QFormLayout(light);
+    intensity_->setRange(0, 4);
+    intensity_->setSingleStep(0.1);
+    intensity_->setAccessibleName(tr("Light intensity"));
+    lightForm->addRow(tr("Intensity"), intensity_);
+    connect(intensity_, &QDoubleSpinBox::editingFinished, this, &Inspector::apply);
+
+    auto *physics = section(sections, tr("Physics"), false);
+    auto *physicsForm = new QFormLayout(physics);
+    physicsForm->setContentsMargins(12,4,8,5);
+    bodyMode_->setAccessibleName(tr("Physics body"));
+    bodyMode_->addItem(tr("None"), QString());
+    bodyMode_->addItem(tr("Static"), "Static");
+    bodyMode_->addItem(tr("Dynamic"), "Dynamic");
+    physicsForm->addRow(tr("Collider"), bodyMode_);
+    colliderShape_ = new QComboBox(physics);
+    colliderShape_->setAccessibleName(tr("Collider shape"));
+    colliderShape_->addItems({tr("Box"),tr("Sphere"),tr("Capsule")});
+    physicsForm->addRow(tr("Shape"),colliderShape_);
+    connect(colliderShape_,&QComboBox::activated,this,&Inspector::apply);
+    bounce_->setAccessibleName(tr("Restitution"));
+    bounce_->setRange(0,1);
+    bounce_->setSingleStep(0.05);
+    physicsForm->addRow(tr("Bounce"), bounce_);
+    mass_ = new QDoubleSpinBox(physics);
+    mass_->setRange(0,100000);
+    mass_->setSpecialValueText(tr("Automatic"));
+    mass_->setSuffix(tr(" kg"));
+    mass_->setAccessibleName(tr("Rigid body mass"));
+    friction_ = new QDoubleSpinBox(physics);
+    friction_->setRange(0,1);
+    friction_->setSingleStep(0.05);
+    friction_->setAccessibleName(tr("Rigid body friction"));
+    physicsForm->addRow(tr("Mass"),mass_);
+    physicsForm->addRow(tr("Friction"),friction_);
+    spin_ = new QDoubleSpinBox(physics);
+    spin_->setRange(-720,720);
+    spin_->setSuffix(tr(" °/s"));
+    spin_->setAccessibleName(tr("Initial spin about world Z"));
+    physicsForm->addRow(tr("Initial Z spin"),spin_);
+    for (auto *input : {mass_,friction_,spin_}) {
+        input->setKeyboardTracking(false);
+        connect(input,&QDoubleSpinBox::editingFinished,this,&Inspector::apply);
+    }
+    jointType_ = new QComboBox(physics);
+    jointType_->setAccessibleName(tr("Joint type"));
+    jointType_->addItem(tr("None"),QString());
+    for (const auto &type : {QString("Fixed"),QString("Hinge"),QString("Distance")})
+        jointType_->addItem(type,type);
+    jointTarget_ = new QComboBox(physics);
+    jointTarget_->setAccessibleName(tr("Joint target"));
+    jointAxis_ = new QComboBox(physics);
+    jointAxis_->setAccessibleName(tr("Joint world axis"));
+    jointAxis_->addItems({"X","Y","Z"});
+    physicsForm->addRow(tr("Joint"),jointType_);
+    physicsForm->addRow(tr("Connect to"),jointTarget_);
+    physicsForm->addRow(tr("Hinge world axis"),jointAxis_);
+    auto *pivot = new QWidget(physics);
+    auto *pivotFields = new QHBoxLayout(pivot);
+    pivotFields->setContentsMargins(0,0,0,0);
+    pivotFields->setSpacing(3);
+    for (int axis = 0; axis < int(jointOffset_.size()); ++axis) {
+        auto *input = new QDoubleSpinBox(pivot);
+        input->setRange(-10000,10000);
+        input->setButtonSymbols(QAbstractSpinBox::NoButtons);
+        input->setKeyboardTracking(false);
+        input->setAccessibleName(tr("Hinge pivot offset %1").arg(QString("XYZ").at(axis)));
+        pivotFields->addWidget(input);
+        jointOffset_[axis] = input;
+        connect(input,&QDoubleSpinBox::editingFinished,this,&Inspector::apply);
+    }
+    physicsForm->addRow(tr("Pivot offset XYZ"),pivot);
+    pivot->setToolTip(tr("Offset in world axes from the selected object's origin."));
+    for (auto *input : {jointType_,jointTarget_,jointAxis_})
+        connect(input,&QComboBox::activated,this,&Inspector::apply);
+    connect(bodyMode_, &QComboBox::activated, this, &Inspector::apply);
+    connect(bounce_, &QDoubleSpinBox::editingFinished, this, &Inspector::apply);
 
     auto *object = section(sections, tr("Object"), false);
     auto *objectTitle = qobject_cast<QToolButton *>(sections->itemAt(sections->count() - 2)->widget());
@@ -633,11 +714,9 @@ Inspector::Inspector(ProjectStore &store, QWidget *parent)
 
     connect(&store_, &ProjectStore::selectionChanged, this, &Inspector::refresh);
     connect(name_, &QLineEdit::editingFinished, this, &Inspector::apply);
-    for (auto *combo : {group_, mesh_, lodGroup_})
+    for (auto *combo : {group_, mesh_})
         connect(combo, &QComboBox::activated, this, &Inspector::apply);
-    for (auto *check : {visible_, autoLod_, collision_})
-        connect(check, &QCheckBox::clicked, this, &Inspector::apply);
-    connect(lods_, &QSpinBox::editingFinished, this, &Inspector::apply);
+    connect(visible_, &QCheckBox::clicked, this, &Inspector::apply);
     refresh();
 }
 
@@ -653,40 +732,93 @@ void Inspector::refresh()
     componentModel_->clear();
     if (!object)
         return;
-    const bool castle = object->id == "castle-main";
-    const bool staticMesh = object->type == "Static Mesh";
+    const auto *asset = store_.selectedMesh();
+    const bool terrain = object->type == "Terrain";
+    const bool atmosphere = object->type == "World Atmosphere";
     name_->setToolTip(object->id);
+    if (group_->findText(object->group) < 0)
+        group_->addItem(object->group);
     group_->setCurrentText(object->group);
-    const auto selectedMesh = object->details.value("mesh").toString(staticMesh ? assetName(*object) : QString());
-    int meshIndex = mesh_->findText(selectedMesh);
-    if (meshIndex < 0 && !selectedMesh.isEmpty()) {
-        mesh_->addItem(selectedMesh);
-        meshIndex = mesh_->count() - 1;
+    const QSignalBlocker meshBlock(mesh_);
+    mesh_->clear();
+    mesh_->addItem(tr("None"), QString());
+    for (const auto &candidate : store_.project()->assets)
+        mesh_->addItem(editorIcon("box"), candidate.name, candidate.id);
+    mesh_->setCurrentIndex(std::max(0, mesh_->findData(object->meshAsset)));
+    mesh_->setEnabled(object->type == "Static Mesh" || object->type == "Empty");
+    meshInfo_->setText(terrain ? tr("Heightfield · Static terrain collider")
+        : asset ? tr("%1 vertices · %2 faces").arg(asset->evaluated().vertices.size())
+            .arg(asset->evaluated().faces.size()) : tr("No mesh assigned"));
+    auto *meshForm = qobject_cast<QFormLayout *>(terrainSize_->parentWidget()->layout());
+    meshForm->setRowVisible(terrainSize_,terrain);
+    meshForm->setRowVisible(foliageDensity_,terrain);
+    meshForm->setRowVisible(foliageSeed_,terrain);
+    meshForm->setRowVisible(foliageWind_,terrain);
+    if (terrain) {
+        terrainSize_->setValue(readHeightfield(*object).size);
+        foliageDensity_->setValue(object->details.value("foliageDensity").toInt());
+        foliageSeed_->setValue(object->details.value("foliageSeed").toInt(42));
+        foliageWind_->setValue(object->details.value("foliageWind").toDouble(0.09));
     }
-    mesh_->setCurrentIndex(meshIndex);
-    materials_[0]->setCurrentIndex(materials_[0]->findData(object->material));
-    materials_[1]->setCurrentIndex(materials_[1]->findData(object->details.value("material1").toString(castle ? "M_Castle_Moss" : "")));
-    materials_[2]->setCurrentIndex(materials_[2]->findData(object->details.value("material2").toString(castle ? "M_Castle_Banner" : "")));
-    lodGroup_->setCurrentText(object->details.value("lodGroup").toString(staticMesh ? "LargeProp" : "None"));
-    lods_->setValue(object->details.value("lods").toInt(castle ? 4 : 1));
-    autoLod_->setChecked(object->details.value("autoLod").toBool(staticMesh));
-    collision_->setChecked(object->details.value("collision").toBool(true));
+    geometryState_->setText(asset ? (asset->sourcePath.isEmpty() ? tr("Native mesh") : QFileInfo(asset->sourcePath).fileName())
+        : (object->type == "Static Mesh" ? tr("This object has no renderable asset. Assign a project mesh.") : QString()));
+    const int materialIndex = materialSlot_->currentIndex();
+    materialSlot_->clear();
+    if (asset)
+        for (const auto &material : asset->mesh->materials)
+            materialSlot_->addItem(QString::fromStdString(material.name));
+    if (materialIndex >= 0 && materialIndex < materialSlot_->count())
+        materialSlot_->setCurrentIndex(materialIndex);
+    const bool light = object->type == "Directional Light" || object->type == "Point Light";
+    intensity_->setEnabled(light);
+    intensity_->setValue(object->details.value("lightIntensity").toDouble(1));
+    bodyMode_->setEnabled(asset != nullptr);
+    bodyMode_->setCurrentIndex(std::max(0,bodyMode_->findData(object->details.value("physics").toString())));
+    colliderShape_->setEnabled(asset && bodyMode_->currentIndex() > 0);
+    colliderShape_->setCurrentIndex(std::clamp(object->details.value("colliderShape").toInt(),0,2));
+    bounce_->setEnabled(asset && bodyMode_->currentIndex() == 2);
+    bounce_->setValue(object->details.value("bounce").toDouble());
+    mass_->setEnabled(asset && bodyMode_->currentIndex() == 2);
+    mass_->setValue(object->details.value("mass").toDouble());
+    friction_->setEnabled(asset && bodyMode_->currentIndex() > 0);
+    friction_->setValue(object->details.value("friction").toDouble(0.55));
+    spin_->setEnabled(asset && bodyMode_->currentIndex() == 2);
+    spin_->setValue(object->details.value("spin").toDouble());
+    jointType_->setEnabled(asset && bodyMode_->currentIndex() > 0);
+    jointType_->setCurrentIndex(std::max(0,jointType_->findData(object->details.value("jointType").toString())));
+    jointTarget_->clear();
+    jointTarget_->addItem(tr("Choose a body"),QString());
+    if (const auto *project = store_.project())
+        for (const auto &candidate : project->objects)
+            if (candidate.id != object->id && candidate.visible && store_.meshAsset(candidate.meshAsset)
+                && !candidate.details.value("physics").toString().isEmpty())
+                jointTarget_->addItem(candidate.name,candidate.id);
+    jointTarget_->setCurrentIndex(std::max(0,jointTarget_->findData(object->details.value("jointTarget").toString())));
+    jointTarget_->setEnabled(jointType_->isEnabled() && jointType_->currentIndex() > 0);
+    jointAxis_->setCurrentIndex(std::clamp(object->details.value("jointAxis").toInt(2),0,2));
+    jointAxis_->setEnabled(jointType_->isEnabled() && jointType_->currentData().toString() == "Hinge");
+    const auto offset = object->details.value("jointOffset").toArray();
+    for (int axis = 0; axis < int(jointOffset_.size()); ++axis) {
+        jointOffset_[axis]->setEnabled(jointAxis_->isEnabled());
+        jointOffset_[axis]->setValue(axis < offset.size() ? offset.at(axis).toDouble() : 0);
+    }
     visible_->setChecked(object->visible);
     identity_->setText(object->id);
     const std::array vectors{object->position, object->rotation, object->scale};
-    for (size_t i = 0; i < axes_.size(); ++i)
+    for (size_t i = 0; i < axes_.size(); ++i) {
+        axes_[i]->setEnabled(!atmosphere && (!terrain || i < 3));
         axes_[i]->setValue(vectors[i / 3][int(i % 3)]);
-
-    const auto kind = staticMesh ? tr("StaticMeshActor") : object->type;
-    auto *actor = item(tr("%1 (%2)").arg(object->name, kind), editorIcon("box"));
-    componentModel_->appendRow(actor);
-    if (staticMesh) {
-        for (const auto &component : {tr("StaticMeshComponent (StaticMeshComponent0)"),
-            tr("CollisionComponent (Collision)"), tr("LODComponent (LOD)")})
-            actor->appendRow(item(component, editorIcon("box")));
     }
-    for (const auto &component : object->details.value("components").toArray())
-        actor->appendRow(item(component.toString(), editorIcon("box")));
+
+    auto *actor = item(tr("%1 (%2)").arg(object->name, object->type), editorIcon(objectIcon(*object)));
+    componentModel_->appendRow(actor);
+    actor->appendRow(item(tr("Transform"), editorIcon("move")));
+    if (asset)
+        actor->appendRow(item(tr("Mesh · %1").arg(asset->name), editorIcon("box")));
+    if (light)
+        actor->appendRow(item(tr("Light"), editorIcon("spark")));
+    if (terrain || bodyMode_->currentIndex() > 0)
+        actor->appendRow(item(terrain ? tr("Terrain collider") : bodyMode_->currentText(), editorIcon("box")));
     components_->expandAll();
     components_->setCurrentIndex(actor->rowCount() ? actor->child(0)->index() : actor->index());
 }
@@ -707,23 +839,45 @@ void Inspector::apply()
         action = tr("Rename %1").arg(current->name);
     } else if (sender() == group_) {
         next.group = group_->currentText();
-    } else if (sender() == materials_[0]) {
-        next.material = materials_[0]->currentData().toString();
-    } else if (sender() == materials_[1] || sender() == materials_[2]) {
-        const int index = sender() == materials_[1] ? 1 : 2;
-        next.details.insert("material" + QString::number(index), materials_[index]->currentData().toString());
     } else if (sender() == visible_) {
         next.visible = visible_->isChecked();
     } else if (sender() == mesh_) {
-        next.details.insert("mesh", mesh_->currentText());
-    } else if (sender() == lodGroup_) {
-        next.details.insert("lodGroup", lodGroup_->currentText());
-    } else if (sender() == lods_) {
-        next.details.insert("lods", lods_->value());
-    } else if (sender() == autoLod_) {
-        next.details.insert("autoLod", autoLod_->isChecked());
-    } else if (sender() == collision_) {
-        next.details.insert("collision", collision_->isChecked());
+        next.meshAsset = mesh_->currentData().toString();
+        if (!next.meshAsset.isEmpty() && next.type == "Empty")
+            next.type = "Static Mesh";
+    } else if (sender() == intensity_) {
+        next.details.insert("lightIntensity", intensity_->value());
+    } else if (sender() == bodyMode_) {
+        next.details.insert("physics", bodyMode_->currentData().toString());
+    } else if (sender() == colliderShape_) {
+        next.details.insert("colliderShape",colliderShape_->currentIndex());
+    } else if (sender() == bounce_) {
+        next.details.insert("bounce", bounce_->value());
+    } else if (sender() == mass_) {
+        next.details.insert("mass",mass_->value());
+    } else if (sender() == friction_) {
+        next.details.insert("friction",friction_->value());
+    } else if (sender() == spin_) {
+        next.details.insert("spin",spin_->value());
+    } else if (sender() == jointType_) {
+        next.details.insert("jointType",jointType_->currentData().toString());
+    } else if (sender() == jointTarget_) {
+        next.details.insert("jointTarget",jointTarget_->currentData().toString());
+    } else if (sender() == jointAxis_) {
+        next.details.insert("jointAxis",jointAxis_->currentIndex());
+    } else if (std::ranges::find(jointOffset_,sender()) != jointOffset_.end()) {
+        QJsonArray offset;
+        for (const auto *input : jointOffset_)
+            offset.append(input->value());
+        next.details.insert("jointOffset",offset);
+    } else if (sender() == foliageDensity_ && next.type == "Terrain") {
+        next.details.insert("foliageDensity",int(foliageDensity_->value()));
+    } else if (sender() == foliageSeed_ && next.type == "Terrain") {
+        next.details.insert("foliageSeed",int(foliageSeed_->value()));
+    } else if (sender() == foliageWind_ && next.type == "Terrain") {
+        next.details.insert("foliageWind",foliageWind_->value());
+    } else if (sender() == terrainSize_ && next.type == "Terrain") {
+        next.details.insert("size",terrainSize_->value());
     } else {
         const auto axis = std::ranges::find(axes_, sender());
         if (axis == axes_.end())
@@ -732,9 +886,7 @@ void Inspector::apply()
         const std::array vectors{&next.position, &next.rotation, &next.scale};
         (*vectors[index / 3])[int(index % 3)] = float((*axis)->value());
     }
-    if (next.name != current->name || next.group != current->group || next.material != current->material
-        || next.visible != current->visible || next.position != current->position || next.rotation != current->rotation
-        || next.scale != current->scale || next.details != current->details)
+    if (next != *current)
         store_.updateObject(next, action);
 }
 
@@ -747,7 +899,6 @@ public:
     {
         const bool selected = option.state.testFlag(QStyle::State_Selected);
         const bool hovered = option.state.testFlag(QStyle::State_MouseOver);
-        const bool folder = !index.data(FolderRole).toString().isEmpty();
         painter->save();
         painter->setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
         QRect tile = option.rect.adjusted(2, 2, -2, -3);
@@ -768,11 +919,9 @@ public:
         const auto label = painter->fontMetrics().elidedText(name, Qt::ElideMiddle, tile.width() - 5);
         painter->setPen(QColor("#eff0f5"));
         painter->drawText(QRect(tile.left(), image.bottom() + 3, tile.width(), 15), Qt::AlignCenter, label);
-        if (!folder) {
-            painter->setPen(QColor("#b2b3c0"));
-            painter->drawText(QRect(tile.left(), image.bottom() + 17, tile.width(), 14),
-                Qt::AlignCenter, index.data(AssetTypeRole).toString());
-        }
+        painter->setPen(QColor("#b2b3c0"));
+        painter->drawText(QRect(tile.left(), image.bottom() + 17, tile.width(), 14),
+            Qt::AlignCenter, index.data(AssetTypeRole).toString());
         painter->restore();
     }
 
@@ -784,7 +933,8 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     : QWidget(parent), store_(store), search_(searchBox(tr("Search Content"), this)),
       folders_(new QTreeView(this)), tiles_(new QListView(this)), folderModel_(new QStandardItemModel(this)),
       assetModel_(new QStandardItemModel(this)), tabs_(new QTabWidget(this)), path_(new QLabel(this)),
-      count_(mutedLabel({}, this)), log_(new QPlainTextEdit(this))
+      count_(mutedLabel({}, this)), log_(new QPlainTextEdit(this)), messages_(new QPlainTextEdit(this)),
+      profiler_(new QLabel(this))
 {
     setObjectName("panelBody");
     setMinimumHeight(219);
@@ -797,12 +947,14 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     assets->setObjectName("panelBody");
     tabs_->addTab(assets, editorIcon("box"), tr("Content Browser"));
     tabs_->addTab(log_, editorIcon("log"), tr("Output Log"));
-    auto *messages = new QLabel(tr("No project messages"), tabs_);
-    messages->setAlignment(Qt::AlignCenter);
-    tabs_->addTab(messages, editorIcon("log"), tr("Message Log"));
-    auto *profiler = new QLabel(tr("Profiler preview · sample readings appear in the status bar"), tabs_);
-    profiler->setAlignment(Qt::AlignCenter);
-    tabs_->addTab(profiler, editorIcon("pulse"), tr("Profiler"));
+    messages_->setReadOnly(true);
+    messages_->setMaximumBlockCount(500);
+    messages_->setAccessibleName(tr("Project messages"));
+    messages_->setPlaceholderText(tr("No project messages"));
+    tabs_->addTab(messages_, editorIcon("log"), tr("Message Log"));
+    profiler_->setAlignment(Qt::AlignCenter);
+    tabs_->addTab(profiler_, editorIcon("pulse"), tr("Profiler"));
+    tabs_->addTab(new CommandTerminal(store_,tabs_),editorIcon("code"),tr("Terminal"));
     auto *close = iconButton("close", tr("Close Content Browser"), tabs_);
     connect(close, &QToolButton::clicked, this, &ContentBrowser::closeRequested);
     tabs_->setCornerWidget(close);
@@ -815,7 +967,7 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     log_->setReadOnly(true);
     log_->setMaximumBlockCount(500);
     log_->setAccessibleName(tr("Output log"));
-    appendLog(tr("WorldForge frontend initialized."));
+    log_->setPlaceholderText(tr("Editor activity, rendering, and runtime output appear here."));
 
     auto *content = new QVBoxLayout(assets);
     content->setContentsMargins(0, 0, 0, 0);
@@ -837,12 +989,11 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     auto *add = textButton("plus", tr("Add"));
     add->setPopupMode(QToolButton::InstantPopup);
     auto *addMenu = new QMenu(add);
-    for (const auto &kind : QStringList{"Static Mesh", "Character", "Empty"}) {
-        addMenu->addAction(kind, this, [this, kind] {
-            const auto group = folders_->currentIndex().data(IdRole).toString();
-            store_.addObject(kind, Groups.contains(group) ? group : "Props");
-        });
-    }
+    addMenu->addAction(tr("Cube"), this, [this] { store_.addCube(); });
+    addMenu->addAction(tr("Place Selected Mesh"), this, [this] {
+        store_.placeMesh(tiles_->currentIndex().data(IdRole).toString());
+    });
+    addMenu->addAction(tr("New Studio Asset…"), this, &ContentBrowser::newStudioAssetRequested);
     add->setMenu(addMenu);
     auto *import = textButton("import", tr("Import"));
     connect(import, &QToolButton::clicked, this, [this] {
@@ -853,7 +1004,8 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
             return;
         QString error;
         if (!store_.importMesh(file, error)) {
-            appendLog(tr("Import failed: %1").arg(error));
+            appendMessage(tr("Import failed: %1").arg(error));
+            showMessages();
             return;
         }
         appendLog(tr("Imported %1.").arg(QFileInfo(file).fileName()));
@@ -864,12 +1016,12 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     auto *copy = iconButton("copy", tr("Copy asset name"), commands);
     auto *link = iconButton("link", tr("Copy asset ID"), commands);
     connect(copy, &QToolButton::clicked, this, [this] {
-        if (const auto *object = store_.selectedObject())
-            QApplication::clipboard()->setText(assetName(*object));
+        if (const auto *asset = store_.meshAsset(tiles_->currentIndex().data(IdRole).toString()))
+            QApplication::clipboard()->setText(asset->name);
     });
     connect(link, &QToolButton::clicked, this, [this] {
-        if (const auto *object = store_.selectedObject())
-            QApplication::clipboard()->setText(object->id);
+        if (const auto *asset = store_.meshAsset(tiles_->currentIndex().data(IdRole).toString()))
+            QApplication::clipboard()->setText(asset->id);
     });
     bar->addWidget(copy);
     bar->addWidget(link);
@@ -918,16 +1070,11 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     folders_->setIconSize({13, 13});
     folders_->setItemDelegate(new RowHeightDelegate(15, folders_));
     folders_->setUniformRowHeights(true);
-    auto *project = item("MythicValley", editorIcon("box"));
+    auto *project = item({}, editorIcon("box"));
     auto *root = item(tr("Content"), editorIcon("folderFill", QColor("#f3ce63")));
     folderModel_->appendRow(project);
     project->appendRow(root);
-    for (const auto &group : QStringList{"Environment", "Megascans", "Props", "Ruins", "Characters",
-        "Materials", "Textures", "Blueprints", "Maps", "Lighting", "Gameplay"}) {
-        auto *row = item(group, editorIcon("folderFill", QColor("#f3ce63")));
-        row->setData(group == "Characters" ? "Props" : group, IdRole);
-        root->appendRow(row);
-    }
+    root->appendRow(item(tr("Meshes"), editorIcon("folderFill", QColor("#f3ce63"))));
     folders_->expandAll();
     folders_->setCurrentIndex(root->index());
     const auto updateProject = [this, project] {
@@ -952,6 +1099,15 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     tiles_->setGridSize({81, 116});
     tiles_->setIconSize({65, 69});
     tiles_->setMouseTracking(true);
+    tiles_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(tiles_, &QListView::customContextMenuRequested, this, [this](const QPoint &point) {
+        const auto id = tiles_->indexAt(point).data(IdRole).toString();
+        if (id.isEmpty())
+            return;
+        QMenu menu(tiles_);
+        menu.addAction(tr("Edit in Studio"), this, [this, id] { emit editStudioAssetRequested(id); });
+        menu.exec(tiles_->viewport()->mapToGlobal(point));
+    });
     auto *tileDelegate = new AssetTileDelegate(tiles_);
     auto *listDelegate = tiles_->itemDelegate();
     tiles_->setItemDelegate(tileDelegate);
@@ -988,20 +1144,18 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     connect(folders_->selectionModel(), &QItemSelectionModel::currentChanged, this, &ContentBrowser::rebuild);
     connect(tiles_->selectionModel(), &QItemSelectionModel::currentChanged, this, [this](const QModelIndex &index) {
         const auto id = index.data(IdRole).toString();
-        if (!id.isEmpty())
-            store_.select(id);
-    });
-    connect(tiles_, &QListView::activated, this, [this, root](const QModelIndex &index) {
-        const auto folder = index.data(FolderRole).toString();
-        if (folder.isEmpty())
+        const auto *project = store_.project();
+        if (!project || id.isEmpty())
             return;
-        for (int row = 0; row < root->rowCount(); ++row) {
-            if (root->child(row)->text() == folder) {
-                folders_->setCurrentIndex(root->child(row)->index());
-                return;
-            }
-        }
-        search_->setText(folder == "Meshes" ? "Static Mesh" : folder);
+        const auto *current = store_.selectedObject();
+        if (current && current->meshAsset == id)
+            return;
+        const auto instance = std::ranges::find(project->objects, id, &SceneObject::meshAsset);
+        if (instance != project->objects.end())
+            store_.select(instance->id);
+    });
+    connect(tiles_, &QListView::activated, this, [this](const QModelIndex &index) {
+        store_.placeMesh(index.data(IdRole).toString());
     });
     connect(&store_, &ProjectStore::sceneChanged, this, &ContentBrowser::rebuild);
     connect(&store_, &ProjectStore::selectionChanged, this, &ContentBrowser::syncSelection);
@@ -1011,55 +1165,38 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
 void ContentBrowser::rebuild()
 {
     const QSignalBlocker block(tiles_->selectionModel());
+    const auto previous = tiles_->currentIndex().data(IdRole).toString();
     assetModel_->clear();
     const auto *project = store_.project();
     const auto query = search_->text().trimmed();
-    auto folder = folders_->currentIndex().data(IdRole).toString();
-    const bool referenceProject = project && project->id == "mythic-valley";
-    if (folder.isEmpty() && referenceProject && query.isEmpty())
-        folder = "Ruins";
-    path_->setText(folder == "Ruins" ? tr("Content   ›   Environment   ›   Ruins   ›")
-        : (folder.isEmpty() ? tr("Content   ›") : tr("Content   ›   %1   ›").arg(folder)));
-
+    path_->setText(tr("Content  ›  Meshes"));
+    QList<const MeshAsset *> assets;
     if (project) {
-        if (referenceProject && query.isEmpty() && folder == "Ruins") {
-            const QStringList names{tr("Meshes"), tr("Materials"), tr("Textures")};
-            for (const auto &name : names) {
-                auto *tile = item(name, QIcon(worldCrop({553, 741, 65, 63})));
-                tile->setData(name, AssetNameRole);
-                tile->setData(name, FolderRole);
-                assetModel_->appendRow(tile);
-            }
+        for (const auto &asset : project->assets) {
+            if (asset.name.contains(query, Qt::CaseInsensitive)
+                || QFileInfo(asset.sourcePath).fileName().contains(query, Qt::CaseInsensitive))
+                assets.append(&asset);
         }
-        QList<const SceneObject *> assets;
-        for (const auto &object : project->objects) {
-            if ((folder.isEmpty() || object.group == folder)
-                && (object.name.contains(query, Qt::CaseInsensitive) || object.type.contains(query, Qt::CaseInsensitive)
-                    || assetName(object).contains(query, Qt::CaseInsensitive)))
-                assets.append(&object);
-        }
-        if (sort_ != 0) {
-            std::ranges::sort(assets, [this](const SceneObject *a, const SceneObject *b) {
-                if (sort_ == 3 && a->type != b->type)
-                    return a->type.localeAwareCompare(b->type) < 0;
-                const int compare = a->name.localeAwareCompare(b->name);
-                return sort_ == 2 ? compare > 0 : compare < 0;
-            });
-        }
-        const auto statue = std::ranges::find_if(assets, [](const SceneObject *object) {
-            return object->id == "statue-left";
+    }
+    if (sort_ != 0) {
+        std::ranges::sort(assets, [this](const MeshAsset *a, const MeshAsset *b) {
+            const auto comparison = a->name.localeAwareCompare(b->name);
+            return sort_ == 2 ? comparison > 0 : comparison < 0;
         });
-        const bool pairedStatue = statue != assets.end() && query.isEmpty() && folder == "Ruins";
-        for (const auto *object : assets) {
-            if (object->id == "statue-right" && pairedStatue)
-                continue;
-            auto *tile = item(object->name, thumbnail(*object));
-            tile->setData(object->id, IdRole);
-            tile->setData(assetName(*object), AssetNameRole);
-            tile->setData(object->type, AssetTypeRole);
-            tile->setToolTip(assetName(*object) + '\n' + object->type + "  /  " + object->group);
-            assetModel_->appendRow(tile);
-        }
+    }
+    for (const auto *asset : assets) {
+        auto *tile = item(asset->name, editorIcon("box", QColor("#a78be6")));
+        tile->setData(asset->id, IdRole);
+        tile->setData(asset->name, AssetNameRole);
+        tile->setData(tr("Static Mesh"), AssetTypeRole);
+        tile->setToolTip(tr("%1\n%2 vertices · %3 faces").arg(asset->name)
+            .arg(asset->evaluated().vertices.size()).arg(asset->evaluated().faces.size()));
+        assetModel_->appendRow(tile);
+    }
+    if (!previous.isEmpty()) {
+        const auto matches = assetModel_->match(assetModel_->index(0, 0), IdRole, previous);
+        if (!matches.isEmpty())
+            tiles_->setCurrentIndex(matches.first());
     }
     syncSelection();
 }
@@ -1067,23 +1204,44 @@ void ContentBrowser::rebuild()
 void ContentBrowser::syncSelection()
 {
     const QSignalBlocker block(tiles_->selectionModel());
-    const auto matches = store_.selection().isEmpty() ? QModelIndexList{}
-        : assetModel_->match(assetModel_->index(0, 0), IdRole, store_.selection(), 1, Qt::MatchExactly);
-    if (matches.isEmpty())
-        tiles_->selectionModel()->clear();
-    else
-        tiles_->setCurrentIndex(matches.first());
+    const auto *asset = store_.selectedMesh();
+    if (asset) {
+        const auto matches = assetModel_->match(assetModel_->index(0, 0), IdRole, asset->id, 1, Qt::MatchExactly);
+        if (matches.isEmpty())
+            tiles_->selectionModel()->clear();
+        else
+            tiles_->setCurrentIndex(matches.first());
+    }
     const int count = assetModel_->rowCount();
-    count_->setText((count == 1 ? tr("1 item") : tr("%1 items").arg(count))
-        + (matches.isEmpty() ? QString() : tr(" (1 selected)")));
+    count_->setText(tr("%n mesh asset(s)", nullptr, count));
 }
-
 void ContentBrowser::appendLog(const QString &message)
 {
     log_->appendPlainText(QDateTime::currentDateTime().toString("HH:mm:ss  ") + message);
 }
 
+void ContentBrowser::appendMessage(const QString &message)
+{
+    const auto time = QDateTime::currentDateTime().toString("HH:mm:ss  ");
+    messages_->appendPlainText(time + message);
+    appendLog(message);
+}
+
+void ContentBrowser::setMetrics(const QString &report)
+{
+    profiler_->setText(report);
+}
+
 void ContentBrowser::showMessages()
 {
-    tabs_->setCurrentIndex(2);
+    tabs_->setCurrentWidget(messages_);
+}
+
+void ContentBrowser::showLog() { tabs_->setCurrentWidget(log_); }
+
+void ContentBrowser::showTerminal()
+{
+    tabs_->setCurrentIndex(tabs_->count()-1);
+    if (auto *field = tabs_->currentWidget()->findChild<QLineEdit *>())
+        field->setFocus();
 }

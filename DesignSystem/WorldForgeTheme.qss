@@ -13,9 +13,11 @@ QLabel[muted="true"] { color: #aeb2c0; }
 QLabel[heading="true"] { font-weight: 600; color: #f2f3fa; }
 
 QWidget#appHeader { background: #141721; border-bottom: 1px solid #282c3a; }
-QToolButton#captionButton, QToolButton#captionClose { background: transparent; border: 0; border-radius: 0; }
+QToolButton#captionButton, QToolButton#captionClose { background: transparent; border: 0; border-radius: 0; padding: 0; }
 QToolButton#captionButton:hover { background: #303445; }
-QToolButton#captionClose:hover { background: #b7353f; }
+QToolButton#captionButton:pressed { background: #414558; }
+QToolButton#captionClose:hover { background: #c42b36; }
+QToolButton#captionClose:pressed { background: #a72832; }
 
 QMenuBar { background: transparent; border: 0; padding: 0; font-size: 12px; }
 QMenuBar::item { padding: 5px 7px; background: transparent; }

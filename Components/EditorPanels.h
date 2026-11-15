@@ -29,6 +29,7 @@ private:
     QLineEdit *search_;
     QTreeView *tree_;
     QStandardItemModel *model_;
+    bool showDemo_ = false;
 };
 
 class Inspector : public QWidget {
@@ -51,12 +52,26 @@ private:
     QWidget *form_;
     QLineEdit *name_;
     QComboBox *group_;
-    std::array<QComboBox *, 3> materials_{};
     QComboBox *mesh_;
-    QComboBox *lodGroup_;
-    QSpinBox *lods_;
-    QCheckBox *autoLod_;
-    QCheckBox *collision_;
+    QComboBox *materialSlot_;
+    QLabel *meshInfo_;
+    QLabel *geometryState_;
+    class QPushButton *materialColor_;
+    QDoubleSpinBox *intensity_;
+    QComboBox *bodyMode_;
+    QComboBox *colliderShape_ = nullptr;
+    QDoubleSpinBox *bounce_;
+    QDoubleSpinBox *terrainSize_;
+    QDoubleSpinBox *foliageDensity_ = nullptr;
+    QDoubleSpinBox *foliageSeed_ = nullptr;
+    QDoubleSpinBox *foliageWind_ = nullptr;
+    QDoubleSpinBox *spin_ = nullptr;
+    QDoubleSpinBox *mass_ = nullptr;
+    QDoubleSpinBox *friction_ = nullptr;
+    QComboBox *jointType_ = nullptr;
+    QComboBox *jointTarget_ = nullptr;
+    QComboBox *jointAxis_ = nullptr;
+    std::array<QDoubleSpinBox *,3> jointOffset_{};
     QCheckBox *visible_;
     QTreeView *components_;
     QStandardItemModel *componentModel_;
@@ -69,13 +84,19 @@ class ContentBrowser : public QWidget {
 public:
     explicit ContentBrowser(ProjectStore &store, QWidget *parent = nullptr);
     void appendLog(const QString &message);
+    void appendMessage(const QString &message);
     void showMessages();
+    void showLog();
+    void showTerminal();
+    void setMetrics(const QString &report);
 
 signals:
     void closeRequested();
     void floatRequested();
     void saveRequested();
     void meshImported();
+    void newStudioAssetRequested();
+    void editStudioAssetRequested(const QString &assetId);
 
 private:
     void rebuild();
@@ -91,5 +112,7 @@ private:
     QLabel *path_;
     QLabel *count_;
     QPlainTextEdit *log_;
+    QPlainTextEdit *messages_;
+    QLabel *profiler_;
     int sort_ = 0;
 };

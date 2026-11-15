@@ -1,0 +1,1300 @@
+diff --git a/intern/ghost/intern/GHOST_SystemWin32.cc b/intern/ghost/intern/GHOST_SystemWin32.cc
+index c085177d..4bb298e8 100644
+--- a/intern/ghost/intern/GHOST_SystemWin32.cc
++++ b/intern/ghost/intern/GHOST_SystemWin32.cc
+@@ -1303,7 +1303,8 @@ void GHOST_SystemWin32::processWheelEventHorizontal(GHOST_WindowWin32 *window,
+ }
+ 
+ std::unique_ptr<GHOST_EventKey> GHOST_SystemWin32::processKeyEvent(GHOST_WindowWin32 *window,
+-                                                                   RAWINPUT const &raw)
++                                                                 RAWINPUT const &raw,
++                                                                 std::optional<bool> message_repeat)
+ {
+   const char vk = raw.data.keyboard.VKey;
+   bool key_down = false;
+@@ -1333,7 +1334,7 @@ std::unique_ptr<GHOST_EventKey> GHOST_SystemWin32::processKeyEvent(GHOST_WindowW
+   bool is_repeat = false;
+   bool is_repeated_modifier = false;
+   if (key_down) {
+-    if (HIBYTE(::GetKeyState(vk)) != 0) {
++    if (message_repeat.value_or(HIBYTE(::GetKeyState(vk)) != 0)) {
+       /* This thread's message queue shows this key as already down. */
+       is_repeat = true;
+       is_repeated_modifier = GHOST_KEY_MODIFIER_CHECK(key);
+@@ -1659,6 +1660,16 @@ LRESULT WINAPI GHOST_SystemWin32::s_wndProc(HWND hwnd, uint msg, WPARAM wParam,
+ 
+     GHOST_WindowWin32 *window = (GHOST_WindowWin32 *)::GetWindowLongPtr(hwnd, GWLP_USERDATA);
+     if (window) {
++      const bool hosted = ::GetPropW(hwnd, L"WorldForgeHostedWindow") != nullptr;
++      if (hosted) {
++        static const UINT focus_message = ::RegisterWindowMessageW(L"WorldForge.Studio.Focus");
++        if (focus_message && msg == focus_message) {
++          if (::IsWindowVisible(hwnd) && ::GetForegroundWindow() == ::GetAncestor(hwnd, GA_ROOT)) {
++            ::SetFocus(hwnd);
++          }
++          return 0;
++        }
++      }
+       switch (msg) {
+         /* We need to check if new key layout has AltGr. */
+         case WM_INPUTLANGCHANGE: {
+@@ -1681,6 +1692,10 @@ LRESULT WINAPI GHOST_SystemWin32::s_wndProc(HWND hwnd, uint msg, WPARAM wParam,
+ 
+           switch (raw.header.dwType) {
+             case RIM_TYPEKEYBOARD: {
++              if (hosted) {
++                /* The hosted viewport uses focused window key messages below. */
++                break;
++              }
+               event = processKeyEvent(window, raw);
+               if (!event) {
+                 GHOST_PRINT("GHOST_SystemWin32::wndProc: key event ");
+@@ -1757,8 +1772,20 @@ LRESULT WINAPI GHOST_SystemWin32::s_wndProc(HWND hwnd, uint msg, WPARAM wParam,
+         case WM_KEYDOWN:
+         case WM_SYSKEYDOWN:
+         case WM_KEYUP:
+-        case WM_SYSKEYUP:
+-          /* These functions were replaced by #WM_INPUT. */
++        case WM_SYSKEYUP: {
++          if (hosted) {
++            /* The viewport is a child of another process. Use focused window key messages with
++             * the same GHOST translation as standalone Studio. */
++            RAWINPUT raw{};
++            raw.data.keyboard.VKey = USHORT(wParam);
++            raw.data.keyboard.Message = msg;
++            raw.data.keyboard.MakeCode = USHORT((lParam >> 16) & 0xff);
++            raw.data.keyboard.Flags = (lParam & (1L << 24)) ? RI_KEY_E0 : 0;
++            event = processKeyEvent(window, raw, (lParam & (1L << 30)) != 0);
++            eventHandled = true;
++          }
++          break;
++        }
+         case WM_CHAR:
+           /* The #WM_CHAR message is posted to the window with the keyboard focus when
+            * a WM_KEYDOWN message is translated by the #TranslateMessage function.
+@@ -1947,7 +1974,16 @@ LRESULT WINAPI GHOST_SystemWin32::s_wndProc(HWND hwnd, uint msg, WPARAM wParam,
+         /* =======================
+          * Mouse events, processed
+          * ======================= */
++        case WM_MOUSEACTIVATE:
++          if (hosted) {
++            ::SetFocus(hwnd);
++            return MA_ACTIVATE;
++          }
++          break;
+         case WM_LBUTTONDOWN: {
++          if (hosted && ::GetFocus() != hwnd) {
++            ::SetFocus(hwnd);
++          }
+           event = processButtonEvent(GHOST_kEventButtonDown, window, GHOST_kButtonMaskLeft);
+           break;
+         }
+@@ -2280,7 +2316,11 @@ LRESULT WINAPI GHOST_SystemWin32::s_wndProc(HWND hwnd, uint msg, WPARAM wParam,
+           /* The WM_KILLFOCUS message is sent to a window immediately before it loses the keyboard
+            * focus. We want to prevent this if a window is still active and it loses focus to
+            * nowhere. */
+-          if (!wParam && hwnd == ::GetActiveWindow()) {
++          if (hosted) {
++            window->lostMouseCapture();
++            event = processWindowEvent(GHOST_kEventWindowDeactivate, window);
++          }
++          else if (!wParam && hwnd == ::GetActiveWindow()) {
+             ::SetFocus(hwnd);
+           }
+           break;
+@@ -2353,6 +2393,9 @@ LRESULT WINAPI GHOST_SystemWin32::s_wndProc(HWND hwnd, uint msg, WPARAM wParam,
+         case WM_SETFOCUS: {
+           /* The WM_SETFOCUS message is sent to a window after it has gained the keyboard focus. */
+           window->updateHDRInfo();
++          if (hosted) {
++            event = processWindowEvent(GHOST_kEventWindowActivate, window);
++          }
+           break;
+         }
+         /* ============
+diff --git a/intern/ghost/intern/GHOST_SystemWin32.hh b/intern/ghost/intern/GHOST_SystemWin32.hh
+index c8e8c9de..ec0d45e1 100644
+--- a/intern/ghost/intern/GHOST_SystemWin32.hh
++++ b/intern/ghost/intern/GHOST_SystemWin32.hh
+@@ -15,6 +15,7 @@
+ 
+ #include <ole2.h> /* For drag-n-drop. */
+ #include <windows.h>
++#include <optional>
+ 
+ #include "GHOST_System.hh"
+ 
+@@ -389,7 +390,8 @@ class GHOST_SystemWin32 : public GHOST_System {
+    * \param raw: RawInput structure with detailed info about the key event.
+    */
+   static std::unique_ptr<GHOST_EventKey> processKeyEvent(GHOST_WindowWin32 *window,
+-                                                         RAWINPUT const &raw);
++                                                        RAWINPUT const &raw,
++                                                        std::optional<bool> message_repeat = {});
+ 
+   /**
+    * Process special keys `VK_OEM_*`, to see if current key layout
+diff --git a/intern/ghost/intern/GHOST_WindowWin32.cc b/intern/ghost/intern/GHOST_WindowWin32.cc
+index 8edbffaa..a639e089 100644
+--- a/intern/ghost/intern/GHOST_WindowWin32.cc
++++ b/intern/ghost/intern/GHOST_WindowWin32.cc
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdlib>
+ 
+ #include "GHOST_ContextD3D.hh"
+ #include "GHOST_ContextNone.hh"
+@@ -84,16 +85,34 @@ GHOST_WindowWin32::GHOST_WindowWin32(GHOST_SystemWin32 *system,
+       parent_window_hwnd_(parent_window ? parent_window->h_wnd_ : HWND_DESKTOP),
+       direct_manipulation_helper_(nullptr)
+ {
++  static bool hosted_root_created = false;
++  const bool hosted_root = !hosted_root_created && !parent_window && !dialog &&
++                           blender::BLI_getenv("WORLDFORGE_HOSTED_WINDOW");
++  HWND host = nullptr;
++  if (hosted_root) {
++    if (const char *address = blender::BLI_getenv("WORLDFORGE_HOSTED_PARENT")) {
++      char *end = nullptr;
++      const auto handle = reinterpret_cast<HWND>(std::strtoull(address, &end, 10));
++      if (*end == '\0' && ::IsWindow(handle)) {
++        host = handle;
++      }
++    }
++  }
+   DWORD style = parent_window ?
+                     WS_POPUPWINDOW | WS_CAPTION | WS_MAXIMIZEBOX | WS_MINIMIZEBOX | WS_SIZEBOX :
+                     WS_OVERLAPPEDWINDOW;
+ 
+-  if (state == GHOST_kWindowStateFullScreen) {
++  if (host) {
++    style = WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
++  }
++  else if (state == GHOST_kWindowStateFullScreen) {
+     style |= WS_MAXIMIZE;
+   }
+ 
+-  /* Forces owned windows onto taskbar and allows minimization. */
+-  DWORD extended_style = parent_window ? WS_EX_APPWINDOW : 0;
++  /* An embedded Studio dialog belongs to the authoring session in WorldForge. */
++  const bool hosted_dialog = dialog && parent_window &&
++                             ::GetPropW(parent_window_hwnd_, L"WorldForgeHostedWindow");
++  DWORD extended_style = parent_window ? (hosted_dialog ? WS_EX_TOOLWINDOW : WS_EX_APPWINDOW) : 0;
+ 
+   if (dialog) {
+     /* When we are ready to make windows of this type:
+@@ -103,7 +122,12 @@ GHOST_WindowWin32::GHOST_WindowWin32(GHOST_SystemWin32 *system,
+   }
+ 
+   RECT win_rect = {left, top, long(left + width), long(top + height)};
+-  adjustWindowRectForClosestMonitor(&win_rect, style, extended_style);
++  if (host) {
++    win_rect = {0, 0, long(width), long(height)};
++  }
++  else {
++    adjustWindowRectForClosestMonitor(&win_rect, style, extended_style);
++  }
+ 
+   wchar_t *title_16 = alloc_utf16_from_8((char *)title, 0);
+   h_wnd_ = ::CreateWindowExW(extended_style,                 /* window extended style */
+@@ -114,7 +138,7 @@ GHOST_WindowWin32::GHOST_WindowWin32(GHOST_SystemWin32 *system,
+                              win_rect.top,                   /* vertical position of window */
+                              win_rect.right - win_rect.left, /* window width */
+                              win_rect.bottom - win_rect.top, /* window height */
+-                             parent_window_hwnd_,            /* handle to parent or owner window */
++                             host ? host : parent_window_hwnd_, /* handle to parent or owner window */
+                              0,                    /* handle to menu or child-window identifier */
+                              ::GetModuleHandle(0), /* handle to application instance */
+                              0);                   /* pointer to window-creation data */
+@@ -204,7 +228,11 @@ GHOST_WindowWin32::GHOST_WindowWin32(GHOST_SystemWin32 *system,
+ 
+   ThemeRefresh();
+ 
+-  ::ShowWindow(h_wnd_, nCmdShow);
++  /* WorldForge's host shows the main window after docking it. Keep file
++   * browsers and other Studio windows on the normal GHOST visibility path. */
++  if (!hosted_root) {
++    ::ShowWindow(h_wnd_, nCmdShow);
++  }
+ 
+   /* Initialize WINTAB. */
+   if (system->getTabletAPI() != GHOST_kTabletWinPointer) {
+@@ -220,6 +248,12 @@ GHOST_WindowWin32::GHOST_WindowWin32(GHOST_SystemWin32 *system,
+ 
+   /* Initialize HDR info. */
+   updateHDRInfo();
++  if (hosted_root) {
++    hosted_root_created = ::SetPropW(h_wnd_, L"WorldForgeHostedWindow", h_wnd_) != FALSE;
++    if (!hosted_root_created && !host) {
++      ::ShowWindow(h_wnd_, nCmdShow);
++    }
++  }
+ }
+ 
+ void GHOST_WindowWin32::updateDirectManipulation()
+@@ -258,6 +292,7 @@ GHOST_TTrackpadInfo GHOST_WindowWin32::getTrackpadInfo()
+ GHOST_WindowWin32::~GHOST_WindowWin32()
+ {
+   if (h_wnd_) {
++    ::RemovePropW(h_wnd_, L"WorldForgeHostedWindow");
+     unregisterWindowAppUserModelProperties();
+   }
+ 
+diff --git a/scripts/presets/keyconfig/keymap_data/blender_default.py b/scripts/presets/keyconfig/keymap_data/blender_default.py
+index 07ba934d..a574152b 100644
+--- a/scripts/presets/keyconfig/keymap_data/blender_default.py
++++ b/scripts/presets/keyconfig/keymap_data/blender_default.py
+@@ -698,15 +698,12 @@ def km_window(params):
+         # Old shortcuts
+         items.extend([
+             ("wm.save_homefile", {"type": 'U', "value": 'PRESS', "ctrl": True}, None),
+-            ("wm.open_mainfile", {"type": 'F1', "value": 'PRESS'}, None),
++            ("wm.worldforge_open_asset", {"type": 'F1', "value": 'PRESS'}, None),
+             ("wm.link", {"type": 'O', "value": 'PRESS', "ctrl": True, "alt": True}, None),
+             ("wm.append", {"type": 'F1', "value": 'PRESS', "shift": True}, None),
+-            ("wm.save_mainfile", {"type": 'W', "value": 'PRESS', "ctrl": True},
+-             {"properties": [("show_save_modified_images_dialog", True)]}),
+-            ("wm.save_as_mainfile", {"type": 'F2', "value": 'PRESS'},
+-             {"properties": [("show_save_modified_images_dialog", True)]}),
+-            ("wm.save_as_mainfile", {"type": 'S', "value": 'PRESS', "ctrl": True, "alt": True},
+-             {"properties": [("copy", True), ("show_save_modified_images_dialog", True)]}),
++            ("wm.worldforge_save_asset", {"type": 'W', "value": 'PRESS', "ctrl": True}, None),
++            ("wm.worldforge_save_asset", {"type": 'F2', "value": 'PRESS'},
++             {"properties": [("mode", "SAVE_AS")]}),
+             ("wm.window_new", {"type": 'W', "value": 'PRESS', "ctrl": True, "alt": True}, None),
+             ("wm.window_fullscreen_toggle", {"type": 'F11', "value": 'PRESS', "alt": True}, None),
+             ("wm.doc_view_manual_ui_context", {"type": 'F1', "value": 'PRESS', "alt": True}, None),
+@@ -718,15 +715,13 @@ def km_window(params):
+     items.extend([
+         # File operations
+         op_menu("TOPBAR_MT_file_new", {"type": 'N', "value": 'PRESS', "ctrl": True}),
+-        op_menu("TOPBAR_MT_file_open_recent", {"type": 'O', "value": 'PRESS', "shift": True, "ctrl": True}),
+-        ("wm.open_mainfile", {"type": 'O', "value": 'PRESS', "ctrl": True}, None),
+-        ("wm.save_mainfile", {"type": 'S', "value": 'PRESS', "ctrl": True},
+-         {"properties": [("show_save_modified_images_dialog", True)]}),
+-        ("wm.save_as_mainfile", {"type": 'S', "value": 'PRESS', "shift": True, "ctrl": True},
+-         {"properties": [("show_save_modified_images_dialog", True)]}),
+-        ("wm.save_mainfile",
+-         {"type": 'S', "value": 'PRESS', "ctrl": True, "alt": True},
+-         {"properties": [("incremental", True), ("show_save_modified_images_dialog", True)]}),
++        op_menu("TOPBAR_MT_worldforge_recent", {"type": 'O', "value": 'PRESS', "shift": True, "ctrl": True}),
++        ("wm.worldforge_open_asset", {"type": 'O', "value": 'PRESS', "ctrl": True}, None),
++        ("wm.worldforge_save_asset", {"type": 'S', "value": 'PRESS', "ctrl": True}, None),
++        ("wm.worldforge_save_asset", {"type": 'S', "value": 'PRESS', "shift": True, "ctrl": True},
++         {"properties": [("mode", "SAVE_AS")]}),
++        ("wm.worldforge_save_asset", {"type": 'S', "value": 'PRESS', "ctrl": True, "alt": True},
++         {"properties": [("mode", "COPY")]}),
+         ("wm.quit_blender", {"type": 'Q', "value": 'PRESS', "ctrl": True}, None),
+ 
+         # Quick menu and toolbar
+diff --git a/scripts/presets/keyconfig/keymap_data/industry_compatible_data.py b/scripts/presets/keyconfig/keymap_data/industry_compatible_data.py
+index 5649a8bd..94e183fb 100644
+--- a/scripts/presets/keyconfig/keymap_data/industry_compatible_data.py
++++ b/scripts/presets/keyconfig/keymap_data/industry_compatible_data.py
+@@ -190,15 +190,13 @@ def km_window(params):
+ 
+         # File operations
+         ("wm.read_homefile", {"type": 'N', "value": 'PRESS', "ctrl": True}, None),
+-        op_menu("TOPBAR_MT_file_open_recent", {"type": 'O', "value": 'PRESS', "shift": True, "ctrl": True}),
+-        ("wm.open_mainfile", {"type": 'O', "value": 'PRESS', "ctrl": True}, None),
+-        ("wm.save_mainfile", {"type": 'S', "value": 'PRESS', "ctrl": True},
+-         {"properties": [("show_save_modified_images_dialog", True)]}),
+-        ("wm.save_as_mainfile", {"type": 'S', "value": 'PRESS', "shift": True, "ctrl": True},
+-         {"properties": [("show_save_modified_images_dialog", True)]}),
+-        ("wm.save_mainfile",
+-         {"type": 'S', "value": 'PRESS', "ctrl": True, "alt": True},
+-         {"properties": [("incremental", True), ("show_save_modified_images_dialog", True)]}),
++        op_menu("TOPBAR_MT_worldforge_recent", {"type": 'O', "value": 'PRESS', "shift": True, "ctrl": True}),
++        ("wm.worldforge_open_asset", {"type": 'O', "value": 'PRESS', "ctrl": True}, None),
++        ("wm.worldforge_save_asset", {"type": 'S', "value": 'PRESS', "ctrl": True}, None),
++        ("wm.worldforge_save_asset", {"type": 'S', "value": 'PRESS', "shift": True, "ctrl": True},
++         {"properties": [("mode", "SAVE_AS")]}),
++        ("wm.worldforge_save_asset", {"type": 'S', "value": 'PRESS', "ctrl": True, "alt": True},
++         {"properties": [("mode", "COPY")]}),
+         ("wm.quit_blender", {"type": 'Q', "value": 'PRESS', "ctrl": True}, None),
+ 
+         # Quick menu and toolbar
+diff --git a/scripts/startup/bl_operators/__init__.py b/scripts/startup/bl_operators/__init__.py
+index 9de13085..e8228357 100644
+--- a/scripts/startup/bl_operators/__init__.py
++++ b/scripts/startup/bl_operators/__init__.py
+@@ -44,6 +44,7 @@ _modules = [
+     "vertexpaint_dirt",
+     "view3d",
+     "world",
++    "worldforge_documents",
+     "wm",
+ ]
+ 
+@@ -63,6 +64,7 @@ def register():
+     from . import (
+         bone_selection_sets,
+         copy_global_transform,
++        worldforge_documents,
+     )
+ 
+     for mod in _modules_loaded:
+@@ -71,6 +73,7 @@ def register():
+ 
+     bone_selection_sets.register()
+     copy_global_transform.register()
++    worldforge_documents.register_handlers()
+ 
+ 
+ def unregister():
+@@ -78,10 +81,12 @@ def unregister():
+     from . import (
+         bone_selection_sets,
+         copy_global_transform,
++        worldforge_documents,
+     )
+ 
+     bone_selection_sets.unregister()
+     copy_global_transform.unregister()
++    worldforge_documents.unregister_handlers()
+ 
+     for mod in reversed(_modules_loaded):
+         for cls in reversed(mod.classes):
+diff --git a/scripts/startup/bl_operators/object.py b/scripts/startup/bl_operators/object.py
+index aab791eb..dfd2ef2f 100644
+--- a/scripts/startup/bl_operators/object.py
++++ b/scripts/startup/bl_operators/object.py
+@@ -337,6 +337,43 @@ class SubdivisionSet(Operator):
+         return {'FINISHED'}
+ 
+ 
++class WorldForgeAddSculptDetail(Operator):
++    """Add four sculpting subdivision levels while keeping the base mesh and its shape"""
++
++    bl_idname = "object.worldforge_add_sculpt_detail"
++    bl_label = "Add Sculpt Detail"
++    bl_options = {'UNDO'}
++
++    @classmethod
++    def poll(cls, context):
++        obj = context.sculpt_object
++        return bool(
++            obj and obj.type == 'MESH' and obj.is_editable and obj.data.is_editable
++            and not obj.modifiers and not obj.use_dynamic_topology_sculpting
++            and obj.data.users == 1 and obj.data.shape_keys is None
++            and 0 < len(obj.data.polygons) <= 128 and len(obj.data.vertices) <= 128
++        )
++
++    def execute(self, context):
++        obj = context.sculpt_object
++        try:
++            modifier = obj.modifiers.new("Sculpt Detail", 'MULTIRES')
++        except RuntimeError as error:
++            self.report({'ERROR'}, str(error))
++            return {'CANCELLED'}
++        try:
++            for level in range(1, 5):
++                result = bpy.ops.object.multires_subdivide(modifier=modifier.name, mode='SIMPLE')
++                if result != {'FINISHED'} or modifier.total_levels != level:
++                    raise RuntimeError("Could not subdivide this mesh for sculpting")
++        except RuntimeError as error:
++            bpy.ops.object.modifier_remove(modifier=modifier.name)
++            self.report({'ERROR'}, str(error))
++            return {'CANCELLED'}
++        modifier.levels = modifier.sculpt_levels = modifier.render_levels = modifier.total_levels
++        return {'FINISHED'}
++
++
+ class ShapeTransfer(Operator):
+     """Copy the active shape key of another selected object to this one"""
+ 
+@@ -1030,6 +1067,7 @@ classes = (
+     SelectPattern,
+     ShapeTransfer,
+     SubdivisionSet,
++    WorldForgeAddSculptDetail,
+     TransformsToDeltas,
+     TransformsToDeltasAnim,
+     OBJECT_OT_assign_property_defaults,
+diff --git a/scripts/startup/bl_operators/wm.py b/scripts/startup/bl_operators/wm.py
+index e55be714..3c5590de 100644
+--- a/scripts/startup/bl_operators/wm.py
++++ b/scripts/startup/bl_operators/wm.py
+@@ -3491,7 +3491,7 @@ class WM_MT_splash(Menu):
+         col1 = split.column()
+         sub = col1.row()
+         sub.operator_context = 'INVOKE_DEFAULT'
+-        sub.operator("wm.open_mainfile", text="Open...", icon='FILE_FOLDER')
++        sub.operator("wm.worldforge_open_asset", text="Open Asset...", icon='FILE_FOLDER')
+         col1.operator("wm.recover_last_session", icon='RECOVER_LAST')
+ 
+         col2 = split.column()
+diff --git a/scripts/startup/bl_operators/worldforge_asset.py b/scripts/startup/bl_operators/worldforge_asset.py
+new file mode 100644
+index 00000000..6d0200be
+--- /dev/null
++++ b/scripts/startup/bl_operators/worldforge_asset.py
+@@ -0,0 +1,178 @@
++# SPDX-FileCopyrightText: 2026 WorldForge Studio contributors
++#
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++"""Read and write WorldForge Studio authoring packages."""
++
++from contextlib import contextmanager
++import hashlib
++import json
++import os
++from pathlib import Path
++import struct
++import tempfile
++import uuid
++import zipfile
++import zlib
++
++
++MANIFEST = "manifest.json"
++PAYLOAD = "source.blend"
++VERSION = 1
++MAX_MANIFEST = 64 * 1024
++MAX_SOURCE = 1024 ** 3
++CHUNK_SIZE = 1024 ** 2
++
++
++class PackageError(ValueError):
++    pass
++
++
++def _validate(manifest):
++    if not isinstance(manifest, dict) or type(manifest.get("format_version")) is not int:
++        raise PackageError("Invalid WorldForge asset manifest.")
++    if manifest["format_version"] != VERSION:
++        raise PackageError("This WorldForge asset uses an unsupported format version.")
++    try:
++        identity = manifest["asset_id"]
++        if str(uuid.UUID(identity)) != identity:
++            raise ValueError
++        revision = manifest["revision"]
++        writer = manifest["writer_version"]
++        digest = manifest["sha256"]
++        length = manifest["source_size"]
++        if (type(revision) is not int or revision < 1 or not isinstance(writer, str)
++                or not writer or len(writer) > 128 or manifest["asset_type"] != "scene"
++                or manifest["source"] != PAYLOAD or not isinstance(digest, str)
++                or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
++                or type(length) is not int or not 0 < length <= MAX_SOURCE):
++            raise ValueError
++    except (AttributeError, KeyError, TypeError, ValueError) as error:
++        raise PackageError("Invalid asset identity, revision, or source metadata.") from error
++    return manifest
++
++
++def _stream(source, destination=None, max_size=MAX_SOURCE):
++    checksum = hashlib.sha256()
++    length = 0
++    while chunk := source.read(CHUNK_SIZE):
++        length += len(chunk)
++        if length > max_size:
++            raise PackageError("Asset source exceeds the declared size.")
++        checksum.update(chunk)
++        if destination is not None:
++            destination.write(chunk)
++    return length, checksum.hexdigest()
++
++
++def _read_manifest(archive):
++    entries = archive.infolist()
++    if len(entries) != 2 or {entry.filename for entry in entries} != {MANIFEST, PAYLOAD}:
++        raise PackageError("Unexpected, missing, or duplicate WorldForge asset entries.")
++    if archive.getinfo(MANIFEST).file_size > MAX_MANIFEST:
++        raise PackageError("WorldForge asset manifest is too large.")
++    manifest = _validate(json.loads(archive.read(MANIFEST)))
++    if archive.getinfo(PAYLOAD).file_size != manifest["source_size"]:
++        raise PackageError("Asset source size differs from the manifest.")
++    return manifest
++
++
++@contextmanager
++def _atomic_file(path):
++    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
++    try:
++        with os.fdopen(fd, "w+b") as output:
++            yield output
++            output.flush()
++            os.fsync(output.fileno())
++        os.replace(temp, path)
++    finally:
++        Path(temp).unlink(missing_ok=True)
++
++
++def read_package(path, extract_to=None):
++    """Validate the full payload before committing any extracted file."""
++    try:
++        with Path(path).open("rb") as container:
++            container.seek(0, os.SEEK_END)
++            size = container.tell()
++            if not 22 <= size <= MAX_SOURCE + 2 * 1024 ** 2:
++                raise PackageError("WorldForge asset exceeds the supported archive size.")
++            # The writer emits a single-disk ZIP with two entries and no archive comment.
++            container.seek(-22, os.SEEK_END)
++            marker, disk, start, on_disk, total, directory_size, offset, comment = struct.unpack(
++                "<4s4H2IH", container.read(22))
++            if (marker != b"PK\x05\x06" or disk or start or on_disk != 2 or total != 2
++                    or directory_size > 4096 or offset + directory_size != size - 22 or comment):
++                raise PackageError("Invalid WorldForge asset archive directory.")
++            with zipfile.ZipFile(container) as archive:
++                manifest = _read_manifest(archive)
++                with archive.open(PAYLOAD) as source:
++                    expected = manifest["source_size"], manifest["sha256"]
++                    if extract_to is None:
++                        if _stream(source, max_size=expected[0]) != expected:
++                            raise PackageError("Asset source checksum does not match.")
++                    else:
++                        with _atomic_file(Path(extract_to)) as output:
++                            if _stream(source, output, expected[0]) != expected:
++                                raise PackageError("Asset source checksum does not match.")
++                return manifest
++    except (zipfile.BadZipFile, json.JSONDecodeError, UnicodeError, RuntimeError,
++            NotImplementedError, EOFError, zlib.error) as error:
++        raise PackageError(f"Cannot read WorldForge asset: {error}") from error
++
++
++@contextmanager
++def _write_lock(path):
++    # Windows releases this lock automatically if the writer exits or crashes.
++    import msvcrt
++
++    lock_path = path.with_name(path.name + ".lock")
++    with lock_path.open("a+b") as lock:
++        lock.seek(0)
++        try:
++            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
++        except OSError as error:
++            raise PackageError("Another Studio session is saving this asset.") from error
++        try:
++            yield
++        finally:
++            lock.seek(0)
++            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
++
++
++def write_package(path, source, writer_version, *, expected=None, identity=None):
++    """Commit a new or revised package without overwriting concurrent edits."""
++    path = Path(path)
++    if path.suffix.lower() != ".wfasset":
++        raise PackageError("WorldForge assets use the .wfasset extension.")
++    with _write_lock(path):
++        if path.exists():
++            if expected is None or read_package(path) != expected:
++                raise PackageError("This asset changed or already exists. Choose a new destination or reopen it.")
++        elif expected is not None:
++            raise PackageError("The original asset is missing. Use Save As to choose a destination.")
++
++        with _atomic_file(path) as output:
++            with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
++                with Path(source).open("rb") as payload, archive.open(PAYLOAD, "w", force_zip64=True) as member:
++                    length, digest = _stream(payload, member)
++                manifest = _validate({
++                    "format_version": VERSION,
++                    "asset_id": (expected or identity or {}).get("asset_id") or str(uuid.uuid4()),
++                    "revision": (expected or identity or {}).get("revision", 0) + 1,
++                    "asset_type": "scene",
++                    "writer_version": writer_version,
++                    "source": PAYLOAD,
++                    "source_size": length,
++                    "sha256": digest,
++                })
++                archive.writestr(MANIFEST, json.dumps(manifest, sort_keys=True).encode("utf-8"))
++            output.seek(0)
++            with zipfile.ZipFile(output) as archive:
++                if _read_manifest(archive) != manifest:
++                    raise PackageError("Could not validate the written package.")
++                with archive.open(PAYLOAD) as member:
++                    if _stream(member, max_size=length) != (length, digest):
++                        raise PackageError("Could not verify the written asset source.")
++    return manifest
+diff --git a/scripts/startup/bl_operators/worldforge_documents.py b/scripts/startup/bl_operators/worldforge_documents.py
+new file mode 100644
+index 00000000..ebc142bc
+--- /dev/null
++++ b/scripts/startup/bl_operators/worldforge_documents.py
+@@ -0,0 +1,304 @@
++# SPDX-FileCopyrightText: 2026 WorldForge Studio contributors
++#
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++"""WorldForge Studio document commands."""
++
++import json
++import os
++from pathlib import Path
++import tempfile
++
++import bpy
++from bpy.app.handlers import persistent
++from bpy.props import BoolProperty, EnumProperty, StringProperty
++from bpy.types import Menu, Operator
++from bpy_extras.io_utils import ImportHelper
++
++from .worldforge_asset import PackageError, _atomic_file, read_package, write_package
++
++
++_path = None
++_manifest = None
++_opening = False
++_scratch = None
++_autosave_minutes = 0
++
++
++def active_path():
++    return _path
++
++
++@persistent
++def reset_document(_):
++    global _path, _manifest, _scratch
++    if not _opening:
++        _path = _manifest = None
++        if _scratch is not None:
++            _scratch.cleanup()
++            _scratch = None
++
++
++def register_handlers():
++    if reset_document not in bpy.app.handlers.load_post:
++        bpy.app.handlers.load_post.append(reset_document)
++    if not bpy.app.background:
++        bpy.app.timers.register(_autosave, first_interval=60, persistent=True)
++
++
++def unregister_handlers():
++    if reset_document in bpy.app.handlers.load_post:
++        bpy.app.handlers.load_post.remove(reset_document)
++    if bpy.app.timers.is_registered(_autosave):
++        bpy.app.timers.unregister(_autosave)
++
++
++def _history_file():
++    return Path(bpy.utils.user_resource("CONFIG", create=True)) / "worldforge-recent.json"
++
++
++def recent_assets():
++    try:
++        value = json.loads(_history_file().read_text(encoding="utf-8"))
++        return [item for item in value[:12] if isinstance(item, str)] if isinstance(value, list) else []
++    except (OSError, ValueError):
++        return []
++
++
++def _remember(path):
++    entries = [str(path)] + [item for item in recent_assets() if item != str(path)]
++    try:
++        with _atomic_file(_history_file()) as output:
++            output.write(json.dumps(entries[:12]).encode("utf-8"))
++    except OSError:
++        # A read-only preferences directory must not invalidate an asset write.
++        pass
++
++
++def _recovery_file():
++    return _history_file().with_name("worldforge-autosave.wfasset")
++
++
++def _installed_library(path, libraries):
++    parts = path.parts
++    if len(parts) < 5 or parts[-4:-2] != ("datafiles", "assets"):
++        return None
++    version = parts[-5].split(".")
++    if len(version) != 2 or not all(number.isdecimal() for number in version):
++        return None
++    filename = path.with_suffix(".blend").name if path.suffix == ".wflib" else path.name
++    return libraries.get((parts[-2], filename))
++
++
++def _serialize(source):
++    essentials = (Path(bpy.utils.system_resource("DATAFILES")) / "assets").resolve()
++    libraries = {(folder, path.name): path.resolve() for folder in ("brushes", "nodes")
++                 for path in (essentials / folder).glob("*.blend")}
++    for library in bpy.data.libraries:
++        path = Path(bpy.path.abspath(library.filepath, library=library.parent))
++        installed = _installed_library(path, libraries)
++        if installed and path.resolve() != installed:
++            library.filepath = str(installed)
++    for image in bpy.data.images:
++        if image.library is None and image.is_dirty and image.source in {"FILE", "GENERATED", "TILED"}:
++            image.pack()
++            if not image.packed_files:
++                raise PackageError(f"Could not pack the painted image {image.name}.")
++    bpy.ops.file.pack_all()
++    external = []
++    for path in sorted(set(bpy.utils.blend_paths(absolute=True)) - {""}):
++        if _installed_library(Path(path).resolve(), libraries):
++            continue
++        external.append(path)
++    if external:
++        names = ", ".join(external[:3])
++        raise PackageError(f"Resolve or pack {len(external)} external dependencies first: {names}")
++    if bpy.ops.wm.save_as_mainfile(filepath=str(source), copy=True) != {"FINISHED"}:
++        raise PackageError("Studio could not serialize the editable scene.")
++
++
++def _autosave():
++    global _autosave_minutes
++    preferences = bpy.context.preferences.filepaths
++    if preferences.use_auto_save_temporary_files and bpy.data.is_dirty:
++        _autosave_minutes += 1
++        if _autosave_minutes >= preferences.auto_save_time:
++            _autosave_minutes = 0
++            try:
++                save_recovery()
++            except (OSError, RuntimeError, PackageError) as error:
++                print(f"WorldForge autosave skipped: {error}")
++    else:
++        _autosave_minutes = 0
++    return 60
++
++
++def save_recovery():
++    path = _recovery_file()
++    expected = read_package(path) if path.exists() else None
++    with tempfile.TemporaryDirectory(prefix="worldforge-autosave-") as directory:
++        source = Path(directory) / "source.blend"
++        _serialize(source)
++        write_package(path, source, bpy.app.version_string, expected=expected)
++
++
++def open_asset(path, *, remember=True, working_copy=False):
++    global _path, _manifest, _opening, _scratch
++    path = Path(path).resolve()
++    candidate = tempfile.TemporaryDirectory(prefix="worldforge-asset-")
++    try:
++        source = Path(candidate.name) / "source.blend"
++        manifest = read_package(path, source)
++        _opening = True
++        load_ui = os.environ.get("WORLDFORGE_EMBEDDED_STUDIO") != "1"
++        if bpy.ops.wm.open_mainfile(filepath=str(source), use_scripts=False, load_ui=load_ui) != {"FINISHED"}:
++            raise PackageError("Studio could not open the editable asset source.")
++    except Exception:
++        candidate.cleanup()
++        raise
++    finally:
++        _opening = False
++    if _scratch is not None:
++        _scratch.cleanup()
++    _scratch = candidate
++    _path, _manifest = (None if working_copy else path), manifest
++    if remember:
++        _remember(path)
++    return manifest
++
++
++def snapshot_asset(path, identity=None):
++    with tempfile.TemporaryDirectory(prefix="worldforge-publish-") as directory:
++        source = Path(directory) / "source.blend"
++        _serialize(source)
++        return write_package(path, source, bpy.app.version_string, identity=identity or _manifest)
++
++
++def save_asset(path, *, copy=False):
++    global _path, _manifest
++    path = Path(path).resolve()
++    if copy and path == _path:
++        raise PackageError("Save a Copy needs a different filename.")
++    with tempfile.TemporaryDirectory(prefix="worldforge-save-") as directory:
++        source = Path(directory) / "source.blend"
++        _serialize(source)
++        same_destination = path == _path and not copy
++        manifest = write_package(path, source, bpy.app.version_string,
++                                 expected=_manifest if same_destination else None,
++                                 identity=None if copy else _manifest)
++    if not copy:
++        _path, _manifest = path, manifest
++        _remember(path)
++    return manifest
++
++
++class WM_OT_worldforge_open_asset(Operator, ImportHelper):
++    bl_idname = "wm.worldforge_open_asset"
++    bl_label = "Open WorldForge Asset"
++    filename_ext = ".wfasset"
++    filter_glob: StringProperty(default="*.wfasset", options={"HIDDEN"})
++    skip_save_check: BoolProperty(default=False, options={"HIDDEN", "SKIP_SAVE"})
++
++    def invoke(self, context, event):
++        if self.filepath:
++            return self.execute(context)
++        return ImportHelper.invoke(self, context, event)
++
++    def execute(self, context):
++        if (not self.skip_save_check and not bpy.app.background
++                and (bpy.data.is_dirty or _path is not None)):
++            self.skip_save_check = True
++            return context.window_manager.invoke_confirm(
++                self, None, title="Open another asset?",
++                message="Save any unsaved work before opening a different asset.",
++                confirm_text="Open Asset", icon="WARNING")
++        try:
++            open_asset(self.filepath)
++        except (OSError, RuntimeError, PackageError) as error:
++            self.report({"ERROR"}, str(error))
++            return {"CANCELLED"}
++        return {"FINISHED"}
++
++
++class WM_OT_worldforge_save_asset(Operator):
++    bl_idname = "wm.worldforge_save_asset"
++    bl_label = "Save WorldForge Asset"
++
++    filepath: StringProperty(subtype="FILE_PATH")
++    filter_glob: StringProperty(default="*.wfasset", options={"HIDDEN"})
++    mode: EnumProperty(items=[
++        ("SAVE", "Save", "Save the active asset"),
++        ("SAVE_AS", "Save As", "Write the asset to a new path and retain its identity"),
++        ("COPY", "Save a Copy", "Write a separate asset with a new identity"),
++    ], default="SAVE", options={"SKIP_SAVE"})
++
++    def invoke(self, context, _event):
++        if self.mode == "SAVE" and _path:
++            self.filepath = str(_path)
++            return self.execute(context)
++        # Recovered documents and published working copies use a temporary
++        # extraction directory that is deleted when the document closes.
++        original = bpy.data.filepath if _scratch is None else ""
++        self.filepath = str(_path or Path(original or "Untitled").with_suffix(".wfasset"))
++        context.window_manager.fileselect_add(self)
++        return {"RUNNING_MODAL"}
++
++    def check(self, _context):
++        path = bpy.path.ensure_ext(self.filepath, ".wfasset", case_sensitive=False)
++        if path == self.filepath:
++            return False
++        self.filepath = path
++        return True
++
++    def execute(self, _context):
++        if not self.filepath and (self.mode != "SAVE" or _path is None):
++            self.report({"ERROR"}, "Choose a filename for the WorldForge asset.")
++            return {"CANCELLED"}
++        try:
++            path = bpy.path.ensure_ext(self.filepath or str(_path), ".wfasset", case_sensitive=False)
++            manifest = save_asset(path, copy=self.mode == "COPY")
++        except (OSError, RuntimeError, PackageError) as error:
++            self.report({"ERROR"}, str(error))
++            return {"CANCELLED"}
++        self.report({"INFO"}, f"Saved {Path(path).name} revision {manifest['revision']}")
++        return {"FINISHED"}
++
++
++class TOPBAR_MT_worldforge_recent(Menu):
++    bl_idname = "TOPBAR_MT_worldforge_recent"
++    bl_label = "Recent Assets"
++
++    def draw(self, _context):
++        self.layout.operator_context = "INVOKE_DEFAULT"
++        assets = recent_assets()
++        for path in assets:
++            self.layout.operator("wm.worldforge_open_asset", text=Path(path).name).filepath = path
++        if not assets:
++            self.layout.label(text="No recent WorldForge assets")
++
++
++class WM_OT_worldforge_recover_asset(Operator):
++    bl_idname = "wm.worldforge_recover_asset"
++    bl_label = "Recover WorldForge Autosave"
++
++    @classmethod
++    def poll(cls, _context):
++        return _recovery_file().is_file()
++
++    def invoke(self, context, event):
++        return context.window_manager.invoke_confirm(self, event)
++
++    def execute(self, _context):
++        try:
++            open_asset(_recovery_file(), remember=False)
++        except (OSError, RuntimeError, PackageError) as error:
++            self.report({"ERROR"}, str(error))
++            return {"CANCELLED"}
++        # Recovered work must be saved to a user-chosen path.
++        global _path, _manifest
++        _path = _manifest = None
++        return {"FINISHED"}
++
++
++classes = (WM_OT_worldforge_open_asset, WM_OT_worldforge_save_asset,
++           WM_OT_worldforge_recover_asset, TOPBAR_MT_worldforge_recent)
+diff --git a/scripts/startup/bl_ui/space_topbar.py b/scripts/startup/bl_ui/space_topbar.py
+index 95639e52..17e32607 100644
+--- a/scripts/startup/bl_ui/space_topbar.py
++++ b/scripts/startup/bl_ui/space_topbar.py
+@@ -2,6 +2,8 @@
+ #
+ # SPDX-License-Identifier: GPL-2.0-or-later
+ 
++import os
++
+ import bpy
+ from bpy.types import Header, Menu, Panel
+ 
+@@ -32,10 +34,22 @@ class TOPBAR_HT_upper_bar(Header):
+ 
+         layout.separator(type='LINE')
+ 
+-        if not screen.show_fullscreen:
+-            layout.template_ID_tabs(window, "workspace", new="workspace.add", menu="TOPBAR_MT_workspace_menu")
+-        else:
++        if screen.show_fullscreen:
+             layout.operator("screen.back_to_previous", icon='SCREEN_BACK', text="Back to Previous")
++        elif os.environ.get("WORLDFORGE_EMBEDDED_STUDIO") == "1":
++            layout.label(text=window.workspace.name)
++            if window.workspace.name == "Rigging":
++                obj = context.active_object
++                row = layout.row(align=True)
++                if obj and obj.type == "ARMATURE":
++                    row.operator("object.mode_set", text="Edit Bones").mode = 'EDIT'
++                    row.operator("object.mode_set", text="Pose").mode = 'POSE'
++                elif obj and obj.type == "MESH":
++                    row.operator("object.mode_set", text="Weight Paint").mode = 'WEIGHT_PAINT'
++                if obj and obj.mode != 'OBJECT':
++                    row.operator("object.mode_set", text="Object Mode").mode = 'OBJECT'
++        else:
++            layout.template_ID_tabs(window, "workspace", new="workspace.add", menu="TOPBAR_MT_workspace_menu")
+ 
+     def draw_right(self, context):
+         layout = self.layout
+@@ -158,29 +172,16 @@ class TOPBAR_MT_file(Menu):
+ 
+         layout.operator_context = 'INVOKE_AREA'
+         layout.menu("TOPBAR_MT_file_new", text="New", text_ctxt=i18n_contexts.id_windowmanager, icon='FILE_NEW')
+-        layout.operator("wm.open_mainfile", text="Open...", icon='FILE_FOLDER')
+-        layout.menu("TOPBAR_MT_file_open_recent")
+-        layout.operator("wm.revert_mainfile")
++        layout.operator("wm.worldforge_open_asset", text="Open Asset...", icon='FILE_FOLDER')
++        layout.menu("TOPBAR_MT_worldforge_recent")
+         layout.menu("TOPBAR_MT_file_recover")
+ 
+         layout.separator()
+ 
+-        layout.operator_context = 'EXEC_AREA' if context.blend_data.is_saved else 'INVOKE_AREA'
+-        layout.operator("wm.save_mainfile", text="Save", icon='FILE_TICK').show_save_modified_images_dialog = True
+-
+         layout.operator_context = 'INVOKE_AREA'
+-        layout.operator("wm.save_as_mainfile", text="Save As...").show_save_modified_images_dialog = True
+-        layout.operator_context = 'INVOKE_AREA'
+-        save_copy = layout.operator("wm.save_as_mainfile", text="Save Copy...")
+-        save_copy.copy = True
+-        save_copy.show_save_modified_images_dialog = True
+-
+-        sub = layout.row()
+-        sub.enabled = context.blend_data.is_saved
+-        sub.operator_context = 'EXEC_AREA'
+-        save_incremental = sub.operator("wm.save_mainfile", text="Save Incremental")
+-        save_incremental.incremental = True
+-        save_incremental.show_save_modified_images_dialog = True
++        layout.operator("wm.worldforge_save_asset", text="Save", icon='FILE_TICK')
++        layout.operator("wm.worldforge_save_asset", text="Save As...").mode = "SAVE_AS"
++        layout.operator("wm.worldforge_save_asset", text="Save a Copy...").mode = "COPY"
+ 
+         layout.separator()
+ 
+@@ -208,7 +209,8 @@ class TOPBAR_MT_file(Menu):
+ 
+         layout.separator()
+ 
+-        layout.operator("wm.quit_blender", text="Quit", icon='QUIT')
++        close_label = "Close Authoring Session" if os.environ.get("WORLDFORGE_EMBEDDED_STUDIO") == "1" else "Quit"
++        layout.operator("wm.quit_blender", text=close_label, icon='QUIT')
+ 
+ 
+ class TOPBAR_MT_file_new(Menu):
+@@ -289,8 +291,10 @@ class TOPBAR_MT_file_recover(Menu):
+     def draw(self, _context):
+         layout = self.layout
+ 
+-        layout.operator("wm.recover_last_session", text="Last Session")
+-        layout.operator("wm.recover_auto_save", text="Auto Save...")
++        layout.operator("wm.worldforge_recover_asset", text="WorldForge Autosave")
++        if os.environ.get("WORLDFORGE_EMBEDDED_STUDIO") != "1":
++            layout.operator("wm.recover_last_session", text="Last Session")
++            layout.operator("wm.recover_auto_save", text="Auto Save...")
+ 
+ 
+ class TOPBAR_MT_file_defaults(Menu):
+@@ -364,6 +368,7 @@ class TOPBAR_MT_file_import(Menu):
+     bl_owner_use_filter = False
+ 
+     def draw(self, _context):
++        self.layout.operator("wm.open_mainfile", text="Blender Project (.blend)")
+         if bpy.app.build_options.alembic:
+             self.layout.operator("wm.alembic_import", text="Alembic (.abc)")
+         if bpy.app.build_options.usd:
+diff --git a/scripts/startup/bl_ui/space_view3d.py b/scripts/startup/bl_ui/space_view3d.py
+index fdb12ecd..ee358ba4 100644
+--- a/scripts/startup/bl_ui/space_view3d.py
++++ b/scripts/startup/bl_ui/space_view3d.py
+@@ -104,6 +104,8 @@ class VIEW3D_HT_tool_header(Header):
+         if tool_mode == 'SCULPT':
+             if is_valid_context:
+                 draw_3d_brush_settings(layout, tool_mode)
++            if bpy.ops.object.worldforge_add_sculpt_detail.poll():
++                layout.operator("object.worldforge_add_sculpt_detail", icon='MOD_MULTIRES')
+         elif tool_mode == 'PAINT_VERTEX':
+             if is_valid_context:
+                 draw_3d_brush_settings(layout, tool_mode)
+diff --git a/source/blender/asset_system/intern/asset_library_service.cc b/source/blender/asset_system/intern/asset_library_service.cc
+index c9507fc4..8c02e410 100644
+--- a/source/blender/asset_system/intern/asset_library_service.cc
++++ b/source/blender/asset_system/intern/asset_library_service.cc
+@@ -462,7 +462,9 @@ std::string AssetLibraryService::resolve_asset_weak_reference_to_library_path(
+ 
+ int64_t AssetLibraryService::rfind_blendfile_extension(StringRef path)
+ {
+-  const std::vector<StringRefNull> blendfile_extensions = {".blend" SEP_STR,
++  const std::vector<StringRefNull> blendfile_extensions = {".wflib" SEP_STR,
++                                                           ".wflib" ALTSEP_STR,
++                                                           ".blend" SEP_STR,
+                                                            ".blend.gz" SEP_STR,
+                                                            ".ble" SEP_STR,
+                                                            ".blend" ALTSEP_STR,
+@@ -537,6 +539,17 @@ std::string AssetLibraryService::resolve_asset_weak_reference_to_full_path(
+   std::string normalized_full_path = utils::normalize_path(library_dirpath + SEP_STR) +
+                                      normalize_asset_weak_reference_relative_asset_identifier(
+                                          asset_reference);
++  if (asset_reference.asset_library_type == ASSET_LIBRARY_ESSENTIALS) {
++    const auto extension = rfind_blendfile_extension(normalized_full_path);
++    if (extension != StringRef::not_found &&
++        normalized_full_path.compare(extension, 7, ".wflib" SEP_STR) == 0)
++    {
++      const auto migrated_library = normalized_full_path.substr(0, extension) + ".blend";
++      if (BLI_is_file(migrated_library.c_str())) {
++        normalized_full_path.replace(extension, 6, ".blend");
++      }
++    }
++  }
+ 
+   return normalized_full_path;
+ }
+diff --git a/source/blender/blenkernel/intern/asset_weak_reference.cc b/source/blender/blenkernel/intern/asset_weak_reference.cc
+index b0981bd6..7862eb6f 100644
+--- a/source/blender/blenkernel/intern/asset_weak_reference.cc
++++ b/source/blender/blenkernel/intern/asset_weak_reference.cc
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <memory>
++#include <string>
+ 
+ #include "BLI_listbase.h"
+ #include "BLI_path_utils.hh"
+@@ -71,6 +72,24 @@ AssetWeakReference &AssetWeakReference::operator=(AssetWeakReference &&other)
+   return *this;
+ }
+ 
++static std::string studio_essentials_identifier(const char *identifier)
++{
++  std::string path(identifier);
++  const auto slash = path.find_first_of("/\\");
++  if (slash == std::string::npos ||
++      (path.compare(0, slash, "brushes") != 0 && path.compare(0, slash, "nodes") != 0))
++  {
++    return path;
++  }
++  const auto library_end = path.find_first_of("/\\", slash + 1);
++  if (library_end != std::string::npos && library_end >= 6 &&
++      path.compare(library_end - 6, 6, ".wflib") == 0)
++  {
++    path.replace(library_end - 6, 6, ".blend");
++  }
++  return path;
++}
++
+ bool operator==(const AssetWeakReference &a, const AssetWeakReference &b)
+ {
+   if (a.asset_library_type != b.asset_library_type) {
+@@ -86,10 +105,15 @@ bool operator==(const AssetWeakReference &a, const AssetWeakReference &b)
+   }
+   const char *a_asset_idenfifier = a.relative_asset_identifier ? a.relative_asset_identifier : "";
+   const char *b_asset_idenfifier = b.relative_asset_identifier ? b.relative_asset_identifier : "";
+-  if (BLI_path_cmp_normalized(a_asset_idenfifier, b_asset_idenfifier) != 0) {
+-    return false;
++  if (BLI_path_cmp_normalized(a_asset_idenfifier, b_asset_idenfifier) == 0) {
++    return true;
++  }
++  if (a.asset_library_type == ASSET_LIBRARY_ESSENTIALS) {
++    const auto lhs = studio_essentials_identifier(a_asset_idenfifier);
++    const auto rhs = studio_essentials_identifier(b_asset_idenfifier);
++    return BLI_path_cmp_normalized(lhs.c_str(), rhs.c_str()) == 0;
+   }
+-  return true;
++  return false;
+ }
+ 
+ AssetWeakReference AssetWeakReference::make_reference(const asset_system::AssetLibrary &library,
+diff --git a/source/blender/blenkernel/intern/blendfile.cc b/source/blender/blenkernel/intern/blendfile.cc
+index d2eb290b..8040aced 100644
+--- a/source/blender/blenkernel/intern/blendfile.cc
++++ b/source/blender/blenkernel/intern/blendfile.cc
+@@ -87,7 +87,7 @@ using namespace bke;
+ 
+ bool BKE_blendfile_extension_check(const char *str)
+ {
+-  const char *ext_test[4] = {".blend", ".ble", ".blend.gz", nullptr};
++  const char *ext_test[] = {".wflib", ".blend", ".ble", ".blend.gz", nullptr};
+   return BLI_path_extension_check_array(str, ext_test);
+ }
+ 
+diff --git a/source/blender/blenloader/intern/readfile.cc b/source/blender/blenloader/intern/readfile.cc
+index c29c9236..5dfc1558 100644
+--- a/source/blender/blenloader/intern/readfile.cc
++++ b/source/blender/blenloader/intern/readfile.cc
+@@ -73,6 +73,7 @@
+ 
+ #include "BKE_anim_data.hh"
+ #include "BKE_animsys.h"
++#include "BKE_appdir.hh"
+ #include "BKE_asset.hh"
+ #include "BKE_blender_version.h"
+ #include "BKE_collection.hh"
+@@ -5967,6 +5968,36 @@ static void read_library_clear_weak_links(FileData *basefd, Main *mainvar)
+   }
+ }
+ 
++/* An older Studio document may still point at the built-in library in a different install. */
++static void resolve_studio_builtin_library(Main *bmain, Library *library)
++{
++  const char *absolute = library->runtime->filepath_abs;
++  std::string path(absolute);
++  std::replace(path.begin(), path.end(), '\\', '/');
++  const size_t folder = path.rfind("/datafiles/assets/");
++  if (folder == std::string::npos) {
++    return;
++  }
++  std::string relative = path.substr(folder + sizeof("/datafiles/assets/") - 1);
++  const size_t slash = relative.find('/');
++  if (slash == std::string::npos || relative.find('/', slash + 1) != std::string::npos ||
++      (relative.substr(0, slash) != "brushes" && relative.substr(0, slash) != "nodes"))
++  {
++    return;
++  }
++  if (relative.ends_with(".wflib")) {
++    relative.replace(relative.size() - 6, 6, ".blend");
++  }
++  if (relative.ends_with(".blend")) {
++    if (const auto assets = BKE_appdir_folder_id(BLENDER_SYSTEM_DATAFILES, "assets")) {
++      const std::string replacement = *assets + "/" + relative;
++      if (BLI_path_cmp(absolute, replacement.c_str()) != 0 && BLI_is_file(replacement.c_str())) {
++        BKE_library_filepath_set(bmain, library, replacement.c_str());
++      }
++    }
++  }
++}
++
+ static FileData *read_library_file_data(FileData *basefd, Main *bmain, Main *lib_bmain)
+ {
+   FileData *fd = lib_bmain->curlib->runtime->filedata;
+@@ -5992,6 +6023,7 @@ static FileData *read_library_file_data(FileData *basefd, Main *bmain, Main *lib
+   }
+   else {
+     /* Read file on disk. */
++    resolve_studio_builtin_library(bmain, lib_bmain->curlib);
+     BLO_reportf_wrap(basefd->reports,
+                      RPT_INFO,
+                      RPT_("Read library: '%s', '%s', parent '%s'"),
+diff --git a/source/blender/windowmanager/intern/wm_event_system.cc b/source/blender/windowmanager/intern/wm_event_system.cc
+index 9f6a0be3..7289b0ef 100644
+--- a/source/blender/windowmanager/intern/wm_event_system.cc
++++ b/source/blender/windowmanager/intern/wm_event_system.cc
+@@ -2872,7 +2872,7 @@ static eHandlerActionFlag wm_handler_fileselect_do(bContext *C,
+   switch (val) {
+     case EVT_FILESELECT_FULL_OPEN: {
+       ScrArea *area = ED_screen_temp_space_open(
+-          C, IFACE_("Blender File View"), SPACE_FILE, U.filebrowser_display_type, true);
++          C, IFACE_("WorldForge File Browser"), SPACE_FILE, U.filebrowser_display_type, true);
+       if (!area) {
+         BKE_report(&wm->runtime->reports, RPT_ERROR, "Failed to open file browser!");
+         return WM_HANDLER_BREAK;
+diff --git a/source/blender/windowmanager/intern/wm_files.cc b/source/blender/windowmanager/intern/wm_files.cc
+index 686250cd..026645f6 100644
+--- a/source/blender/windowmanager/intern/wm_files.cc
++++ b/source/blender/windowmanager/intern/wm_files.cc
+@@ -4953,7 +4953,13 @@ static void wm_block_file_close_save(bContext *C, void *arg_block, void *arg_dat
+ 
+   bool file_has_been_saved_before = BKE_main_blendfile_path(bmain)[0] != '\0';
+ 
+-  if (file_has_been_saved_before) {
++  if (WM_operatortype_find("WM_OT_worldforge_save_asset", true)) {
++    const wmOperatorStatus status = WM_operator_name_call(
++        C, "WM_OT_worldforge_save_asset", wm::OpCallContext::InvokeDefault, nullptr, nullptr);
++    /* A newly opened Save dialog leaves the current document available until it is saved. */
++    execute_callback = execute_callback && (status & OPERATOR_FINISHED);
++  }
++  else if (file_has_been_saved_before) {
+     if (bmain->has_forward_compatibility_issues || bmain->colorspace.is_missing_opencolorio_config)
+     {
+       /* Need to invoke to get the file-browser and choose where to save the new file.
+@@ -5061,7 +5067,10 @@ static ui::Block *block_create__close_file_dialog(bContext *C, ARegion *region,
+   /* Filename. */
+   const char *blendfile_path = BKE_main_blendfile_path(CTX_data_main(C));
+   char filename[FILE_MAX];
+-  if (blendfile_path[0] != '\0') {
++  if (WM_operatortype_find("WM_OT_worldforge_save_asset", true)) {
++    BLI_strncpy(filename, IFACE_("WorldForge Asset (.wfasset)"), sizeof(filename));
++  }
++  else if (blendfile_path[0] != '\0') {
+     BLI_path_split_file_part(blendfile_path, filename, sizeof(filename));
+   }
+   else {
+diff --git a/source/creator/creator.cc b/source/creator/creator.cc
+index 4253893b..d6b1a333 100644
+--- a/source/creator/creator.cc
++++ b/source/creator/creator.cc
+@@ -663,7 +663,9 @@ int main(int argc,
+     BLI_assert(app_state.main_arg_deferred == nullptr);
+ 
+     /* Shows the splash as needed. */
+-    WM_init_splash_on_startup(C);
++    if (!BLI_getenv("WORLDFORGE_EMBEDDED_STUDIO")) {
++      WM_init_splash_on_startup(C);
++    }
+ 
+     WM_main(C);
+   }
+diff --git a/source/creator/creator_args.cc b/source/creator/creator_args.cc
+index 109f9388..dfdbd3b5 100644
+--- a/source/creator/creator_args.cc
++++ b/source/creator/creator_args.cc
+@@ -66,6 +66,7 @@
+ #  include "RE_pipeline.h"
+ 
+ #  include "WM_api.hh"
++#  include "RNA_access.hh"
+ 
+ #  ifdef WITH_LIBMV
+ #    include "libmv-capi.h"
+@@ -2940,6 +2941,30 @@ static bool handle_load_file(bContext *C, const char *filepath_arg, const bool l
+   STRNCPY(filepath, filepath_arg);
+   BLI_path_canonicalize_native(filepath, sizeof(filepath));
+ 
++#  ifdef WITH_PYTHON
++  if (BLI_path_extension_check(filepath, ".wfasset")) {
++    const char *operator_name = "WM_OT_worldforge_open_asset";
++    if (WM_operatortype_find(operator_name, true) == nullptr) {
++      fprintf(stderr, "WorldForge asset opening is unavailable.\n");
++      if (G.background) {
++        G.is_break = true;
++      }
++      return false;
++    }
++    PointerRNA props = WM_operator_properties_create(operator_name);
++    RNA_string_set(&props, "filepath", filepath);
++    RNA_boolean_set(&props, "skip_save_check", true);
++    const bool opened = (WM_operator_name_call(
++                             C, operator_name, wm::OpCallContext::ExecDefault, &props, nullptr) &
++                         OPERATOR_FINISHED) != 0;
++    WM_operator_properties_free(&props);
++    if (!opened && G.background) {
++      G.is_break = true;
++    }
++    return opened;
++  }
++#  endif
++
+   /* Load the file. */
+   ReportList reports;
+   BKE_reports_init(&reports, RPT_PRINT | RPT_STORE);
