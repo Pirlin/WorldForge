@@ -17,7 +17,13 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     vec4 skyZenith;        // linear sky radiance at the zenith
     vec4 skyGround;        // linear radiance of the ground below the horizon
     vec4 lights[16];       // position or direction, intensity in scene units (negative for directional)
+    // Large-scale sky occlusion (Engine/Render/SkyVisibility.h): world space to each sky direction's depth map,
+    // the directions toward the sky, and settings: enabled, meters per texel, unused, unused.
+    mat4 skyMatrices[16];
+    vec4 skyDirections[16];
+    vec4 skySettings;
 } lighting;
+layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles, one per sky direction, nearest
 
 const float sunAngularDiameter = 0.00925; // radians, as in ShadowCascades.h
 const vec2 shadowDisk[16] = vec2[16](

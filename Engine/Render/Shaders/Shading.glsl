@@ -35,6 +35,39 @@ vec3 skyRadianceToward(vec3 r)
     return mix(lighting.skyHorizon.rgb,lighting.skyZenith.rgb,pow(r.z,0.55));
 }
 
+// The share of sky light that reaches position on a surface facing normal: each sky direction counts by its
+// brightness times the cosine to the normal (plus a little, so surfaces facing down still see the sky around
+// them), and only when its depth map shows nothing between the point and the sky. 1 when the maps are off.
+float skyOpenness(vec3 position,vec3 normal)
+{
+    if (lighting.skySettings.x < 0.5)
+        return 1.0;
+    float texel = lighting.skySettings.y;
+    float texels = float(textureSize(skyVisibilityMap,0).x)*0.25;
+    // Off the surface by about two texels; the lookup moves within a texel each TAA frame, which smooths the
+    // coarse maps into soft occlusion.
+    vec3 lifted = position+normal*texel*2.0;
+    vec2 pixel = gl_FragCoord.xy+5.588238*lighting.settings.z;
+    float noise = fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
+    vec2 jitter = (vec2(noise,fract(noise*7.31+0.37))-0.5)/texels;
+    float open = 0.0, total = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        vec3 direction = lighting.skyDirections[i].xyz;
+        float weight = dot(skyRadianceToward(direction),vec3(0.2126,0.7152,0.0722))*(max(dot(normal,direction),0.0)+0.05);
+        vec3 c = (lighting.skyMatrices[i]*vec4(lifted,1.0)).xyz;
+        vec2 uv = c.xy*0.5+0.5+jitter;
+        float visible = 1.0;
+        if (all(greaterThan(uv,vec2(0.0))) && all(lessThan(uv,vec2(1.0))) && c.z > 0.0 && c.z < 1.0) {
+            uv = clamp(uv,vec2(0.5/texels),vec2(1.0-0.5/texels));
+            float depth = textureLod(skyVisibilityMap,(uv+vec2(i%4,i/4))*0.25,0.0).r;
+            visible = step(c.z,depth);
+        }
+        open += weight*visible;
+        total += weight;
+    }
+    return total > 0.0 ? open/total : 1.0;
+}
+
 // The split-sum environment BRDF, analytic fit (Karis 2014, after Lazarov 2013): scale and bias for F0.
 vec2 environmentBrdf(float roughness,float nv)
 {
@@ -98,6 +131,6 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
     // Rough surfaces see a blurrier sky; at full roughness the reflection is the irradiance.
     vec3 reflected = mix(skyRadianceToward(r),skyIrradiance(r),smoothstep(0.0,1.0,surface.roughness));
     vec3 diffuse = surface.albedo*(1.0-surface.metallic)*(1.0-specularColor)*skyIrradiance(surface.normal);
-    indirect = (diffuse+reflected*specularColor)*surface.occlusion;
+    indirect = (diffuse+reflected*specularColor)*surface.occlusion*skyOpenness(position,surface.normal);
     return result+indirect;
 }

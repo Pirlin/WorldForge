@@ -18,10 +18,13 @@ public:
     static constexpr uint32_t sceneSubpass = 0, temporalSubpass = 0, displaySubpass = 1;
     // Samples in the jitter sequence, and how many frames a still view averages.
     static constexpr uint32_t temporalSamples = 16;
-    // The scene pass writes the lit scene and, separately, its sky-light part for ambient occlusion.
-    static constexpr uint32_t sceneColorAttachments = 2;
-    // Float, so a frame may exceed 1: the noisy per-frame values average to the unbiased result under TAA.
-    static constexpr VkFormat occlusionFormat = VK_FORMAT_R16_SFLOAT;
+    // The scene pass writes the lit scene and, separately, its sky-light part (which ambient occlusion scales) and
+    // the surfaces' diffuse albedo with the fog transmission in alpha (which bounce light needs).
+    static constexpr uint32_t sceneColorAttachments = 3;
+    static constexpr VkFormat albedoFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    // Bounce light in RGB and sky visibility in alpha (Ambient.frag). Float, so a frame may exceed 1: the noisy
+    // per-frame values average to the unbiased result under TAA.
+    static constexpr VkFormat occlusionFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
     struct Temporal {
         bool enabled = false;
@@ -32,7 +35,7 @@ public:
         std::array<float,16> reprojection{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     };
 
-    // Ground-truth ambient occlusion (Ambient.frag) from the scene depth, applied to the sky light.
+    // Ground-truth ambient occlusion and screen-space bounce light (Ambient.frag) from the scene depth and color.
     struct Occlusion {
         bool enabled = false;
         // This frame's clip space (with its jitter) to world space, column-major as GLSL reads it.
@@ -97,7 +100,7 @@ private:
     VkPipelineLayout displayLayout_{}, temporalLayout_{}, occlusionLayout_{};
     VkPipeline display_{}, temporal_{}, ambient_{};
     VkSampler nearest_{}, linear_{};
-    Image scene_, indirect_, occlusion_, depth_;
+    Image scene_, indirect_, albedo_, occlusion_, depth_;
     std::array<Image,2> history_;
     std::array<bool,2> historyReady_{};
     VkExtent2D extent_{};

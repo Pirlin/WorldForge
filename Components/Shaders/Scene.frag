@@ -15,7 +15,8 @@ layout(location = 5) in vec3 materialNormal;
 layout(location = 6) flat in vec2 surfaceFactors;
 layout(set = 0, binding = 2, std430) readonly buffer MaterialImages { uint pixels[]; } images;
 layout(location = 0) out vec4 color;
-layout(location = 1) out vec4 indirectLight; // the sky-light part of color and the diffuse albedo, for ambient occlusion
+layout(location = 1) out vec4 indirectLight; // the sky-light part of color, which ambient occlusion scales
+layout(location = 2) out vec4 surfaceAlbedo; // diffuse albedo and fog transmission, for bounce light
 layout(push_constant) uniform View {
     mat4 matrix;
     vec4 eye;
@@ -141,7 +142,7 @@ void main()
     float visibility = sunVisibility(worldPosition,materialNormal,true);
     vec3 surface = shade * materialImage(0,vec3(1.0));
     vec3 indirect = vec3(0.0);
-    float reflectance = 0.0;
+    vec3 diffuseAlbedo = vec3(0.0);
     if (camera.zenith.y > 0.5 && dot(materialNormal,materialNormal) > 0.001) {
         // World views: the physically based model shared with the Player.
         vec3 packed = materialImage(2,vec3(1.0));
@@ -151,7 +152,7 @@ void main()
         material.metallic = clamp(surfaceFactors.x*packed.b,0.0,1.0);
         material.roughness = clamp(surfaceFactors.y*packed.g,0.045,1.0);
         material.occlusion = materialImage(3,vec3(1.0)).r;
-        reflectance = dot(material.albedo*(1.0-material.metallic),vec3(0.2126,0.7152,0.0722));
+        diffuseAlbedo = material.albedo*(1.0-material.metallic);
         surface = shadeSurface(material,worldPosition,camera.eye.xyz,visibility,indirect)+surfaceEmission();
     } else if (surfaceFactors.y > 0.0 && dot(materialNormal,materialNormal) > 0.001)
         surface = materialLighting(surface,visibility);
@@ -160,5 +161,7 @@ void main()
     vec3 haze = mix(surface,inscatter,amount);
     vec4 local = localMist(camera.eye.xyz,ray/max(rayLength,0.0001),rayLength,working(camera.fog.rgb),camera.zenith.x);
     color = vec4(haze*(1.0-local.a)+local.rgb,1.0);
-    indirectLight = vec4(indirect*(1.0-amount)*(1.0-local.a),reflectance);
+    float transmission = (1.0-amount)*(1.0-local.a);
+    indirectLight = vec4(indirect*transmission,1.0);
+    surfaceAlbedo = vec4(diffuseAlbedo,transmission);
 }

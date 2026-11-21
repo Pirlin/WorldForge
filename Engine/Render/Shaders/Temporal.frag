@@ -10,8 +10,9 @@
 layout(set = 0, binding = 0) uniform sampler2D scene;   // this frame, nearest
 layout(set = 0, binding = 1) uniform sampler2D depth;   // this frame, nearest
 layout(set = 0, binding = 2) uniform sampler2D history; // the previous resolve, bilinear
-layout(set = 0, binding = 3) uniform sampler2D indirect; // this frame's sky light after fog, and diffuse albedo in alpha; nearest
-layout(set = 0, binding = 4) uniform sampler2D ambient;  // ambient occlusion (Ambient.frag), nearest
+layout(set = 0, binding = 3) uniform sampler2D indirect; // this frame's sky light after fog, nearest
+layout(set = 0, binding = 4) uniform sampler2D ambient;  // bounce light and sky visibility (Ambient.frag), nearest
+layout(set = 0, binding = 5) uniform sampler2D albedo;   // diffuse albedo and fog transmission, nearest
 layout(push_constant) uniform Temporal {
     mat4 reprojection; // this frame's clip space to the previous frame's clip space
     vec4 settings;     // weight of this frame, history valid, clamp history, ambient occlusion on
@@ -37,23 +38,15 @@ vec3 clipToBox(vec3 value,vec3 center,vec3 extent)
     return largest > 1.0 ? center+offset/largest : value;
 }
 
-// The share of sky light that reaches a surface, counting light that bounces between the surface and what
-// occludes it (GTAO multi-bounce fit, Jimenez et al. 2016): bright surfaces lose less light in creases.
-// Above 1 it continues in a straight line, so noisy frames still average to the right value.
-float multiBounce(float visibility,float albedo)
-{
-    float a = 2.0404*albedo-0.3324, b = -4.7951*albedo+0.6417, c = 2.7552*albedo+0.6903;
-    float x = min(visibility,1.0);
-    return ((x*a+b)*x+c)*x+max(visibility-1.0,0.0)*(3.0*a+2.0*b+c);
-}
-
-// This frame's light at a pixel, with ambient occlusion taken out of the sky light.
+// This frame's light at a pixel: the occluded share of the sky light taken out, and the light bounced from nearby
+// surfaces added (both after fog, as the scene was).
 vec3 sceneAt(ivec2 pixel)
 {
     vec3 light = texelFetch(scene,pixel,0).rgb;
     if (taa.settings.w > 0.5) {
-        vec4 sky = texelFetch(indirect,pixel,0);
-        light -= sky.rgb*(1.0-multiBounce(texelFetch(ambient,pixel,0).r,sky.a));
+        vec4 nearby = texelFetch(ambient,pixel,0);
+        vec4 surface = texelFetch(albedo,pixel,0);
+        light += surface.rgb*nearby.rgb*surface.a-texelFetch(indirect,pixel,0).rgb*(1.0-nearby.a);
     }
     return max(light,vec3(0.0));
 }

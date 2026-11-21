@@ -2193,6 +2193,7 @@ public:
         if (window_.owner_.rendererName().isEmpty())
             window_.owner_.setRenderDevice(QString::fromUtf8(window_.physicalDeviceProperties()->deviceName), {}, 0, 0);
         frames_.resize(window_.concurrentFrameCount());
+        skyValid_ = skyInitialized_ = false;
         if (!lighting_.create(window_,vk_,window_.modelOnly_)) {
             window_.report(QObject::tr("Vulkan could not allocate shadow resources."));
             return;
@@ -2384,14 +2385,53 @@ public:
             std::copy_n(cascades.matrices[i].data(),16,lighting.cascadeMatrices[i]);
             std::copy_n(cascades.scales[i].data(),4,lighting.cascadeScales[i]);
         }
+        // Large-scale sky occlusion, part of the ambient occlusion setting; world views only.
+        const bool skyMaps = environment.ambientOcclusion && shadowBounds_ && !window_.modelOnly_ && !geometry.triangles.empty();
+        auto skyVisibility = shadowBounds_ ? wf::sky::fit(*shadowBounds_) : wf::sky::Visibility{};
+        // The maps are shared by all frames and re-rendered only when needed: at once after an edit or a refit, and
+        // at most every skyRefreshFrames frames while a running game moves objects.
+        bool skyRefresh = false;
+        if (skyMaps) {
+            const auto &rendered = skyRendered_;
+            const float moved = std::hypot(skyVisibility.center[0]-rendered.center[0],skyVisibility.center[1]-rendered.center[1],
+                                           skyVisibility.center[2]-rendered.center[2]);
+            const bool refit = !skyValid_ || std::abs(skyVisibility.radius-rendered.radius) > 0.1f*rendered.radius
+                || moved > 8*rendered.metersPerTexel;
+            const bool changed = skyRevision_ != window_.geometryRevision_;
+            ++skyAge_;
+            skyRefresh = refit || (changed && (!window_.runtime_ || skyAge_ >= skyRefreshFrames));
+            if (skyRefresh) {
+                skyRendered_ = skyVisibility;
+                skyValid_ = true;
+                skyRevision_ = window_.geometryRevision_;
+                skyAge_ = 0;
+            } else {
+                skyVisibility = skyRendered_;
+            }
+        }
+        for (int i = 0; i < wf::sky::directionCount; ++i) {
+            std::copy_n(skyVisibility.matrices[i].data(),16,lighting.skyMatrices[i]);
+            std::copy_n(skyVisibility.directions[i].data(),4,lighting.skyDirections[i]);
+        }
+        lighting.skySettings[0] = skyMaps ? 1.0f : 0.0f;
+        lighting.skySettings[1] = skyVisibility.metersPerTexel;
         const auto frameIndex = window_.currentFrame();
         const auto exposure = exposureFor(environment,frameIndex);
         const bool ready = triangles_ && lines_ && sky_ && shadow_
             && (!hasGeometry || upload(frame,geometry,window_.geometryRevision_)) && lighting_.upload(frameIndex,lighting)
             && lighting_.uploadTextures(frameIndex,window_.modelOnly_ ? geometry.texturePixels : window_.worldTexturePixels_,
                 window_.textureRevision_);
-        if (ready)
-            recordShadow(command,frame,frameIndex,shadows,geometry.triangles.size(),cascades,windTime);
+        if (ready) {
+            recordDepthTiles(command,frame,lighting_.framebuffer(frameIndex),WorldLightingVulkan::shadowSize,wf::shadow::tileSize,
+                             shadows,geometry.triangles.size(),cascades.matrices,windTime);
+            if (skyRefresh || !skyInitialized_) {
+                recordDepthTiles(command,frame,lighting_.skyFramebuffer(),wf::sky::atlasSize,wf::sky::tileSize,
+                                 skyRefresh,geometry.triangles.size(),skyVisibility.matrices,windTime);
+                skyInitialized_ = true;
+            }
+        } else {
+            skyValid_ = false; // nothing was drawn; render the maps on the next ready frame
+        }
         frame_.begin(command,window_.currentSwapChainImageIndex(),background.data());
         if (ready) {
             const VkViewport viewport{0, 0, float(size.width()), float(size.height()), 0, 1};
@@ -2534,30 +2574,30 @@ private:
         return wf::shadow::fit(toWorld,{sun.x(),sun.y(),sun.z()},shadowBounds_);
     }
 
-    void recordShadow(VkCommandBuffer command,const Buffer &frame,int frameIndex,bool draw,std::size_t count,
-                      const wf::shadow::Cascades &cascades,float wind)
+    // Renders the scene's depth into square tiles of an atlas, one per matrix: the sun shadow cascades or the
+    // sky visibility maps. The atlas is always cleared, so it is ready to sample even when nothing is drawn.
+    void recordDepthTiles(VkCommandBuffer command,const Buffer &frame,VkFramebuffer framebuffer,uint32_t size,
+                          uint32_t tileSize,bool draw,std::size_t count,std::span<const wf::shadow::Matrix> matrices,float wind)
     {
-        constexpr auto size = WorldLightingVulkan::shadowSize;
         const VkRect2D area{{0,0},{size,size}};
+        const uint32_t columns = size/tileSize;
         VkClearValue clear{};
         clear.depthStencil = {1,0};
         const VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,lighting_.pass(),
-            lighting_.framebuffer(frameIndex),area,1,&clear};
+            framebuffer,area,1,&clear};
         vk_->vkCmdBeginRenderPass(command,&pass,VK_SUBPASS_CONTENTS_INLINE);
         if (draw) {
             vk_->vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadow_);
             const VkDeviceSize offset = 0;
             vk_->vkCmdBindVertexBuffers(command,0,1,&frame.buffer,&offset);
-            // One tile of the atlas per cascade.
-            for (int cascade = 0; cascade < wf::shadow::cascadeCount; ++cascade) {
-                const auto origin = wf::shadow::tileOrigin(cascade);
-                constexpr auto tileSize = wf::shadow::tileSize;
+            for (std::size_t index = 0; index < matrices.size(); ++index) {
+                const std::array<uint32_t,2> origin{uint32_t(index)%columns*tileSize,uint32_t(index)/columns*tileSize};
                 const VkViewport viewport{float(origin[0]),float(origin[1]),float(tileSize),float(tileSize),0,1};
                 const VkRect2D tile{{int32_t(origin[0]),int32_t(origin[1])},{tileSize,tileSize}};
                 vk_->vkCmdSetViewport(command,0,1,&viewport);
                 vk_->vkCmdSetScissor(command,0,1,&tile);
                 ViewUniform uniforms{};
-                std::copy_n(cascades.matrices[cascade].data(),16,uniforms.matrix);
+                std::copy_n(matrices[index].data(),16,uniforms.matrix);
                 uniforms.eye[3] = wind;
                 vk_->vkCmdPushConstants(command,layout_,shaderStages,0,sizeof(uniforms),&uniforms);
                 vk_->vkCmdDraw(command,uint32_t(count),1,0,0);
@@ -2733,10 +2773,10 @@ private:
             depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
             VkPipelineColorBlendAttachmentState blend{};
             blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-            // The scene pass has a second target for the sky-light part, which only Scene.frag writes.
-            VkPipelineColorBlendAttachmentState blends[wf::vk::HdrFrame::sceneColorAttachments]{blend,blend};
+            // The scene pass has targets for the sky-light part and the surface albedo, which only Scene.frag writes.
+            VkPipelineColorBlendAttachmentState blends[wf::vk::HdrFrame::sceneColorAttachments]{blend,blend,blend};
             if (sky)
-                blends[1].colorWriteMask = 0;
+                blends[1].colorWriteMask = blends[2].colorWriteMask = 0;
             VkPipelineColorBlendStateCreateInfo colors{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
             colors.attachmentCount = subpass == ViewportFrameVulkan::sceneSubpass ? wf::vk::HdrFrame::sceneColorAttachments : 1;
             colors.pAttachments = blends;
@@ -2789,6 +2829,12 @@ private:
     // The scene's bounds for fitting shadow cascades, for geometry revision shadowBoundsRevision_.
     std::optional<wf::shadow::Bounds> shadowBounds_;
     quint64 shadowBoundsRevision_ = ~quint64(0);
+    // The sky visibility maps as last rendered (see skyRefresh in the frame recording).
+    static constexpr uint32_t skyRefreshFrames = 30;
+    wf::sky::Visibility skyRendered_;
+    bool skyValid_ = false, skyInitialized_ = false;
+    quint64 skyRevision_ = 0;
+    uint32_t skyAge_ = 0;
     bool previousValid_ = false;
 };
 

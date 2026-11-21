@@ -11,6 +11,7 @@
 #include "Engine/Render/Flip.h"
 #include "Engine/Render/SkyLight.h"
 #include "Engine/Render/ShadowCascades.h"
+#include "Engine/Render/SkyVisibility.h"
 #include "Tests/AgxReference.h"
 #include <algorithm>
 #include <sstream>
@@ -199,6 +200,34 @@ void checkShadowCascades()
     }
 }
 
+void checkSkyVisibility()
+{
+    using namespace shadow::detail;
+    const shadow::Bounds street{{-60,-60,0},{60,60,12}};
+    const auto maps = sky::fit(street);
+    require(maps.metersPerTexel > 0.2f && maps.metersPerTexel < 0.5f, "Sky visibility maps cover the street at about a third of a meter per texel");
+    for (int i = 0; i < sky::directionCount; ++i) {
+        const shadow::Vector toward{maps.directions[i][0],maps.directions[i][1],maps.directions[i][2]};
+        require(std::abs(dot(toward,toward)-1) < 1e-4f && toward[2] >= sky::lowestElevation-1e-4f,
+                "Sky visibility directions are unit vectors above the lowest elevation");
+        const auto project = [&](shadow::Vector point) {
+            const auto &m = maps.matrices[i];
+            shadow::Vector result;
+            for (int row = 0; row < 3; ++row)
+                result[row] = m[row]*point[0]+m[4+row]*point[1]+m[8+row]*point[2]+m[12+row];
+            return result;
+        };
+        const auto center = project({0,0,6});
+        require(std::abs(center[0]) < 1e-4f && std::abs(center[1]) < 1e-4f && std::abs(center[2]-0.5f) < 1e-4f,
+                "The scene center lands in the middle of each sky visibility map");
+        // A roof above a floor point, toward the sky, is nearer the sky in that direction's map.
+        const shadow::Vector floor{5,5,0};
+        const auto roof = project(add(floor,scale(toward,4))), ground = project(floor);
+        require(std::abs(roof[0]-ground[0]) < 1e-4f && std::abs(roof[1]-ground[1]) < 1e-4f && roof[2] < ground[2] && roof[2] > 0,
+                "An occluder toward the sky covers the point beneath it in the sky visibility map");
+    }
+}
+
 int main(int argc,char *argv[])
 {
     if (argc == 2) {
@@ -225,6 +254,7 @@ int main(int argc,char *argv[])
     checkColorPipeline();
     checkFlip();
     checkShadowCascades();
+    checkSkyVisibility();
     const auto example = Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAC");
     require(example && example->toString() == "a1723291-8a22-47dc-b098-1f6718cffaac", "GUID canonicalizes");
     require(!Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAX"), "Invalid GUID rejected");

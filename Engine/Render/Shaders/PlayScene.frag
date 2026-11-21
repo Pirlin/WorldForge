@@ -18,7 +18,8 @@ layout(location = 1) in vec3 albedo;
 layout(location = 2) in vec2 surfaceUv;
 layout(location = 3) in vec3 surfaceNormal;
 layout(location = 0) out vec4 color;
-layout(location = 1) out vec4 indirectLight; // the sky-light part of color and the diffuse albedo, for ambient occlusion
+layout(location = 1) out vec4 indirectLight; // the sky-light part of color, which ambient occlusion scales
+layout(location = 2) out vec4 surfaceAlbedo; // diffuse albedo and fog transmission, for bounce light
 
 // The surface normal with the material's tangent-space normal map applied. The tangent frame comes from
 // screen-space derivatives of the position and texture coordinates.
@@ -71,6 +72,7 @@ void main()
     vec3 haze = mix(lit,mix(fogColor,srgbToLinear(vec3(1.0,0.83,0.64)),scattering),amount);
     vec4 mist = localMist(view.eye.xyz,direction,rayLength,fogColor,view.sun.w);
     color = vec4(haze*(1.0-mist.a)+mist.rgb,1.0);
-    indirectLight = vec4(indirect*(1.0-amount)*(1.0-mist.a),
-                         dot(surface.albedo*(1.0-surface.metallic),vec3(0.2126,0.7152,0.0722)));
+    float transmission = (1.0-amount)*(1.0-mist.a);
+    indirectLight = vec4(indirect*transmission,1.0);
+    surfaceAlbedo = vec4(surface.albedo*(1.0-surface.metallic),transmission);
 }

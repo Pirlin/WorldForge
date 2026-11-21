@@ -41,13 +41,14 @@ bool WorldLightingVulkan::create(QVulkanWindow &window,QVulkanDeviceFunctions *v
     const VkDescriptorSetLayoutBinding bindings[]{
         {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
+        {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
     };
-    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,3,bindings};
+    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,4,bindings};
     if (vk_->vkCreateDescriptorSetLayout(device_,&layout,nullptr,&layout_) != VK_SUCCESS)
         return false;
     const auto count = uint32_t(window.concurrentFrameCount());
-    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,count},
+    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2*count},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,count}};
     const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,count,3,sizes};
     if (vk_->vkCreateDescriptorPool(device_,&pool,nullptr,&pool_) != VK_SUCCESS)
@@ -58,6 +59,8 @@ bool WorldLightingVulkan::create(QVulkanWindow &window,QVulkanDeviceFunctions *v
     sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     if (vk_->vkCreateSampler(device_,&sampler,nullptr,&sampler_) != VK_SUCCESS)
         return false;
+    if (!createDepthTarget(sky_,format,worldforge::sky::atlasSize))
+        return false;
     frames_.resize(count);
     for (auto &frame : frames_)
         if (!createFrame(frame,format))
@@ -65,34 +68,48 @@ bool WorldLightingVulkan::create(QVulkanWindow &window,QVulkanDeviceFunctions *v
     return true;
 }
 
-bool WorldLightingVulkan::createFrame(Frame &frame,VkFormat format)
+bool WorldLightingVulkan::createDepthTarget(DepthTarget &target,VkFormat format,uint32_t size)
 {
     VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     image.imageType = VK_IMAGE_TYPE_2D;
     image.format = format;
-    image.extent = {shadowSize,shadowSize,1};
+    image.extent = {size,size,1};
     image.mipLevels = image.arrayLayers = 1;
     image.samples = VK_SAMPLE_COUNT_1_BIT;
     image.tiling = VK_IMAGE_TILING_OPTIMAL;
     image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (vk_->vkCreateImage(device_,&image,nullptr,&frame.image) != VK_SUCCESS)
+    if (vk_->vkCreateImage(device_,&image,nullptr,&target.image) != VK_SUCCESS)
         return false;
     VkMemoryRequirements requirements{};
-    vk_->vkGetImageMemoryRequirements(device_,frame.image,&requirements);
-    if (!allocate(frame.imageMemory,requirements,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-        || vk_->vkBindImageMemory(device_,frame.image,frame.imageMemory,0) != VK_SUCCESS)
+    vk_->vkGetImageMemoryRequirements(device_,target.image,&requirements);
+    if (!allocate(target.memory,requirements,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        || vk_->vkBindImageMemory(device_,target.image,target.memory,0) != VK_SUCCESS)
         return false;
     VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view.image = frame.image;
+    view.image = target.image;
     view.viewType = VK_IMAGE_VIEW_TYPE_2D;
     view.format = format;
     view.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,1};
-    if (vk_->vkCreateImageView(device_,&view,nullptr,&frame.view) != VK_SUCCESS)
+    if (vk_->vkCreateImageView(device_,&view,nullptr,&target.view) != VK_SUCCESS)
         return false;
     const VkFramebufferCreateInfo framebuffer{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,nullptr,0,pass_,
-        1,&frame.view,shadowSize,shadowSize,1};
-    if (vk_->vkCreateFramebuffer(device_,&framebuffer,nullptr,&frame.framebuffer) != VK_SUCCESS)
+        1,&target.view,size,size,1};
+    return vk_->vkCreateFramebuffer(device_,&framebuffer,nullptr,&target.framebuffer) == VK_SUCCESS;
+}
+
+void WorldLightingVulkan::destroyDepthTarget(const DepthTarget &target)
+{
+    if (target.framebuffer) vk_->vkDestroyFramebuffer(device_,target.framebuffer,nullptr);
+    if (target.view) vk_->vkDestroyImageView(device_,target.view,nullptr);
+    if (target.image) vk_->vkDestroyImage(device_,target.image,nullptr);
+    if (target.memory) vk_->vkFreeMemory(device_,target.memory,nullptr);
+}
+
+bool WorldLightingVulkan::createFrame(Frame &frame,VkFormat format)
+{
+    if (!createDepthTarget(frame.shadow,format,shadowSize))
         return false;
+    VkMemoryRequirements requirements{};
     const VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,nullptr,0,sizeof(LightingUniform),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,VK_SHARING_MODE_EXCLUSIVE,0,nullptr};
     if (vk_->vkCreateBuffer(device_,&buffer,nullptr,&frame.uniform) != VK_SUCCESS)
@@ -112,15 +129,17 @@ bool WorldLightingVulkan::createFrame(Frame &frame,VkFormat format)
     const VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,nullptr,pool_,1,&layout_};
     if (vk_->vkAllocateDescriptorSets(device_,&allocation,&frame.set) != VK_SUCCESS)
         return false;
-    const VkDescriptorImageInfo depth{sampler_,frame.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    const VkDescriptorImageInfo depth{sampler_,frame.shadow.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+    const VkDescriptorImageInfo skyMaps{sampler_,sky_.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
     const VkDescriptorBufferInfo uniform{frame.uniform,0,sizeof(LightingUniform)};
     const VkDescriptorBufferInfo textures{frame.textures,0,textureBytes_};
     const VkWriteDescriptorSet writes[]{
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,0,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&depth,nullptr,nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,1,0,1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,nullptr,&uniform,nullptr},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,2,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&textures,nullptr}
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,2,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&textures,nullptr},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,4,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&skyMaps,nullptr,nullptr}
     };
-    vk_->vkUpdateDescriptorSets(device_,3,writes,0,nullptr);
+    vk_->vkUpdateDescriptorSets(device_,4,writes,0,nullptr);
     return true;
 }
 
@@ -168,15 +187,13 @@ void WorldLightingVulkan::destroy()
     if (pool_)
         vk_->vkDestroyDescriptorPool(device_,pool_,nullptr);
     for (const auto &frame : frames_) {
-        if (frame.framebuffer) vk_->vkDestroyFramebuffer(device_,frame.framebuffer,nullptr);
-        if (frame.view) vk_->vkDestroyImageView(device_,frame.view,nullptr);
-        if (frame.image) vk_->vkDestroyImage(device_,frame.image,nullptr);
-        if (frame.imageMemory) vk_->vkFreeMemory(device_,frame.imageMemory,nullptr);
+        destroyDepthTarget(frame.shadow);
         if (frame.uniform) vk_->vkDestroyBuffer(device_,frame.uniform,nullptr);
         if (frame.uniformMemory) vk_->vkFreeMemory(device_,frame.uniformMemory,nullptr);
         if (frame.textures) vk_->vkDestroyBuffer(device_,frame.textures,nullptr);
         if (frame.textureMemory) vk_->vkFreeMemory(device_,frame.textureMemory,nullptr);
     }
+    destroyDepthTarget(sky_);
     if (sampler_) vk_->vkDestroySampler(device_,sampler_,nullptr);
     if (pass_) vk_->vkDestroyRenderPass(device_,pass_,nullptr);
     if (layout_) vk_->vkDestroyDescriptorSetLayout(device_,layout_,nullptr);

@@ -4,6 +4,7 @@
 // Direct3D 11 remains as the fallback for computers without a Vulkan driver.
 
 #include "Engine/Render/ShadowCascades.h"
+#include "Engine/Render/SkyVisibility.h"
 #include "Engine/World/PlayableScene.h"
 
 #include <windows.h>
@@ -32,8 +33,11 @@ struct View {
     // Sun shadow cascades (Engine/Render/ShadowCascades.h), fitted to the view without TAA jitter. Direct3D 11 uses
     // lightProjection instead.
     shadow::Cascades cascades;
+    // Large-scale sky occlusion maps (Engine/Render/SkyVisibility.h), fitted to the scene; used with ambient occlusion.
+    sky::Visibility skyVisibility;
     uint32_t temporalSample = 0; // the TAA frame in its sequence, which turns the shadow filter pattern
-    uint32_t padding[3]{};
+    uint32_t skyMaps = 0;        // 1 when skyVisibility covers the scene
+    uint32_t skyRefresh = 0;     // 1 when this frame re-renders the sky visibility maps (set by the renderer)
 };
 // Direct3D 11 uploads View as a constant buffer, whose size must be a multiple of 16 bytes.
 static_assert(sizeof(View)%16 == 0);
