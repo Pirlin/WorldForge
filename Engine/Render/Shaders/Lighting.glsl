@@ -85,9 +85,12 @@ float sunVisibility(vec3 position,vec3 normal,bool soft)
         vec3 towardSun = normalize(lighting.sun.xyz);
         if (dot(n,towardSun) < 0.0)
             n = -n;
-        // More offset where the sun grazes the surface, where a texel spans more of it.
+        // Off the surface by half a texel, then toward the sun, more where the sun grazes the surface and a texel
+        // spans more depth. Moving along the light ray changes only the depth compared, not where the shadow edge
+        // falls; a larger offset along the normal would shift edges toward their casters (by its height over the
+        // tangent of the sun's elevation, four times it for a low sun).
         float grazing = 1.0-clamp(dot(n,towardSun),0.0,1.0);
-        vec3 moved = position+n*scale.x*(1.0+2.0*grazing);
+        vec3 moved = position+n*scale.x*0.5+towardSun*scale.x*(1.0+2.0*grazing);
         vec3 c = (lighting.cascadeMatrices[cascade]*vec4(moved,1.0)).xyz;
         coordinates = vec3(c.xy*0.5+0.5,c.z);
     }
