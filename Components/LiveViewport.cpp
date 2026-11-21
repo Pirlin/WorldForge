@@ -2371,6 +2371,8 @@ public:
         std::copy_n(skyLight.horizon.data(),3,lighting.skyHorizon);
         std::copy_n(skyLight.zenith.data(),3,lighting.skyZenith);
         std::copy_n(skyLight.ground.data(),3,lighting.skyGround);
+        for (std::size_t i = 0; i < skyLight.reflections.size(); ++i)
+            std::copy_n(skyLight.reflections[i].data(),4,lighting.skyReflections[i]);
         int lightCount = 0;
         for (std::size_t i = 1; i < lights.size() && lightCount < 16; ++i)
             if (lights[i].intensity > 0) {

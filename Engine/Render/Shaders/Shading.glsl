@@ -68,6 +68,20 @@ float skyOpenness(vec3 position,vec3 normal)
     return total > 0.0 ? open/total : 1.0;
 }
 
+// The sky reflected in direction r by a surface of the given roughness, prefiltered with its GGX lobe. Mirror-like
+// surfaces use the sky itself, whose sharp horizon the table's 16 elevations would blur.
+vec3 skyReflection(vec3 r,float roughness)
+{
+    float level = clamp(roughness,0.0,1.0)*7.0;
+    float elevation = clamp(r.z*0.5+0.5,0.0,1.0)*15.0;
+    int low = min(int(level),6), row = min(int(elevation),14);
+    float across = elevation-float(row);
+    vec3 lower = low == 0 ? skyRadianceToward(r)
+        : mix(lighting.skyReflections[low*16+row].rgb,lighting.skyReflections[low*16+row+1].rgb,across);
+    vec3 upper = mix(lighting.skyReflections[(low+1)*16+row].rgb,lighting.skyReflections[(low+1)*16+row+1].rgb,across);
+    return mix(lower,upper,level-float(low));
+}
+
 // The split-sum environment BRDF, analytic fit (Karis 2014, after Lazarov 2013): scale and bias for F0.
 vec2 environmentBrdf(float roughness,float nv)
 {
@@ -133,8 +147,7 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
     }
     vec3 specularColor = (f0*brdf.x+brdf.y)*energy;
     vec3 r = reflect(-v,surface.normal);
-    // Rough surfaces see a blurrier sky; at full roughness the reflection is the irradiance.
-    vec3 reflected = mix(skyRadianceToward(r),skyIrradiance(r),smoothstep(0.0,1.0,surface.roughness));
+    vec3 reflected = skyReflection(r,surface.roughness);
     vec3 diffuse = surface.albedo*(1.0-surface.metallic)*(1.0-specularColor)*skyIrradiance(surface.normal);
     indirect = (diffuse+reflected*specularColor)*surface.occlusion*skyOpenness(position,surface.normal);
     return result+indirect;

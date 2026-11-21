@@ -652,6 +652,10 @@ public:
         view.skyHorizon = parameter(skyLight_->horizon,0);
         view.skyZenith = parameter(skyLight_->zenith,0);
         view.skyGround = parameter(skyLight_->ground,0);
+        for (std::size_t i = 0; i < skyLight_->reflections.size(); ++i) {
+            const auto &entry = skyLight_->reflections[i];
+            view.skyReflections[i] = {entry[0],entry[1],entry[2],0};
+        }
         return view;
     }
 

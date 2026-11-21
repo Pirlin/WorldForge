@@ -22,6 +22,9 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     mat4 skyMatrices[16];
     vec4 skyDirections[16];
     vec4 skySettings;
+    // The sky prefiltered for reflections (Engine/Render/SkyLight.h): roughness 0, 1/7 .. 1 by reflected elevation
+    // -1 .. 1 in 16 steps.
+    vec4 skyReflections[128];
 } lighting;
 layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles, one per sky direction, nearest
 

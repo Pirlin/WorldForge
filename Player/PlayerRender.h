@@ -4,6 +4,7 @@
 // Direct3D 11 remains as the fallback for computers without a Vulkan driver.
 
 #include "Engine/Render/ShadowCascades.h"
+#include "Engine/Render/SkyLight.h"
 #include "Engine/Render/SkyVisibility.h"
 #include "Engine/World/PlayableScene.h"
 
@@ -30,6 +31,8 @@ struct View {
     // Light from the sky (color::skyLight): irradiance / pi as spherical harmonics, and linear sky radiance at the
     // horizon, the zenith and the ground. Direct3D 11 does not use them.
     DirectX::XMFLOAT4 skyIrradiance[9], skyHorizon, skyZenith, skyGround;
+    // The sky prefiltered for reflections (color::SkyLight::reflections). Direct3D 11 does not use it.
+    DirectX::XMFLOAT4 skyReflections[color::reflectionRoughnessLevels*color::reflectionElevations];
     // Sun shadow cascades (Engine/Render/ShadowCascades.h), fitted to the view without TAA jitter. Direct3D 11 uses
     // lightProjection instead.
     shadow::Cascades cascades;

@@ -42,6 +42,7 @@ struct LightingBlock {      // Lighting.glsl
     XMFLOAT4 sun, skyIrradiance[9], skyHorizon, skyZenith, skyGround, lights[16];
     XMFLOAT4X4 skyMatrices[sky::directionCount];
     XMFLOAT4 skyDirections[sky::directionCount], skySettings; // settings: enabled, meters per texel
+    XMFLOAT4 skyReflections[color::reflectionRoughnessLevels*color::reflectionElevations];
 };
 struct PlayViewBlock {      // PlayView.glsl
     XMFLOAT4X4 viewProjection;
@@ -54,7 +55,7 @@ struct CameraConstants {    // push constants of Sky and Shadow shaders
 struct MaterialConstants {  // push constants of PlayScene.frag
     XMFLOAT4 emissive, factors;
 };
-static_assert(sizeof(LightingBlock) == 2112 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
+static_assert(sizeof(LightingBlock) == 4160 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
 
 constexpr uint32_t shadowSize = shadow::atlasSize;
 constexpr uint32_t framesInFlight = 2;
@@ -788,6 +789,7 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     lighting.skyHorizon = {view.skyHorizon.x,view.skyHorizon.y,view.skyHorizon.z,view.eye.w};
     lighting.skyZenith = view.skyZenith;
     lighting.skyGround = view.skyGround;
+    std::copy(std::begin(view.skyReflections),std::end(view.skyReflections),std::begin(lighting.skyReflections));
     std::copy(std::begin(view.lights),std::end(view.lights),std::begin(lighting.lights));
     std::memcpy(frame.lighting.mapped,&lighting,sizeof(lighting));
     PlayViewBlock block{vulkanClip(view.viewProjection),view.eye,view.horizon,view.zenith,view.fog,view.sun,{},

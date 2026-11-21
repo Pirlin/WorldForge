@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Engine/Render/ShadowCascades.h"
+#include "Engine/Render/SkyLight.h"
 #include "Engine/Render/SkyVisibility.h"
 
 #include <QVulkanFunctions>
@@ -23,8 +24,9 @@ struct LightingUniform {
     float skyMatrices[worldforge::sky::directionCount][16]; // Engine/Render/SkyVisibility.h
     float skyDirections[worldforge::sky::directionCount][4];
     float skySettings[4];       // enabled, meters per texel
+    float skyReflections[worldforge::color::reflectionRoughnessLevels*worldforge::color::reflectionElevations][4];
 };
-static_assert(sizeof(LightingUniform) == 2112);
+static_assert(sizeof(LightingUniform) == 4160);
 
 class WorldLightingVulkan {
 public:

@@ -140,6 +140,20 @@ void checkColorPipeline()
     const auto sunny = color::skyLight({grey,grey,grey},{grey,grey,grey},{0,0,1},1);
     require(sunny.ground[0] > uniformSky.ground[0]+0.2f && color::skyIrradiance(sunny,0,0,1)[0] > floorLight[0],
             "Sunlight brightens the ground and the light it bounces");
+    // Prefiltered reflections of the uniform sky: straight up a smooth-ish surface sees the sky, straight down the
+    // ground, and a rough surface facing the horizon sees a blend of the two.
+    const auto reflection = [&](int level,int elevation) {
+        return uniformSky.reflections[std::size_t(level*color::reflectionElevations+elevation)][1];
+    };
+    require(std::abs(reflection(2,color::reflectionElevations-1)-radiance) < 0.01f*radiance
+            && std::abs(reflection(2,0)-uniformSky.ground[1]) < 0.01f*radiance,
+            "Prefiltered reflections show the sky above and the ground below");
+    const float belowHorizon = reflection(color::reflectionRoughnessLevels-1,color::reflectionElevations/2-1);
+    require(belowHorizon > uniformSky.ground[1]*1.1f && belowHorizon < radiance*0.95f,
+            "A rough reflection just below the horizon blends sky and ground");
+    // Upward reflections leave out the part of the lobe under the surface, so they never see the ground.
+    require(std::abs(reflection(color::reflectionRoughnessLevels-1,color::reflectionElevations/2)-radiance) < 0.01f*radiance,
+            "A rough reflection just above the horizon sees only the sky");
     require(color::skyAmbientScale({166/255.0f,197/255.0f,219/255.0f},{65/255.0f,119/255.0f,177/255.0f}) == 1,
             "The default sky keeps the ambient light unchanged");
     require(color::skyAmbientScale({0.03f,0.03f,0.06f},{0.01f,0.01f,0.03f}) < 0.01f, "A night sky gives almost no ambient light");

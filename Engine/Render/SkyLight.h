@@ -5,7 +5,9 @@
 // The sky the user sees (Engine/Render/Shaders/Sky.frag: the horizon-to-zenith gradient and the glow
 // around the sun) is the light source for everything the sun does not light directly:
 // - Diffuse light uses its irradiance, projected onto nine spherical-harmonic coefficients.
-// - Reflections look the sky up in the reflected direction (Shading.glsl).
+// - Reflections use the sky prefiltered with the GGX lobe of each roughness (split-sum, Karis 2013), tabulated
+//   by roughness and the reflected direction's elevation: the sky depends on elevation only, so the table is
+//   exact for it. The sun's glow is left out, since direct sunlight already draws the highlight.
 // Below the horizon, the sky shows ground: in the absence of global illumination the ground is
 // treated as a flat surface of groundAlbedo lit by the sun and the sky, which is what most of the
 // lower hemisphere of a street scene is.
@@ -17,16 +19,21 @@
 
 #include <array>
 #include <cmath>
+#include <cstdint>
 
 namespace worldforge::color {
 
 inline constexpr float groundAlbedo = 0.25f;
+// The reflection table: roughness 0, 1/7 .. 1 by elevation -1 .. 1 in equal steps (Shading.glsl reads it).
+inline constexpr int reflectionRoughnessLevels = 8, reflectionElevations = 16;
 
 struct SkyLight {
     // Coefficients of irradiance / pi (the radiance a white diffuse surface reflects) for the SH basis in
     // Shading.glsl, RGB in xyz.
     std::array<std::array<float,4>,9> irradiance{};
     Rgb horizon{}, zenith{}, ground{}; // linear radiance
+    // The sky prefiltered for reflections, RGB in xyz: entry level * reflectionElevations + elevation.
+    std::array<std::array<float,4>,reflectionRoughnessLevels*reflectionElevations> reflections{};
 };
 
 // Radiance of the sky in direction (x, y, z), z up, matching Sky.frag without fog. Directions below the
@@ -108,6 +115,53 @@ inline SkyLight skyLight(const Rgb &horizonSrgb,const Rgb &zenithSrgb,std::array
     for (std::size_t i = 0; i < 9; ++i)
         for (int c = 0; c < 3; ++c)
             light.irradiance[i][std::size_t(c)] = band[i]*projected[i][std::size_t(c)];
+    // Prefiltered reflections: GGX importance samples around the reflected direction, weighted by the cosine
+    // to it (the split-sum approximation takes the normal and the view along it).
+    constexpr int samples = 512;
+    const auto radicalInverse = [](uint32_t bits) {
+        bits = (bits << 16u) | (bits >> 16u);
+        bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+        bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+        bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+        bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+        return float(bits)*2.3283064365386963e-10f;
+    };
+    for (int level = 0; level < reflectionRoughnessLevels; ++level) {
+        const float roughness = std::max(0.045f,float(level)/float(reflectionRoughnessLevels-1));
+        const float a2 = roughness*roughness*roughness*roughness;
+        for (int elevation = 0; elevation < reflectionElevations; ++elevation) {
+            const float z = -1+2*float(elevation)/float(reflectionElevations-1);
+            const float r[3]{std::sqrt(std::max(0.0f,1-z*z)),0,z};
+            // An orthonormal frame around r.
+            const float tangent[3]{-r[2],0,r[0]};
+            const float bitangent[3]{0,1,0};
+            Rgb sum{};
+            float total = 0;
+            for (int i = 0; i < samples; ++i) {
+                const float phi = 2*pi*(float(i)+0.5f)/samples;
+                const float u = radicalInverse(uint32_t(i));
+                const float cosine = std::sqrt((1-u)/(1+(a2-1)*u));
+                const float sine = std::sqrt(std::max(0.0f,1-cosine*cosine));
+                float h[3];
+                for (int k = 0; k < 3; ++k)
+                    h[k] = tangent[k]*sine*std::cos(phi)+bitangent[k]*sine*std::sin(phi)+r[k]*cosine;
+                const float rh = r[0]*h[0]+r[1]*h[1]+r[2]*h[2];
+                const float l[3]{2*rh*h[0]-r[0],2*rh*h[1]-r[1],2*rh*h[2]-r[2]};
+                const float weight = l[0]*r[0]+l[1]*r[1]+l[2]*r[2];
+                // Upward reflections come mostly from ground and roofs, where the part of the lobe below the
+                // horizon lies under the surface itself: it sees the surface, not the ground, and drops out.
+                if (weight <= 0 || (z >= 0 && l[2] < 0))
+                    continue;
+                const auto radiance = skyRadiance(l,light.horizon,light.zenith,light.ground,sun.data(),0);
+                for (int c = 0; c < 3; ++c)
+                    sum[std::size_t(c)] += radiance[std::size_t(c)]*weight;
+                total += weight;
+            }
+            auto &entry = light.reflections[std::size_t(level*reflectionElevations+elevation)];
+            for (int c = 0; c < 3; ++c)
+                entry[std::size_t(c)] = total > 0 ? sum[std::size_t(c)]/total : 0;
+        }
+    }
     return light;
 }
 
