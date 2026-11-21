@@ -1,9 +1,14 @@
 #include "App/MainWindow.h"
 #include "App/EditorLog.h"
+#include "Components/AssetHub.h"
+#include "Components/BehaviorCode.h"
+#include "Components/BehaviorEditor.h"
+#include "Components/NativeGameplayEditor.h"
 #include "Components/LiveViewport.h"
 #include "Components/ProjectLauncher.h"
 #include "State/WorldScene.h"
 #include "State/WorldRuntime.h"
+#include "State/NativeComponents.h"
 #include "State/ProjectStore.h"
 #include "Workspaces/ModelingWorkspace.h"
 #include "Workspaces/SurfaceWorkspace.h"
@@ -17,6 +22,7 @@
 #include <QComboBox>
 #include <QCheckBox>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
@@ -25,6 +31,7 @@
 #include <QFileDialog>
 #include "Engine/World/PlayableScene.h"
 #include <sstream>
+#include <numeric>
 #include <QGraphicsItem>
 #include <QGraphicsScene>
 #include <QGraphicsView>
@@ -32,10 +39,12 @@
 #include <QBuffer>
 #include <QImageReader>
 #include <QInputDialog>
+#include <QScopedPointer>
 #include "Engine/Geometry/MeshTopology.h"
 #include "Engine/Geometry/MeshRemesh.h"
 #include "Engine/Geometry/MeshUv.h"
 #include "State/GlbImport.h"
+#include "State/StudioClip.h"
 #include "State/StudioPublishReview.h"
 #include "State/ForgeAi.h"
 #include "State/PlayableStreet.h"
@@ -43,11 +52,13 @@
 #include "Components/ForgeAiPanel.h"
 #include "Workspaces/ForgeAiJob.h"
 #include "Workspaces/EmbeddedStudio.h"
+#include "Engine/Render/Flip.h"
 #include <QEventLoop>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QPainter>
 #include <QLabel>
 #include <QMessageBox>
 #include <QMouseEvent>
@@ -1112,6 +1123,25 @@ void liveAuthoring(MainWindow &window, const QDir &output, Audit &audit)
     auto *editMesh = namedWidget<QToolButton>(window, "Edit Mesh");
     if (editMesh)
         editMesh->click();
+    if (auto *studio = window.findChild<EmbeddedStudio *>(); editMesh && studio) {
+        if (EmbeddedStudio::installedExecutable().isEmpty()) {
+            audit.record(page,"Modeling","Open selected mesh in Studio","SKIP","The build directory has no bundled Studio runtime.");
+            return;
+        }
+        const auto ready = [&] {
+            auto *action = window.findChild<QAction *>("applyStudioUpdate");
+            return tabs->currentIndex() == 2 && studio->isRunning() && action && action->isVisible()
+                && action->toolTip() == "Apply Studio Update to Cube";
+        };
+        for (int attempt = 0; !ready() && attempt < 300; ++attempt)
+            QTest::qWait(50);
+        audit.check(page,"Modeling","World Editor opens the selected cube in embedded Studio",ready());
+        tabs->setCurrentIndex(1);
+        if (studio->isRunning() && studio->closeForAssetSwitch())
+            for (int attempt = 0; studio->isRunning() && attempt < 100; ++attempt)
+                QTest::qWait(50);
+        return;
+    }
     if (!editMesh || tabs->currentIndex() != 2) {
         audit.check(page, "Modeling", "World Editor opens selected mesh in Modeling", false);
         return;
@@ -1585,28 +1615,28 @@ void liveAuthoring(MainWindow &window, const QDir &output, Audit &audit)
     }
 }
 
-void sculptingWorkflow(MainWindow &window,const QDir &output,Audit &audit)
+void sculptingWorkflow(const QDir &output,Audit &audit)
 {
     const QString page = "Sculpting";
-    auto *tabs = window.findChild<QTabBar *>("workspaceTabs");
-    const auto finish = qScopeGuard([tabs] { if (tabs) tabs->setCurrentIndex(1); });
-    auto *create = findAction(window,"New project…");
-    auto *save = findAction(window,"Save");
-    if (!tabs || !create || !save) {
-        audit.check(page,"workflow","Create the sculpting fixture",false);
+    QTemporaryDir directory;
+    ProjectStore store;
+    QString error;
+    if (!directory.isValid() || !store.createStarterProject("Sculpting QA",
+        {{"location",directory.filePath("Sculpting QA")},{"starter","blank"}},error)) {
+        audit.check(page,"workflow","Create the sculpting fixture",false,error);
         return;
     }
-    withDialog([create] { create->trigger(); },"Sculpting QA");
-    tabs->setCurrentIndex(3);
-    auto *sculpting = window.findChild<SculptingWorkspace *>();
-    auto *view = sculpting ? sculpting->findChild<LiveViewport *>() : nullptr;
-    auto *add = sculpting ? namedWidget<QPushButton>(*sculpting,"Add Sculpt Sphere") : nullptr;
+    SculptingWorkspace sculpting(store);
+    sculpting.resize(1200,780);
+    sculpting.show();
+    auto *view = sculpting.findChild<LiveViewport *>();
+    auto *add = namedWidget<QPushButton>(sculpting,"Add Sculpt Sphere");
     if (!view || !add) {
         audit.check(page,"workflow","Open live Sculpting workspace",false);
         return;
     }
     add->click();
-    save->trigger();
+    store.save(&error);
     ProjectStore before;
     const auto *base = before.selectedMesh();
     auto *surface = waitForRender(*view) ? exposedVulkanWindow() : nullptr;
@@ -1626,22 +1656,21 @@ void sculptingWorkflow(MainWindow &window,const QDir &output,Audit &audit)
     drag();
     QTest::keyClick(surface,Qt::Key_Escape);
     QTest::mouseRelease(surface,Qt::LeftButton,Qt::NoModifier,center+QPoint(24,0));
-    save->trigger();
+    store.save(&error);
     ProjectStore cancelled;
     const auto *cancelledAsset = cancelled.meshAsset(id);
     audit.check(page,"workflow","Escape discards the sculpt stroke",cancelledAsset && *cancelledAsset->mesh == *base->mesh);
     drag();
     QTest::mouseRelease(surface,Qt::LeftButton,Qt::NoModifier,center+QPoint(24,0));
     const auto sculptedFrame = view->captureFrame();
-    save->trigger();
+    store.save(&error);
     ProjectStore after;
     const auto *result = after.meshAsset(id);
     audit.check(page,"workflow","Sculpt drag changes the viewport and saves the same mesh asset",
         result && result->mesh->vertices != base->mesh->vertices && result->mesh->faces.size() == base->mesh->faces.size()
         && !sculptedFrame.isNull() && sculptedFrame != baseline && sculptedFrame.save(output.filePath("sculpting-live.png")));
-    if (auto *undo = findAction(window,"Undo Sculpt Stroke"))
-        undo->trigger();
-    save->trigger();
+    store.history().undo();
+    store.save(&error);
     ProjectStore undone;
     const auto *undoneAsset = undone.meshAsset(id);
     audit.check(page,"workflow","One undo restores the entire sculpt stroke",undoneAsset && *undoneAsset->mesh == *base->mesh);
@@ -2002,8 +2031,12 @@ void modelingDeliveryWorkflow(const QDir &output, Audit &audit)
     const auto playable = wf::readPlayable(data);
     QFile file(output.filePath("equipment-case.wfplay"));
     const auto bytes = data.str();
-    audit.check(page,"export","Playable scene contains all three case instances",
-        exported && playable && playable->meshes.size() == 3 && playable->simulation.terrains.size() == 1
+    const auto drawVertices = playable ? std::accumulate(playable->meshes.begin(),playable->meshes.end(),std::size_t{},
+        [](auto total,const auto &draw) { return total + draw.vertices.size(); }) : 0;
+    const auto expectedVertices = uniqueAsset ? 2*wf::makePlayVertices(caseAsset->evaluated()).size()
+        + wf::makePlayVertices(uniqueAsset->evaluated()).size() : 0;
+    audit.check(page,"export","Playable scene contains all three case instances and their material draws",
+        exported && playable && drawVertices > 0 && drawVertices == expectedVertices && playable->simulation.terrains.size() == 1
         && file.open(QIODevice::WriteOnly)
         && file.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size()));
 }
@@ -2279,7 +2312,8 @@ void studioPublishingWorkflow(const QDir &output,Audit &audit)
         window.show();
         auto *tabs = window.findChild<QTabBar *>("workspaceTabs");
         bool opensSelected = tabs != nullptr;
-        for (const auto &name : {QStringLiteral("Sculpting"),QStringLiteral("Texture"),QStringLiteral("Modeling")}) {
+        for (const auto &name : {QStringLiteral("Sculpting"),QStringLiteral("Texture"),QStringLiteral("Material"),
+             QStringLiteral("Rigging"),QStringLiteral("Animation"),QStringLiteral("Modeling")}) {
             if (!opensSelected)
                 break;
             for (int i = 0; i < tabs->count(); ++i)
@@ -2287,8 +2321,9 @@ void studioPublishingWorkflow(const QDir &output,Audit &audit)
                     tabs->setCurrentIndex(i);
             const auto ready = [&] {
                 const auto *action = window.findChild<QAction *>("applyStudioUpdate");
+                const auto *search = window.findChild<QAction *>("searchStudioAssets");
                 return window.windowTitle().endsWith(name) && action && action->isVisible()
-                    && action->toolTip() == "Apply Studio Update to Road Barrier";
+                    && action->toolTip() == "Apply Studio Update to Road Barrier" && search && search->isVisible();
             };
             for (int attempt = 0; !ready() && attempt < 560; ++attempt)
                 QTest::qWait(50);
@@ -2300,6 +2335,105 @@ void studioPublishingWorkflow(const QDir &output,Audit &audit)
             opensSelected && commands && commands->actions().value(0) == action,
             QString("%1 | %2 | %3").arg(window.windowTitle(),action ? action->toolTip() : QStringLiteral("No Studio action"),
                 window.statusBar()->currentMessage()));
+        auto *search = window.findChild<QAction *>("searchStudioAssets");
+        if (opensSelected && search && search->isVisible()) {
+            const auto runSearch = [&](const auto &inspect) {
+                QTimer::singleShot(0,&window,[inspect] {
+                    auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                    if (!dialog)
+                        return;
+                    auto *query = dialog->findChild<QLineEdit *>("studioAssetQuery");
+                    auto *results = dialog->findChild<QListWidget *>("studioAssetResults");
+                    if (!query || !results)
+                        dialog->reject();
+                    else
+                        inspect(*dialog,*query,*results);
+                });
+                search->trigger();
+            };
+            bool filters = false, placed = false;
+            runSearch([&](QDialog &dialog,QLineEdit &query,QListWidget &results) {
+                query.setText("no such asset");
+                const auto *edit = dialog.findChild<QPushButton *>("studioAssetEdit");
+                bool empty = results.count() == 0 && edit && !edit->isEnabled();
+                query.setText("rOaD bArRiEr");
+                filters = empty && results.count() == 1 && results.currentItem()
+                    && results.currentItem()->text() == "Road Barrier" && edit->isEnabled();
+                const auto *barrier = reopened.meshAsset(id);
+                if (barrier && !barrier->evaluated().materials.empty()) {
+                    query.setText(QString::fromStdString(barrier->evaluated().materials.front().name));
+                    filters = filters && results.findItems("Road Barrier",Qt::MatchExactly).size() == 1;
+                }
+                query.setText("Road Barrier");
+                if (auto *button = dialog.findChild<QPushButton *>("studioAssetPlace"); button && button->isEnabled()) {
+                    button->click();
+                    placed = window.statusBar()->currentMessage() == "Added mesh to the level.";
+                } else {
+                    dialog.reject();
+                }
+            });
+            audit.check(page,"navigation","Asset search filters by name and material, handles no results and places the chosen mesh",
+                filters && placed);
+
+            bool imported = false;
+            runSearch([&](QDialog &dialog,QLineEdit &query,QListWidget &results) {
+                auto *import = dialog.findChild<QPushButton *>("studioAssetImport");
+                if (import) {
+                    QTimer::singleShot(0,&window,[&] {
+                        if (auto *file = qobject_cast<QFileDialog *>(QApplication::activeModalWidget())) {
+                            file->selectFile(output.filePath("authored-studio-input.glb"));
+                            QMetaObject::invokeMethod(file,"accept",Qt::DirectConnection);
+                        }
+                    });
+                    import->click();
+                    const auto *asset = results.currentItem();
+                    imported = asset && window.statusBar()->currentMessage().startsWith("Imported ");
+                    if (imported) {
+                        const auto importedId = asset->data(Qt::UserRole);
+                        query.setText("AUTHORED-STUDIO-INPUT.GLB");
+                        imported = results.count() == 1 && results.currentItem()->data(Qt::UserRole) == importedId;
+                    }
+                }
+                dialog.reject();
+            });
+            audit.check(page,"navigation","Import adds a GLB and finds it by source filename from Modeling",imported);
+
+            const auto chooseCube = [&](bool discard) {
+                runSearch([&](QDialog &dialog,QLineEdit &query,QListWidget &results) {
+                    query.setText("Cube");
+                    if (auto *edit = dialog.findChild<QPushButton *>("studioAssetEdit"); results.count() == 1 && edit && edit->isEnabled()) {
+                        QTimer::singleShot(0,&window,[&,discard] {
+                            if (auto *confirm = qobject_cast<QMessageBox *>(QApplication::activeModalWidget())) {
+                                if (discard) {
+                                    for (auto *button : confirm->buttons())
+                                        if (confirm->buttonRole(button) == QMessageBox::DestructiveRole) {
+                                            button->click();
+                                            return;
+                                        }
+                                }
+                                confirm->reject();
+                            }
+                        });
+                        edit->click();
+                    } else {
+                        dialog.reject();
+                    }
+                });
+            };
+            chooseCube(false);
+            const bool stayed = action->isVisible() && action->toolTip() == "Apply Studio Update to Road Barrier";
+            chooseCube(true);
+            const auto switched = [&] {
+                return window.windowTitle().endsWith("Modeling") && action->isVisible()
+                    && action->toolTip() == "Apply Studio Update to Cube";
+            };
+            for (int attempt = 0; !switched() && attempt < 560; ++attempt)
+                QTest::qWait(50);
+            audit.check(page,"navigation","Cancel keeps the original asset and confirmed switching opens the searched cube",
+                stayed && switched(),action->toolTip());
+        } else {
+            audit.check(page,"navigation","Search Assets is available in the Modeling toolbar",false);
+        }
     }
     auto nativeEdit = *updated;
     for (auto &vertex : nativeEdit.vertices)
@@ -2530,6 +2664,7 @@ void forgeAiWorkflow(const QDir &output,Audit &audit)
     frame.save(output.filePath("forge-barrier.png"));
     audit.check(page,"Vulkan","The staged stripes render in the World Editor",!frame.isNull() && yellow > 150,
         QString("Yellow pixels: %1").arg(yellow));
+    view.hide();
 
     error.clear();
     const bool saved = store.save(&error);
@@ -2563,6 +2698,23 @@ void forgeAiWorkflow(const QDir &output,Audit &audit)
         QTest::qWait(100);
     const bool reviewed = panel.stage().has_value() && report->toPlainText().contains("Update “Road Barrier”");
     const auto panelHistory = panelStore.history().index();
+    bool placementRendered = false;
+    const auto stagedPlacement = panel.stage() ? panel.stage()->placement.id : QString{};
+    if (reviewed) {
+        QTimer::singleShot(0,&panel,[&] {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            auto *viewport = dialog ? dialog->findChild<LiveViewport *>() : nullptr;
+            if (viewport && dialog->objectName() == "forgePlacementReview" && waitForRender(*viewport)) {
+                const auto preview = viewport->captureFrame();
+                placementRendered = !preview.isNull() && preview.save(output.filePath("forge-placement-preview.png"));
+            }
+            if (dialog)
+                dialog->reject();
+        });
+        click("forgePlacementPreview");
+    }
+    audit.check(page,"workflow","Preview in Level renders the current stage without committing it",
+        placementRendered && !panelStore.object(stagedPlacement) && panelStore.history().index() == panelHistory);
     const bool appliedFromPanel = click("forgeApply") && panelStore.history().index() == panelHistory+1;
     const bool checked = click("forgeCheck") && report->toPlainText().contains("Play check passed");
     panel.grab().save(output.filePath("forge-panel.png"));
@@ -2612,7 +2764,7 @@ QString playerSummary(const PlayerRun &run)
     const auto cpu = run.report.value("cpuMs").toObject();
     return QString("exit %1 · %2 · mission %3 s · frame avg %4 ms p95 %5 ms p99 %6 ms max %7 ms · CPU avg %8 ms p95 %9 ms"
                    " · working set %10 MiB, peak %11 MiB, private %12 MiB · textured meshes %13")
-        .arg(run.exitCode).arg(run.report.value("adapter").toString())
+        .arg(run.exitCode).arg(run.report.value("adapter").toString()+" (" + run.report.value("renderer").toString("Direct3D 11")+")")
         .arg(run.report.value("missionSeconds").toDouble(),0,'f',1)
         .arg(frame.value("average").toDouble(),0,'f',2).arg(frame.value("p95").toDouble(),0,'f',2)
         .arg(frame.value("p99").toDouble(),0,'f',2).arg(frame.value("max").toDouble(),0,'f',2)
@@ -2753,6 +2905,1912 @@ void streetWorkflow(const QDir &output,Audit &audit)
     view.frame();
     if (waitForRender(view))
         view.captureFrame().save(output.filePath("street-editor.png"));
+}
+
+// Fixed camera views of the Playable Street, compared with reference images in Tests/Golden.
+// Set WORLDFORGE_UPDATE_GOLDEN=1 to record new references after an intended rendering change.
+void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
+{
+    const QString page = "Rendering";
+    QTemporaryDir directory;
+    ProjectStore store;
+    QString error;
+    if (!directory.isValid() || !store.createStarterProject("Rendering QA",
+        {{"location",directory.filePath("Rendering QA")},{"starter","street"}},error)) {
+        audit.check(page,"workflow","Create the Playable Street starter",false,error);
+        return;
+    }
+    store.select({});
+    LiveViewport view(store,false);
+    view.resize(800,450);
+    view.show();
+    if (!waitForRender(view)) {
+        audit.check(page,"render","The street renders",false,QStringLiteral("No Vulkan frame"));
+        return;
+    }
+    const auto capture = [&](QVector3D eye,QVector3D target) {
+        view.setCameraPreview(eye,target);
+        QTest::qWait(100);
+        return view.captureFrame().convertToFormat(QImage::Format_RGB32);
+    };
+    const auto luminance = [](const QImage &image) {
+        double total = 0;
+        for (int y = 0; y < image.height(); ++y)
+            for (int x = 0; x < image.width(); ++x) {
+                const QColor pixel = image.pixel(x,y);
+                total += 0.2126*pixel.redF()+0.7152*pixel.greenF()+0.0722*pixel.blueF();
+            }
+        return image.isNull() ? 0.0 : total/(double(image.width())*image.height());
+    };
+
+    struct Shot { const char *name; QVector3D eye, target; };
+    const Shot shots[]{{"shop-front",{-6,-14,2.2f},{0,3,1.6f}},{"street-corner",{24,-20,7},{6,0,1}},
+                       {"aerial",{-34,-34,26},{0,0,0}}};
+    const QDir golden(root.filePath("Tests/Golden"));
+    const bool update = qEnvironmentVariableIntValue("WORLDFORGE_UPDATE_GOLDEN") == 1;
+    QFile deviceFile(golden.filePath("device.txt"));
+    const QString recordedDevice = deviceFile.open(QIODevice::ReadOnly) ? QString::fromUtf8(deviceFile.readAll()).trimmed() : QString();
+    deviceFile.close();
+    const bool sameDevice = recordedDevice == view.rendererName();
+    if (update && QDir().mkpath(golden.absolutePath()) && deviceFile.open(QIODevice::WriteOnly))
+        deviceFile.write(view.rendererName().toUtf8()+"\n");
+    struct Difference { double mean = 255, share = 1; };
+    // Mean error tolerates small timing differences such as foliage sway; the share of pixels that
+    // differ by more than 24 levels catches real changes in lighting, color, or geometry.
+    const auto difference = [&](const QImage &actual,const QImage &reference,const QString &diffName) {
+        Difference result;
+        if (actual.isNull() || reference.size() != actual.size())
+            return result;
+        double total = 0;
+        qint64 large = 0;
+        QImage diff(actual.size(),QImage::Format_RGB32);
+        for (int y = 0; y < actual.height(); ++y)
+            for (int x = 0; x < actual.width(); ++x) {
+                const QColor a = actual.pixel(x,y), b = reference.pixel(x,y);
+                const int channel = std::max({std::abs(a.red()-b.red()),std::abs(a.green()-b.green()),
+                    std::abs(a.blue()-b.blue())});
+                total += channel;
+                large += channel > 24;
+                diff.setPixel(x,y,qRgb(std::min(255,channel*8),0,0));
+            }
+        const double pixels = double(actual.width())*actual.height();
+        diff.save(output.filePath(diffName));
+        return Difference{total/pixels,double(large)/pixels};
+    };
+    const auto describe = [](const Difference &result) {
+        return QString("mean error %1 levels, %2% of pixels differ by more than 24 levels")
+            .arg(result.mean,0,'f',2).arg(result.share*100,0,'f',2);
+    };
+    const auto checkGolden = [&](const QString &label,const QString &file,const QImage &actual) {
+        const QString referencePath = golden.filePath(file);
+        if (update) {
+            audit.check(page,"golden image",QString("Record %1").arg(label),!actual.isNull() && actual.save(referencePath),
+                        referencePath);
+            return;
+        }
+        const QImage reference(referencePath);
+        if (reference.isNull() || !sameDevice) {
+            audit.record(page,"golden image",QString("%1 matches its reference").arg(label),"SKIP",
+                       reference.isNull() ? QStringLiteral("No reference image. Record one with WORLDFORGE_UPDATE_GOLDEN=1.")
+                                          : QString("References were recorded on %1.").arg(recordedDevice));
+            return;
+        }
+        const auto result = difference(actual,reference.convertToFormat(QImage::Format_RGB32),
+                                       QFileInfo(file).completeBaseName()+"-diff.png");
+        audit.check(page,"golden image",QString("%1 matches its reference").arg(label),
+                    result.mean <= 1.5 && result.share <= 0.005,describe(result));
+    };
+
+    // The Player renders the same views from an exported copy of the street. Both use the shared HDR frame
+    // pass and color pipeline, so they should differ only at edges and shadow borders.
+    const auto playablePath = output.filePath("rendering.wfplay");
+    std::ostringstream playable;
+    bool exported = WorldRuntime::exportScene(store,playable);
+    if (exported) {
+        const auto bytes = playable.str();
+        QFile file(playablePath);
+        exported = file.open(QIODevice::WriteOnly) && file.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+    }
+    const auto playerCapture = [&](const Shot &shot,QSize size) {
+        const auto path = output.filePath(QString("rendering-player-%1.png").arg(shot.name));
+        QFile::remove(path);
+        QStringList arguments{"--capture",playablePath,path,QString::number(size.width()),QString::number(size.height())};
+        for (const float value : {shot.eye.x(),shot.eye.y(),shot.eye.z(),shot.target.x(),shot.target.y(),shot.target.z()})
+            arguments << QString::number(value,'g',9);
+        QProcess player;
+        player.start(QDir(QCoreApplication::applicationDirPath()).filePath("WorldForgePlayer.exe"),arguments);
+        const bool captured = exported && player.waitForFinished(60000) && player.exitStatus() == QProcess::NormalExit
+            && player.exitCode() == 0;
+        return captured ? QImage(path).convertToFormat(QImage::Format_RGB32) : QImage();
+    };
+    for (const auto &shot : shots) {
+        const auto actual = capture(shot.eye,shot.target);
+        actual.save(output.filePath(QString("rendering-%1.png").arg(shot.name)));
+        checkGolden(QString("Street view %1").arg(shot.name),QString("street-%1.png").arg(shot.name),actual);
+        const auto played = playerCapture(shot,actual.size());
+        checkGolden(QString("Player street view %1").arg(shot.name),QString("player-street-%1.png").arg(shot.name),played);
+        const auto alike = difference(played,actual,QString("rendering-%1-editor-player-diff.png").arg(shot.name));
+        audit.check(page,"editor and Player",QString("Editor and Player show street view %1 alike").arg(shot.name),
+                    !played.isNull() && alike.mean <= 1 && alike.share <= 0.005,played.isNull() ? QStringLiteral("The Player did not capture the view.")
+                                                                         : describe(alike));
+    }
+
+    // Display controls: one stop of exposure doubles the light, and Standard clips what AgX rolls off.
+    const auto *initial = store.environment();
+    const auto initialDetails = initial ? std::optional<QJsonObject>(initial->details) : std::nullopt;
+    const auto atmosphere = [&](double exposure,const QString &transform) {
+        auto details = store.environment() ? store.environment()->details : QJsonObject{};
+        details.insert("exposure",exposure);
+        details.insert("viewTransform",transform);
+        store.setAtmosphere(details);
+        return capture(shots[0].eye,shots[0].target);
+    };
+    const auto normal = atmosphere(0,"AgX");
+    const auto brighter = atmosphere(1,"AgX");
+    const auto darker = atmosphere(-1,"AgX");
+    const auto standard = atmosphere(0,"Standard");
+    const double base = luminance(normal), up = luminance(brighter), down = luminance(darker);
+    audit.check(page,"display","Exposure brightens and darkens the street",up > base+0.03 && down < base-0.03,
+                QString("mean display level %1 at -1 EV, %2 at 0 EV, %3 at +1 EV").arg(down,0,'f',3).arg(base,0,'f',3)
+                    .arg(up,0,'f',3));
+    audit.check(page,"display","The Standard view transform renders differently from AgX",
+                !standard.isNull() && standard != normal,QString("mean display level %1 with Standard").arg(luminance(standard),0,'f',3));
+    for (int i = 0; i < 4; ++i)
+        store.history().undo();
+    audit.check(page,"display","Undo restores the default exposure and view transform",
+                initialDetails ? store.environment() && store.environment()->details == *initialDetails : !store.environment());
+
+    // Auto exposure meters the view, so the street stays visible whatever the manual exposure says. The
+    // editor adapts over a few frames; wait until two captures agree.
+    const auto historyStart = store.history().index();
+    const auto setDisplay = [&](const QJsonObject &changes) {
+        auto details = store.environment() ? store.environment()->details : QJsonObject{};
+        for (auto it = changes.begin(); it != changes.end(); ++it)
+            details.insert(it.key(),it.value());
+        store.setAtmosphere(details);
+    };
+    const auto settled = [&](const Shot &shot) {
+        QImage previous = capture(shot.eye,shot.target);
+        int calm = 0;
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            const auto next = capture(shot.eye,shot.target);
+            calm = std::abs(luminance(next)-luminance(previous)) < 0.0005 ? calm+1 : 0;
+            previous = next;
+            if (calm >= 3)
+                break;
+        }
+        return previous;
+    };
+    setDisplay({{"ev100",22},{"exposureMode","Manual"}});
+    const auto tooDark = capture(shots[0].eye,shots[0].target);
+    setDisplay({{"exposureMode","Auto"}});
+    const auto automatic = settled(shots[0]);
+    automatic.save(output.filePath("rendering-auto-exposure.png"));
+    const double dark = luminance(tooDark), metered = luminance(automatic);
+    audit.check(page,"display","Auto exposure keeps the street visible when the manual exposure is far too dark",
+                dark < 0.1 && metered > 0.25 && metered < 0.75,
+                QString("mean display level %1 at EV100 22, %2 with auto exposure").arg(dark,0,'f',3).arg(metered,0,'f',3));
+    setDisplay({{"exposureCompensation",1}});
+    const auto compensated = settled(shots[0]);
+    const double compensatedLevel = luminance(compensated);
+    audit.check(page,"display","Exposure compensation brightens what auto exposure chooses",compensatedLevel > metered+0.03,
+                QString("mean display level %1 with +1 stop of compensation").arg(compensatedLevel,0,'f',3));
+    // The Player meters the same frame and settles at once in a capture.
+    std::ostringstream autoPlayable;
+    QFile autoFile(playablePath);
+    const bool autoExported = WorldRuntime::exportScene(store,autoPlayable) && autoFile.open(QIODevice::WriteOnly)
+        && autoFile.write(autoPlayable.str().data(),qint64(autoPlayable.str().size())) == qint64(autoPlayable.str().size());
+    autoFile.close();
+    const auto playedAuto = autoExported ? playerCapture(shots[0],compensated.size()) : QImage();
+    const auto autoAlike = difference(playedAuto,compensated,"rendering-auto-exposure-editor-player-diff.png");
+    audit.check(page,"display","The Player chooses the same auto exposure as the editor",
+                !playedAuto.isNull() && std::abs(luminance(playedAuto)-compensatedLevel) < 0.02 && autoAlike.mean <= 3,
+                playedAuto.isNull() ? QStringLiteral("The Player did not capture the view.")
+                    : QString("Player mean display level %1; %2").arg(luminance(playedAuto),0,'f',3).arg(describe(autoAlike)));
+
+    // Photometric light units: a sun of 123,532 lux is one scene unit, the old unitless intensity 1. Fog is off
+    // so the check sees the lighting.
+    setDisplay({{"ev100",15},{"exposureMode","Manual"},{"exposureCompensation",0},{"fogDensity",0}});
+    store.addObject("Directional Light","Lighting");
+    const auto *sunObject = store.selectedObject();
+    const auto unitless = settled(shots[0]);
+    bool lux = false, dimmer = false;
+    QString luxDetail = QStringLiteral("The directional light was not added.");
+    if (sunObject && sunObject->type == "Directional Light") {
+        auto sun = *sunObject;
+        setLightPhotometric(sun.details,sun.type,worldforge::color::luxPerUnit);
+        store.updateObject(sun,"Sun in lux");
+        const auto inLux = settled(shots[0]);
+        setLightPhotometric(sun.details,sun.type,worldforge::color::luxPerUnit/4);
+        store.updateObject(sun,"Dimmer sun");
+        const auto quarter = settled(shots[0]);
+        quarter.save(output.filePath("rendering-quarter-sun.png"));
+        const auto same = difference(inLux,unitless,"rendering-lux-diff.png");
+        lux = same.mean <= 0.5 && std::abs(lightUnits(*store.selectedObject())-0.25f) < 1e-4f;
+        // Only sunlit surfaces change; the sky and the shaded road keep their levels.
+        dimmer = luminance(quarter) < luminance(inLux)-0.008;
+        luxDetail = QString("%1 lux matches intensity 1 (%2); a quarter of that gives mean display level %3 instead of %4")
+            .arg(worldforge::color::luxPerUnit,0,'f',0).arg(describe(same)).arg(luminance(quarter),0,'f',3)
+            .arg(luminance(inLux),0,'f',3);
+    }
+    audit.check(page,"display","Sun illuminance in lux lights the street like the earlier unitless intensity",lux && dimmer,
+                luxDetail);
+
+    // TAA averages jittered frames, so turning it off changes edges only; the Player matches the editor either way.
+    const auto smooth = settled(shots[1]);
+    setDisplay({{"antiAliasing","Off"}});
+    const auto aliased = settled(shots[1]);
+    aliased.save(output.filePath("rendering-taa-off.png"));
+    smooth.save(output.filePath("rendering-taa-on.png"));
+    const auto edges = difference(aliased,smooth,"rendering-taa-diff.png");
+    qint64 changed = 0;
+    for (int y = 0; y < smooth.height() && smooth.size() == aliased.size(); ++y)
+        for (int x = 0; x < smooth.width(); ++x) {
+            const QColor a = smooth.pixel(x,y), b = aliased.pixel(x,y);
+            changed += std::max({std::abs(a.red()-b.red()),std::abs(a.green()-b.green()),std::abs(a.blue()-b.blue())}) > 8;
+        }
+    const double changedShare = smooth.isNull() ? 0 : double(changed)/(double(smooth.width())*smooth.height());
+    audit.check(page,"display","Turning TAA off changes only the edges of the street",
+                edges.mean > 0.05 && changedShare > 0.001 && changedShare < 0.06,
+                QString("%1% of pixels change by more than 8 levels; %2").arg(changedShare*100,0,'f',2).arg(describe(edges)));
+    std::ostringstream offPlayable;
+    QFile offFile(playablePath);
+    const bool offExported = WorldRuntime::exportScene(store,offPlayable) && offFile.open(QIODevice::WriteOnly)
+        && offFile.write(offPlayable.str().data(),qint64(offPlayable.str().size())) == qint64(offPlayable.str().size());
+    offFile.close();
+    const auto playedOff = offExported ? playerCapture(shots[1],aliased.size()) : QImage();
+    const auto offAlike = difference(playedOff,aliased,"rendering-taa-off-editor-player-diff.png");
+    audit.check(page,"display","Editor and Player match with TAA off",!playedOff.isNull() && offAlike.mean <= 1 && offAlike.share <= 0.005,
+                playedOff.isNull() ? QStringLiteral("The Player did not capture the view.") : describe(offAlike));
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+    audit.check(page,"display","Undo restores the street after the exposure and light unit checks",
+                initialDetails ? store.environment() && store.environment()->details == *initialDetails : !store.environment());
+}
+
+// The realism check: the Player's view of the Playable Street against a Cycles path-traced reference of the
+// same frame (Tests/CyclesReference.py), scored with LDR-FLIP (0 identical, 1 completely different). Both
+// render without fog. The scores are compared with Tests/Golden/realism.json so a rendering change cannot
+// make the engine less realistic unnoticed. Set WORLDFORGE_UPDATE_GOLDEN=1 to record new scores, and
+// WORLDFORGE_REALISM_SAMPLES to change the Cycles sample count (default 256).
+void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
+{
+    const QString page = "Realism";
+    QTemporaryDir directory;
+    ProjectStore store;
+    QString error;
+    if (!directory.isValid() || !store.createStarterProject("Realism QA",
+        {{"location",directory.filePath("Realism QA")},{"starter","street"}},error)) {
+        audit.check(page,"workflow","Create the Playable Street starter",false,error);
+        return;
+    }
+    const auto studio = EmbeddedStudio::installedExecutable();
+    if (studio.isEmpty()) {
+        audit.record(page,"reference","Render the Cycles references","SKIP",QStringLiteral("WorldForge Studio is not installed."));
+        return;
+    }
+    const auto playablePath = output.filePath("realism.wfplay");
+    std::ostringstream playable;
+    bool exported = WorldRuntime::exportScene(store,playable,&error);
+    if (exported) {
+        const auto bytes = playable.str();
+        QFile file(playablePath);
+        exported = file.open(QIODevice::WriteOnly) && file.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+    }
+    audit.check(page,"workflow","Export the street for the Player",exported,error);
+    if (!exported)
+        return;
+
+    const QDir golden(root.filePath("Tests/Golden"));
+    const bool update = qEnvironmentVariableIntValue("WORLDFORGE_UPDATE_GOLDEN") == 1;
+    const int samples = qEnvironmentVariableIsSet("WORLDFORGE_REALISM_SAMPLES")
+        ? std::clamp(qEnvironmentVariableIntValue("WORLDFORGE_REALISM_SAMPLES"),1,65536) : 256;
+    QFile baselineFile(golden.filePath("realism.json"));
+    const auto baseline = baselineFile.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(baselineFile.readAll()).object()
+                                                                 : QJsonObject{};
+    baselineFile.close();
+    const auto rgb = [](const QImage &image) {
+        const auto converted = image.convertToFormat(QImage::Format_RGB888);
+        std::vector<std::uint8_t> bytes;
+        bytes.reserve(std::size_t(converted.width())*converted.height()*3);
+        for (int y = 0; y < converted.height(); ++y) {
+            const auto *line = converted.constScanLine(y);
+            bytes.insert(bytes.end(),line,line+converted.width()*3);
+        }
+        return bytes;
+    };
+
+    struct Shot { const char *name; QVector3D eye, target; };
+    const Shot shots[]{{"shop-front",{-6,-14,2.2f},{0,3,1.6f}},{"street-corner",{24,-20,7},{6,0,1}},
+                       {"aerial",{-34,-34,26},{0,0,0}}};
+    QJsonObject scores;
+    double total = 0;
+    int scored = 0;
+    for (const auto &shot : shots) {
+        const QString name = shot.name;
+        QDir folder(output.filePath("realism-"+name));
+        folder.removeRecursively();
+        QStringList arguments{"--reference",playablePath,QDir::toNativeSeparators(folder.absolutePath()),"800","450"};
+        for (const float value : {shot.eye.x(),shot.eye.y(),shot.eye.z(),shot.target.x(),shot.target.y(),shot.target.z()})
+            arguments << QString::number(value,'g',9);
+        QProcess player;
+        player.start(QDir(QCoreApplication::applicationDirPath()).filePath("WorldForgePlayer.exe"),arguments);
+        const bool described = player.waitForFinished(60000) && player.exitStatus() == QProcess::NormalExit
+            && player.exitCode() == 0 && QFileInfo(folder.filePath("scene.json")).isFile();
+        audit.check(page,"reference",QString("The Player renders and describes view %1").arg(name),described,
+                    QString("exit code %1").arg(player.exitCode()));
+        if (!described)
+            continue;
+        QProcess cycles;
+        cycles.setProcessChannelMode(QProcess::MergedChannels);
+        cycles.start(studio,{"-b","--factory-startup","--python",QDir::toNativeSeparators(root.filePath("Tests/CyclesReference.py")),
+                             "--",QDir::toNativeSeparators(folder.absolutePath()),QString::number(samples)});
+        const bool rendered = cycles.waitForFinished(30*60*1000) && cycles.exitStatus() == QProcess::NormalExit
+            && cycles.exitCode() == 0 && QFileInfo(folder.filePath("cycles.png")).isFile();
+        const auto log = QString::fromUtf8(cycles.readAll());
+        QFile logFile(folder.filePath("cycles.log"));
+        if (logFile.open(QIODevice::WriteOnly))
+            logFile.write(log.toUtf8());
+        QFile timing(folder.filePath("cycles.json"));
+        const auto details = timing.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(timing.readAll()).object() : QJsonObject{};
+        audit.check(page,"reference",QString("Cycles renders the reference for view %1").arg(name),rendered,
+                    rendered ? QString("%1 samples%2 in %3 s with Studio %4").arg(details.value("samples").toInt())
+                                   .arg(details.value("denoised").toBool() ? QStringLiteral(", denoised") : QString())
+                                   .arg(details.value("seconds").toDouble(),0,'f',1).arg(details.value("version").toString())
+                             : log.right(400));
+        if (!rendered)
+            continue;
+        const QImage engine(folder.filePath("engine.png")), reference(folder.filePath("cycles.png"));
+        if (engine.isNull() || engine.size() != reference.size()) {
+            audit.check(page,"realism",QString("Compare view %1 with Cycles").arg(name),false,
+                        QStringLiteral("The engine and Cycles images differ in size."));
+            continue;
+        }
+        const auto result = worldforge::flip::compare(rgb(reference),rgb(engine),engine.width(),engine.height());
+        if (result.error.empty()) {
+            audit.check(page,"realism",QString("Compare view %1 with Cycles").arg(name),false,QStringLiteral("FLIP failed."));
+            continue;
+        }
+        // Engine, Cycles and the FLIP error map side by side, for people reviewing the result.
+        QImage map(engine.size(),QImage::Format_RGB888);
+        for (int y = 0; y < map.height(); ++y) {
+            auto *line = map.scanLine(y);
+            for (int x = 0; x < map.width(); ++x)
+                worldforge::flip::heat(result.error[std::size_t(y)*map.width()+x],line+x*3);
+        }
+        map.save(folder.filePath("flip.png"));
+        QImage sheet(engine.width()*3,engine.height(),QImage::Format_RGB888);
+        QPainter painter(&sheet);
+        painter.drawImage(0,0,engine);
+        painter.drawImage(engine.width(),0,reference);
+        painter.drawImage(engine.width()*2,0,map);
+        painter.setPen(Qt::white);
+        painter.drawText(12,22,"WorldForge");
+        painter.drawText(engine.width()+12,22,"Cycles");
+        painter.drawText(engine.width()*2+12,22,QString("FLIP %1").arg(result.mean,0,'f',3));
+        painter.end();
+        sheet.save(output.filePath(QString("realism-%1.png").arg(name)));
+        scores.insert(name,std::round(result.mean*10000)/10000);
+        total += result.mean;
+        ++scored;
+        const auto recorded = baseline.value(name);
+        const QString label = QString("View %1 is no less realistic than recorded").arg(name);
+        if (update || recorded.isUndefined()) {
+            audit.record(page,"realism",label,update ? "PASS" : "SKIP",QString("FLIP %1 against Cycles.%2")
+                .arg(result.mean,0,'f',4).arg(update ? QString() : QStringLiteral(" No recorded score. Record one with WORLDFORGE_UPDATE_GOLDEN=1.")));
+            continue;
+        }
+        // Cycles renders the same image every run on one machine (fixed seed); the 0.01 margin covers other CPUs
+        // and Studio builds.
+        audit.check(page,"realism",label,result.mean <= recorded.toDouble()+0.01,
+                    QString("FLIP %1 against Cycles (recorded %2, lower is more realistic)").arg(result.mean,0,'f',4)
+                        .arg(recorded.toDouble(),0,'f',4));
+    }
+    if (scored)
+        audit.record(page,"realism","Realism score of the Playable Street","INFO",
+                     QString("%1 of 100 (100 means indistinguishable from Cycles); mean FLIP %2 over %3 views")
+                         .arg(100*(1-total/scored),0,'f',1).arg(total/scored,0,'f',4).arg(scored));
+    if (update && scored == int(std::size(shots))) {
+        scores.insert("samples",samples);
+        scores.insert("note",QStringLiteral("Mean LDR-FLIP of the Player against Cycles; written by WorldForgeEditorAudit --realism."));
+        const bool saved = QDir().mkpath(golden.absolutePath()) && baselineFile.open(QIODevice::WriteOnly)
+            && baselineFile.write(QJsonDocument(scores).toJson()) > 0;
+        audit.check(page,"realism","Record the realism scores",saved,baselineFile.fileName());
+    }
+}
+
+void engineSessionWorkflow(const QDir &output,Audit &audit)
+{
+    const QString page = "Engine session";
+    QTemporaryDir directory(output.filePath("engine-fixture-XXXXXX"));
+    ProjectStore setup;
+    QString error;
+    if (!directory.isValid() || !setup.createStarterProject("Engine Session QA",
+        {{"location",directory.filePath("Street")},{"starter","street"}},error)
+        || !setup.addMeshPrimitive(worldforge::Primitive::Cube,{2,2,2},4,4,"Unplaced QA Mesh",error)) {
+        audit.check(page,"workflow","Create the engine session fixture",false,error);
+        return;
+    }
+    setup.deleteObject();
+    if (!setup.save(&error)) {
+        audit.check(page,"storage","Save the initial fixture",false,error);
+        return;
+    }
+    MainWindow window;
+    window.resize(1300,800);
+    window.show();
+    QTest::qWait(150);
+    auto *tabs = window.findChild<QTabBar *>("workspaceTabs");
+    const auto tab = [&](const QString &name) {
+        if (tabs)
+            for (int index = 0; index < tabs->count(); ++index)
+                if (tabs->tabText(index) == name) {
+                    tabs->setCurrentIndex(index);
+                    return true;
+                }
+        return false;
+    };
+    tab("World Editor");
+    auto *tiles = window.findChild<QListView *>("assetTiles");
+    const auto selectTile = [&](const QString &name) {
+        if (!tiles)
+            return QModelIndex{};
+        const auto result = tiles->model()->match(tiles->model()->index(0,0),Qt::DisplayRole,name);
+        if (result.isEmpty())
+            return QModelIndex{};
+        const auto index = result.first();
+        tiles->setCurrentIndex(index);
+        tiles->scrollTo(index);
+        tiles->setFocus();
+        QTest::qWait(20);
+        return index;
+    };
+    if (const auto unplaced = selectTile("Unplaced QA Mesh"); unplaced.isValid())
+        QTest::keyClick(tiles,Qt::Key_Return);
+    auto *details = window.findChild<QDialog *>("meshAssetDetails");
+    auto *summary = details ? details->findChild<QLabel *>("meshAssetSummary") : nullptr;
+    auto *preview = details ? details->findChild<LiveViewport *>("meshAssetPreview") : nullptr;
+    const bool rendered = preview && waitForRender(*preview);
+    const bool unplaced = details && details->isVisible() && details->windowTitle().startsWith("Unplaced QA Mesh")
+        && summary && summary->text().contains("0 level placement(s)");
+    audit.check(page,"navigation","Enter opens the unplaced asset with a rendered preview and zero placements",
+        unplaced && rendered && !preview->captureFrame().isNull(),details ? details->windowTitle() : QStringLiteral("Details absent"));
+    if (rendered)
+        preview->captureFrame().save(output.filePath("asset-details-preview.png"));
+    if (details) {
+        details->reject();
+        if (const auto barrier = selectTile("Road Barrier"); barrier.isValid()) {
+            const auto center = tiles->visualRect(barrier).center();
+            QTest::mouseClick(tiles->viewport(),Qt::LeftButton,Qt::NoModifier,center);
+            QTest::mouseDClick(tiles->viewport(),Qt::LeftButton,Qt::NoModifier,center);
+        }
+        const bool opened = details->isVisible() && details->windowTitle().startsWith("Road Barrier")
+            && summary && summary->text().contains("1 level placement(s)");
+        if (auto *place = details->findChild<QPushButton *>("placeInspectedAsset"); opened && place)
+            place->click();
+        audit.check(page,"navigation","Double-click reuses Details and explicit placement adds one instance",
+            opened && summary->text().contains("2 level placement(s)"),details->windowTitle());
+        details->reject();
+    }
+    const auto panel = [&](const QString &name) -> QWidget * {
+        return tab(name) ? window.findChild<QWidget *>("gameplayWorkspace"+name) : nullptr;
+    };
+    const auto setTarget = [](QWidget *workspace,const QString &marker) {
+        auto *target = workspace ? workspace->findChild<QComboBox *>("gameplayTarget") : nullptr;
+        const int index = target ? target->findText(marker) : -1;
+        if (index < 0)
+            return false;
+        target->setCurrentIndex(index);
+        return true;
+    };
+    const auto apply = [](QWidget *workspace) {
+        auto *button = workspace ? workspace->findChild<QPushButton *>("gameplayApply") : nullptr;
+        const auto *status = workspace ? workspace->findChild<QLabel *>("gameplayStatus") : nullptr;
+        if (!button || !status)
+            return false;
+        button->click();
+        return status->text().startsWith("Applied to project");
+    };
+    const auto showPreview = [](QWidget *workspace) {
+        auto *button = workspace ? workspace->findChild<QPushButton *>("gameplayPreview") : nullptr;
+        auto *view = workspace ? workspace->findChild<LiveViewport *>() : nullptr;
+        if (!button || !view)
+            return false;
+        button->click();
+        return view->isVisible() && waitForRender(*view);
+    };
+    auto *program = panel("Programming");
+    const bool programmed = setTarget(program,"Repair Counter") && apply(program);
+    audit.check(page,"authoring","Programming applies the mission completion rule",programmed);
+    const auto undo = [&] {
+        for (auto *action : window.findChildren<QAction *>())
+            if (action->isEnabled() && action->shortcuts().contains(QKeySequence(QKeySequence::Undo))) {
+                action->trigger();
+                return true;
+            }
+        return false;
+    };
+    auto *binding = program ? program->findChild<QComboBox *>("gameplayTarget") : nullptr;
+    const bool undone = programmed && binding && undo() && binding->currentData().toString().isEmpty();
+    bool redone = false;
+    if (undone) {
+        for (auto *action : window.findChildren<QAction *>())
+            if (action->isEnabled() && action->shortcuts().contains(QKeySequence(QKeySequence::Redo))) {
+                action->trigger();
+                redone = binding->currentText() == "Repair Counter";
+                break;
+            }
+    }
+    audit.check(page,"authoring","One undo and redo remove and restore the mission rule",undone && redone);
+    auto *ui = panel("UI");
+    auto *message = ui ? ui->findChild<QLineEdit *>("missionCompletionText") : nullptr;
+    if (message)
+        message->setText("Repair verified");
+    audit.check(page,"authoring","UI applies a live completion message",message && apply(ui));
+    auto *vfx = panel("VFX");
+    const bool effect = setTarget(vfx,"Repair Counter") && showPreview(vfx) && apply(vfx);
+    audit.check(page,"authoring","VFX previews and applies the beacon",effect);
+    auto *cinematic = panel("Cinematic");
+    bool shot = setTarget(cinematic,"Repair Counter") && showPreview(cinematic);
+    if (shot && cinematic) {
+        auto *slider = cinematic->findChild<QSlider *>();
+        auto *view = cinematic->findChild<LiveViewport *>();
+        shot = slider && slider->isVisible() && view;
+        if (shot) {
+            const auto first = view->captureFrame();
+            slider->setValue(100);
+            const auto last = view->captureFrame();
+            shot = !first.isNull() && !last.isNull() && first != last;
+        }
+    }
+    audit.check(page,"authoring","Cinematic previews two keys and applies the shot",shot && apply(cinematic));
+    auto *ai = panel("AI");
+    const bool patrolPreview = setTarget(ai,"Repair Shop Entrance") && showPreview(ai);
+    auto *patrolState = ai ? ai->findChild<QLabel *>("gameplayStatus") : nullptr;
+    if (patrolPreview && patrolState)
+        for (int attempt = 0; attempt < 120 && !patrolState->text().contains("Returning"); ++attempt)
+            QTest::qWait(50);
+    audit.check(page,"authoring","Gameplay AI previews patrol state and applies a waypoint",
+        patrolPreview && patrolState && patrolState->text().contains("Returning") && apply(ai));
+    auto *multiplayer = panel("Multiplayer");
+    auto *loopback = multiplayer ? multiplayer->findChild<QPushButton *>("runLocalMultiplayerCheck") : nullptr;
+    const auto *local = multiplayer ? multiplayer->findChild<QLabel *>("localMultiplayerResult") : nullptr;
+    if (loopback) {
+        loopback->click();
+        for (int attempt = 0; attempt < 220 && !loopback->isEnabled(); ++attempt)
+            QTest::qWait(50);
+    }
+    audit.check(page,"runtime","Two separate clients verify ownership and replicated beacon state",
+        local && local->text().startsWith("Passed."),local ? local->text() : QString{});
+    auto *testing = panel("Testing");
+    auto *run = testing ? testing->findChild<QPushButton *>("runStreetCheck") : nullptr;
+    const auto *results = testing ? testing->findChild<QPlainTextEdit *>("streetCheckResults") : nullptr;
+    if (run) {
+        run->click();
+        for (int attempt = 0; attempt < 600 && !run->isEnabled(); ++attempt)
+            QTest::qWait(50);
+    }
+    const auto report = results ? results->toPlainText() : QString{};
+    audit.check(page,"runtime","Testing runs Editor gameplay and Player verifies the beacon, camera, patrol, and HUD",
+        report.contains("Packaged Player passed") && report.contains("The beacon activated and expired")
+        && report.contains("\"missionHud\": true") && report.contains("\"beaconEnded\": true")
+        && report.contains("\"shotEnded\": true") && report.contains("\"patrolReturned\": true")
+        && report.contains("Repair verified"),report.left(1600));
+    QFile summaryFile(output.filePath("engine-report.txt"));
+    if (summaryFile.open(QIODevice::WriteOnly))
+        summaryFile.write(report.toUtf8());
+    if (testing)
+        testing->grab().save(output.filePath("testing-workspace.png"));
+    window.close();
+    ProjectStore reopened;
+    const auto verified = street::verify(reopened);
+    audit.check(page,"storage","The authored gameplay survives project reopen",verified.ok()
+        && verified.trace.beaconEnded && verified.trace.shotEnded && verified.trace.patrolReturned
+        && verified.objectives.contains("Repair verified"),verified.summary());
+    if (reopened.project()) {
+        const auto packaged = runStreetPlayer(reopened,output,"engine-street");
+        audit.check(page,"runtime","The exported saved street passes in the packaged Player",
+            packaged.exitCode == 0 && packaged.report.value("missionHud").toBool()
+            && packaged.report.value("beaconEnded").toBool() && packaged.report.value("shotEnded").toBool()
+            && packaged.report.value("patrolReturned").toBool(),playerSummary(packaged));
+        const auto &objects = reopened.project()->objects;
+        const auto counter = std::ranges::find(objects,QString("Repair Counter"),&SceneObject::name);
+        if (counter != objects.end()) {
+            auto hidden = *counter;
+            hidden.visible = false;
+            const bool changed = reopened.updateObjects({hidden},"Hide the gameplay target",error);
+            std::ostringstream rejected;
+            const bool exported = WorldRuntime::exportScene(reopened,rejected,&error);
+            audit.check(page,"validation","A stale beacon target is identified and blocks exporting incomplete gameplay",
+                changed && !exported && rejected.str().empty() && error.contains("beacon target"),error);
+            if (changed)
+                reopened.history().undo();
+        }
+    }
+    directory.setAutoRemove(false);
+}
+
+void programmingWorkflow(const QDir &output,Audit &audit)
+{
+    namespace wf = worldforge;
+    using Rule = wf::BehaviorRule;
+    const QString page = "Programming";
+    QTemporaryDir fixture(output.filePath("programming-fixture-XXXXXX"));
+    fixture.setAutoRemove(false);
+    ProjectStore store;
+    QString error;
+    const auto folder = fixture.filePath("Playable Project");
+    if (!fixture.isValid() || !store.createStarterProject("Programming QA",{{"location",folder},{"starter","street"}},error)) {
+        audit.check(page,"setup","Create Playable Street",false,error);
+        return;
+    }
+    const auto &objects = store.project()->objects;
+    const auto source = std::ranges::find_if(objects,[](const SceneObject &object) {
+        return object.details.value("gameplay").toString() == "missionStart";
+    });
+    if (source == objects.end()) {
+        audit.check(page,"setup","Find the authored mission source",false);
+        return;
+    }
+    const auto missionId = source->id;
+    const auto missionMarkerName = source->name;
+    const auto makeDoor = [&](const QString &name,QVector3D position) {
+        if (!store.addMeshPrimitive(wf::Primitive::Cube,{1,1,2},4,4,name,error))
+            return QString{};
+        auto object = *store.selectedObject();
+        object.position = position;
+        object.details.insert("physics","Static");
+        return store.updateObjects({object},"Set door transform",error) ? object.id : QString{};
+    };
+    const auto first = makeDoor("QA Door A",{40,40,1});
+    const auto second = makeDoor("QA Door B",{45,40,1});
+    const auto conditional = makeDoor("QA Conditional",{50,40,1});
+    const auto interact = makeDoor("QA Interact",{55,40,1});
+    const auto raise = store.saveBehavior({},{"Repair Doors",Rule::Event::MissionCompleted,Rule::Action::RaiseObject,missionId,{},3},error);
+    const auto fails = store.saveBehavior({},{"Requires Repair",Rule::Event::PlayStarted,Rule::Action::PulseBeacon,{},missionId,1},error);
+    const auto gate = store.saveBehavior({},{"Interact After Repair",Rule::Event::InteractNearby,Rule::Action::PulseBeacon,{},missionId,1},error);
+    const bool attached = !raise.isEmpty() && !fails.isEmpty() && !gate.isEmpty()
+        && store.attachBehavior(first,raise,error) && store.attachBehavior(second,raise,error)
+        && store.attachBehavior(conditional,fails,error) && store.attachBehavior(interact,gate,error);
+    const auto edits = store.history().index();
+    const bool bad = store.saveBehavior({},{"Bad target",Rule::Event::MissionCompleted,Rule::Action::PulseBeacon,"missing",{},1},error).isEmpty()
+        && store.history().index() == edits;
+    audit.check(page,"authoring","One behavior attaches to two doors and an invalid mission creates no edit",attached && bad,error);
+    if (!attached)
+        return;
+    const auto *door = store.object(second);
+    auto dynamic = *door;
+    dynamic.details.insert("physics","Dynamic");
+    const bool invalid = store.updateObjects({dynamic},"Try dynamics",error)
+        && !store.attachBehavior(second,raise,error);
+    store.history().undo();
+    audit.check(page,"validation","Raise Object rejects a dynamic attachment",invalid,error);
+    const bool detached = store.attachBehavior(second,{},error);
+    store.history().undo();
+    const bool restored = store.object(second)->details.value("behaviorAsset").toString() == raise;
+    store.history().redo();
+    const bool redone = store.object(second)->details.value("behaviorAsset").toString().isEmpty();
+    store.history().undo();
+    audit.check(page,"history","Detach, undo and redo preserve the saved asset reference",detached && restored && redone,error);
+    const auto sourceFolder = QDir(folder).filePath("Programming");
+    const auto compiler = QDir(behaviorVisualStudio()).filePath("MSBuild/Current/Bin/MSBuild.exe");
+    const bool prepared = prepareBehaviorCode(sourceFolder,error) && QFile::exists(compiler);
+    QString launchId;
+    const auto command = [&](const QString &program,const QStringList &arguments) {
+        QProcess process;
+        process.setWorkingDirectory(sourceFolder);
+        process.start(program,arguments);
+        const bool done = process.waitForFinished(55000) && process.exitCode() == 0 && process.exitStatus() == QProcess::NormalExit;
+        return std::tuple{done,process.readAllStandardOutput(),process.readAllStandardError()};
+    };
+    if (prepared) {
+        const QStringList args{"Behavior.vcxproj","/t:Rebuild","/nologo","/nodeReuse:false","/p:Configuration=Debug","/p:Platform=x64"};
+        QString buildOutput;
+        bool built = false;
+        QTimer::singleShot(0,[&] {
+            auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+            auto *build = dialog ? dialog->findChild<QPushButton *>("buildCppBehavior") : nullptr;
+            auto *apply = dialog ? dialog->findChild<QPushButton *>("applyCppBehavior") : nullptr;
+            auto *log = dialog ? dialog->findChild<QPlainTextEdit *>("behaviorBuildOutput") : nullptr;
+            if (build && apply && build->isEnabled()) {
+                build->click();
+                for (int i = 0; i < 550 && !apply->isEnabled() && !build->isEnabled(); ++i)
+                    QTest::qWait(50);
+                built = apply->isEnabled();
+                if (built)
+                    apply->click();
+                if (log)
+                    buildOutput = log->toPlainText();
+            }
+            if (dialog)
+                dialog->reject();
+        });
+        showBehaviorCode(store,nullptr);
+        const auto result = std::ranges::find(store.project()->behaviors,QString("Startup Beacon"),&ProjectBehavior::name);
+        const auto id = result == store.project()->behaviors.cend() ? QString{} : result.key();
+        const auto marker = makeDoor("QA C++ Beacon",{60,40,1});
+        const bool applied = !id.isEmpty() && store.attachBehavior(marker,id,error);
+        audit.check(page,"C++","MSBuild compiles the generated Visual Studio project and its executable emits a usable behavior",
+            built && applied,applied ? QString{} : buildOutput+error);
+        QFile file(QDir(sourceFolder).filePath("Behavior.cpp"));
+        bool wroteBrokenSource = false;
+        if (file.open(QIODevice::Append)) {
+            const QByteArray broken = "\n#error WorldForge_Intentional_Build_Test\n";
+            wroteBrokenSource = file.write(broken) == broken.size();
+            file.close();
+        }
+        const auto [rebuilt,diagnostics,details] = command(compiler,args);
+        const bool handledBrokenBuild = wroteBrokenSource && !rebuilt
+            && (diagnostics+details).contains("WorldForge_Intentional_Build_Test") && applied
+            && store.project()->behaviors.contains(id);
+        audit.check(page,"C++","An invalid C++ build reports the compiler error and leaves the applied asset intact",
+            handledBrokenBuild,handledBrokenBuild ? QString{} : QString::fromLocal8Bit(diagnostics+details));
+        const QByteArray launchSource = R"(#include "WorldForgeGameplay.h"
+int main()
+{
+    using namespace worldforge;
+    return publish(makeBehavior("Launch Crate",events::playStarted(),physics::launchUpward(8.0f)));
+}
+)";
+        bool wroteLaunch = false;
+        if (file.open(QIODevice::WriteOnly)) {
+            wroteLaunch = file.write(launchSource) == launchSource.size();
+            file.close();
+        }
+        const auto [launchBuilt,launchLog,launchDetails] = command(compiler,args);
+        const auto [launchRan,launchRule,launchErrors] = command(QDir(sourceFolder).filePath("build/Behavior.exe"),{});
+        const auto launch = launchBuilt && launchRan ? readBuiltBehavior(launchRule,error) : std::nullopt;
+        const auto launchAsset = launch ? store.saveBehavior({},*launch,error) : QString{};
+        launchId = makeDoor("QA Launch Crate",{65,40,1});
+        const auto launcherId = makeDoor("QA Launcher",{70,40,1});
+        const bool rejectsStatic = !launchAsset.isEmpty() && !store.attachBehavior(first,launchAsset,error)
+            && error.contains("Dynamic");
+        const auto *crate = store.object(launchId);
+        bool launchAttached = false;
+        if (crate && !launchAsset.isEmpty()) {
+            auto dynamicCrate = *crate;
+            dynamicCrate.details.insert("physics","Dynamic");
+            dynamicCrate.name = "Renamed Launch Crate";
+            launchAttached = store.setBehaviorComponents(launcherId,{{launchAsset,false,launchId,8.0f}},error)
+                && store.updateObjects({dynamicCrate},"Rename target and enable dynamic physics",error)
+                && store.setBehaviorComponents(launcherId,{{launchAsset,true,launchId,8.0f}},error);
+        }
+        const bool keptSource = prepareBehaviorCode(sourceFolder,error) && file.open(QIODevice::ReadOnly)
+            && file.readAll() == launchSource;
+        audit.check(page,"C++ library","The shipped physics helper builds and attaches to a dynamic mesh",
+            wroteLaunch && launch && launch->action == Rule::Action::LaunchUpward && launchAttached && rejectsStatic && keptSource,
+            launchAttached ? QString{} : QString::fromLocal8Bit(launchLog+launchDetails+launchErrors)+error);
+    } else {
+        audit.check(page,"C++","Prepare the Visual Studio behavior project",false,error);
+    }
+    const auto pulse = store.saveBehavior({},{"Door Status",Rule::Event::MissionCompleted,Rule::Action::PulseBeacon,missionId,{},1},error);
+    const auto disabled = store.saveBehavior({},{"Disabled Startup",Rule::Event::PlayStarted,Rule::Action::PulseBeacon,{},{},1},error);
+    const QList<BehaviorComponent> stack{{pulse,true,first,2.5f},{raise,true,{},4.0f},{disabled,false,{},{}}};
+    const bool appliedStack = store.setBehaviorComponents(second,stack,error);
+    if (appliedStack)
+        store.history().undo();
+    const bool undidStack = behaviorComponents(*store.object(second)) == QList<BehaviorComponent>{{raise,true,{},{}}};
+    if (appliedStack)
+        store.history().redo();
+    audit.check(page,"components","Ordered components, enable flags, target IDs and overrides undo and redo together",
+        appliedStack && undidStack && behaviorComponents(*store.object(second)) == stack,error);
+    bool graphEdited = false;
+    QTimer::singleShot(0,[&] {
+        auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        auto *amount = dialog ? dialog->findChild<QDoubleSpinBox *>("behaviorAmount") : nullptr;
+        auto *buttons = dialog ? dialog->findChild<QDialogButtonBox *>() : nullptr;
+        if (amount && buttons && dialog->objectName() == "behaviorGraphEditor") {
+            amount->setValue(2.25);
+            buttons->button(QDialogButtonBox::Save)->click();
+            graphEdited = true;
+        }
+        if (dialog && dialog->isVisible())
+            dialog->reject();
+    });
+    editBehaviorAsset(store,gate,nullptr,true);
+    audit.check(page,"graph","The Event, Condition, and Action graph edits the reusable behavior asset",
+        graphEdited && store.project()->behaviors.value(gate).amount == 2.25f);
+    store.select(first);
+    const bool saved = store.save(&error);
+    {
+        MainWindow window;
+        window.resize(1280,800);
+        window.show();
+        QTest::qWait(60);
+        auto *picker = window.findChild<QComboBox *>("objectBehavior");
+        auto *tiles = window.findChild<QListView *>("assetTiles");
+        const auto tile = tiles ? tiles->model()->match(tiles->model()->index(0,0),Qt::DisplayRole,"Repair Doors").value(0)
+            : QModelIndex{};
+        bool opened = false;
+        if (tile.isValid()) {
+            QTimer::singleShot(0,&window,[&] {
+                auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                auto *action = dialog ? dialog->findChild<QComboBox *>("behaviorAction") : nullptr;
+                opened = dialog && dialog->objectName() == "behaviorAssetEditor"
+                    && action && action->currentIndex() == int(Rule::Action::RaiseObject);
+                if (dialog)
+                    dialog->reject();
+            });
+            QMetaObject::invokeMethod(tiles,"activated",Qt::DirectConnection,Q_ARG(QModelIndex,tile));
+        }
+        audit.check(page,"navigation","Content Browser opens the behavior and Details shows the attached asset",
+            saved && opened && picker && picker->currentData().toString() == raise);
+        auto *tabs = window.findChild<QTabBar *>("workspaceTabs");
+        if (tabs)
+            for (int index = 0; index < tabs->count(); ++index)
+                if (tabs->tabText(index) == "Programming") {
+                    tabs->setCurrentIndex(index);
+                    break;
+                }
+        auto *programmingObjects = window.findChild<QListWidget *>("programmingObjects");
+        auto *findObject = window.findChild<QLineEdit *>("programmingObjectSearch");
+        auto *attachment = window.findChild<QComboBox *>("programmingObjectBehavior");
+        auto *selected = window.findChild<QLabel *>("programmingSelectedObject");
+        auto *editAttached = window.findChild<QPushButton *>("programmingOpenAttached");
+        bool synced = programmingObjects && findObject && attachment && selected && editAttached
+            && attachment->currentData().toString() == raise && editAttached->isEnabled();
+        if (synced) {
+            findObject->setText(missionMarkerName);
+            const auto selectObject = [&](const QString &id) {
+                for (int i = 0; i < programmingObjects->count(); ++i)
+                    if (programmingObjects->item(i)->data(Qt::UserRole).toString() == id) {
+                        programmingObjects->setCurrentRow(i);
+                        return true;
+                    }
+                return false;
+            };
+            synced = selectObject(missionId) && selected->text().contains(missionMarkerName)
+                && attachment->currentData().toString().isEmpty() && !editAttached->isEnabled();
+            findObject->setText("QA Interact");
+            synced = synced && selectObject(interact) && selected->text().contains("QA Interact")
+                && attachment->currentData().toString() == gate && picker && picker->currentData().toString() == gate;
+            attachment->setCurrentIndex(0);
+            QMetaObject::invokeMethod(attachment,"activated",Qt::DirectConnection,Q_ARG(int,0));
+            synced = synced && picker && picker->currentData().toString().isEmpty();
+            const auto gateIndex = attachment->findData(gate);
+            attachment->setCurrentIndex(gateIndex);
+            QMetaObject::invokeMethod(attachment,"activated",Qt::DirectConnection,Q_ARG(int,gateIndex));
+            synced = synced && gateIndex > 0 && picker && picker->currentData().toString() == gate;
+        }
+        audit.check(page,"navigation","Programming searches any scene object and updates its own attachment and Details",synced);
+        auto *manage = window.findChild<QPushButton *>("programmingManageComponents");
+        bool managed = false;
+        if (synced && manage) {
+            QTimer::singleShot(0,&window,[&] {
+                auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                if (!dialog)
+                    return;
+                auto *assetBox = dialog->findChild<QComboBox *>("componentAsset");
+                auto *add = dialog->findChild<QPushButton *>("addBehaviorComponent");
+                auto *rows = dialog->findChild<QListWidget *>("behaviorComponentList");
+                auto *isEnabled = dialog->findChild<QCheckBox *>("behaviorComponentEnabled");
+                auto *buttons = dialog->findChild<QDialogButtonBox *>();
+                if (assetBox && add && rows && isEnabled && buttons && rows->count() == 1) {
+                    assetBox->setCurrentIndex(assetBox->findData(disabled));
+                    add->click();
+                    isEnabled->setChecked(false);
+                    managed = rows->count() == 2;
+                    buttons->button(QDialogButtonBox::Save)->click();
+                }
+                if (dialog->isVisible())
+                    dialog->reject();
+            });
+            manage->click();
+        }
+        const auto *detailsManage = window.findChild<QPushButton *>("detailsManageBehaviorComponents");
+        audit.check(page,"components","Programming edits the component stack and Details shows the new count",
+            managed && manage->text().contains("(2)") && detailsManage && detailsManage->text().contains("(2)")
+            && !attachment->isEnabled());
+        window.close();
+    }
+    ProjectStore reopened;
+    WorldRuntime world;
+    if (!world.start(reopened,true) || !world.player() || !world.position(first) || !world.position(second)) {
+        audit.check(page,"play","Start the reopened behavior project",false,world.gameplayErrors().join('\n'));
+        return;
+    }
+    const auto a = *world.position(first), b = *world.position(second);
+    audit.check(page,"components","Project reopen restores the stack and skips the disabled startup component",
+        behaviorComponents(*reopened.object(second)) == stack
+        && std::ranges::none_of(world.gameplay().behaviors,[](const auto &rule) {
+            return rule.label.find("Disabled Startup") != std::string::npos;
+        }));
+    const auto crateStart = world.position(launchId);
+    world.placePlayer(QVector3D(55,40,1));
+    world.key(Qt::Key_E,true);
+    world.tick(0);
+    const auto crateLaunched = world.position(launchId);
+    audit.check(page,"physics","The selected dynamic crate rises in Editor Play using the C++ library rule",
+        crateStart && crateLaunched && crateLaunched->z()-crateStart->z() > 0.04f
+        && world.renderMatrices().value(launchId).map(QVector3D{}).z() > crateStart->z());
+    const auto count = [&world](Rule::Result result) {
+        return std::ranges::count(world.gameplay().behaviors,result,&Rule::result);
+    };
+    const auto trace = takeEditorLog();
+    audit.check(page,"play","Failed conditions appear in the trace and leave door positions untouched",
+        count(Rule::Result::ConditionFailed) == 2 && world.position(first) == a && world.position(second) == b
+        && std::ranges::any_of(trace,[](const auto &entry) { return entry.text.contains("Mission Repair Run is incomplete"); }));
+    const auto &mission = world.gameplay().missions.front();
+    world.placePlayer(QVector3D(mission.start[0],mission.start[1],mission.start[2]));
+    world.tick(0);
+    world.placePlayer(QVector3D(mission.target[0],mission.target[1],mission.target[2]));
+    world.key(Qt::Key_E,true);
+    world.tick(0);
+    const float raiseZ = 3;
+    const bool lifted = world.position(first) == a+QVector3D(0,0,raiseZ)
+        && world.position(second) == b+QVector3D(0,0,4)
+        && world.renderMatrices().value(first).map(QVector3D{}) == a+QVector3D(0,0,raiseZ);
+    const auto pulseRule = std::ranges::find_if(world.gameplay().behaviors,[](const auto &rule) { return rule.label.starts_with("Door Status"); });
+    audit.check(page,"components","The pulse and lift run on one event using different instance targets and values",
+        lifted && pulseRule != world.gameplay().behaviors.end() && pulseRule->result == Rule::Result::Fired
+        && pulseRule->amount == 2.5f && pulseRule+1 != world.gameplay().behaviors.end()
+        && (pulseRule+1)->label == "Repair Doors / QA Door B"
+        && world.gameplay().behaviorBeacons[pulseRule->target].position[0] == a.x());
+    world.placePlayer(QVector3D(55,40,1));
+    world.key(Qt::Key_E,true);
+    world.tick(0);
+    world.tick(0);
+    const auto graphRule = std::ranges::find_if(world.gameplay().behaviors,[](const auto &rule) {
+        return rule.label.starts_with("Interact After Repair");
+    });
+    audit.check(page,"graph","The graph's selected object fires the edited action with its saved parameter",
+        graphRule != world.gameplay().behaviors.end() && graphRule->result == Rule::Result::Fired
+        && graphRule->amount == 2.25f && world.gameplay().behaviorBeacons[graphRule->target].remaining > 2.20f);
+    audit.check(page,"play","Mission completion lifts both render meshes and colliders once and enables retrying the interaction",
+        lifted && count(Rule::Result::Fired) == 6 && world.position(first) == a+QVector3D(0,0,raiseZ));
+    wf::WorldSimulation collision;
+    collision.gravity = 0;
+    collision.bodies.push_back({{0,0,1},{0.5f,0.5f,1}});
+    collision.bodies.push_back({{-2,0,1},{0.3f,0.3f,0.85f},{},0,true});
+    collision.bodies[1].lockRotation = true;
+    const auto walk = [&] {
+        collision.bodies[1].position = {-2,0,1};
+        for (int step = 0; step < 180; ++step) {
+            collision.bodies[1].velocity = {3,0,0};
+            collision.step();
+        }
+        return collision.bodies[1].position[0];
+    };
+    const auto stoppedAt = walk();
+    collision.bodies[0].position[2] += raiseZ;
+    const auto movedTo = walk();
+    audit.check(page,"physics","Raising a static collider opens the way in the live physics simulation",
+        stoppedAt < -0.3f && movedTo > 0.8f,QString("Closed %1 m, open %2 m").arg(stoppedAt).arg(movedTo));
+    wf::WorldSimulation remotePhysics;
+    remotePhysics.bodies.push_back({{25,0,1},{0.5f,0.5f,0.5f},{},0,true});
+    remotePhysics.bodies.push_back({{25,0,1}});
+    wf::Gameplay remoteGameplay;
+    Rule remoteRule;
+    remoteRule.event = Rule::Event::InteractNearby;
+    remoteRule.action = Rule::Action::LaunchUpward;
+    remoteRule.position = {0,0,1};
+    remoteRule.followLaunchTarget = false;
+    remoteGameplay.behaviors.push_back(remoteRule);
+    remoteGameplay.update(remotePhysics,1,true);
+    const bool ignoredAtTarget = remoteGameplay.behaviors.front().result == Rule::Result::Waiting;
+    remotePhysics.bodies[1].position = {0,0,1};
+    remoteGameplay.update(remotePhysics,1,true);
+    audit.check(page,"components","Nearby interaction follows the component owner when the physics target is remote",
+        ignoredAtTarget && remoteGameplay.behaviors.front().result == Rule::Result::Fired
+        && remotePhysics.bodies.front().velocity[2] == remoteRule.amount);
+    const auto player = runStreetPlayer(reopened,output,"programming-street");
+    audit.check(page,"Player","Player runs both doors and C++ rules, and its physics launches the crate",
+        player.exitCode == 0 && player.report.value("behaviorsFired").toInt() == 5
+        && player.report.value("maxLaunchRiseMeters").toDouble() > 2,
+        playerSummary(player)+QString(" · crate rise %1 m").arg(player.report.value("maxLaunchRiseMeters").toDouble()));
+    if (const auto *crate = reopened.object(launchId)) {
+        auto hiddenCrate = *crate;
+        hiddenCrate.visible = false;
+        std::ostringstream badTarget;
+        const bool targetHidden = reopened.updateObjects({hiddenCrate},"Hide action target",error);
+        audit.check(page,"validation","Hiding the renamed action target blocks export with a Programming diagnostic",
+            targetHidden && !WorldRuntime::exportScene(reopened,badTarget,&error)
+            && error.contains("hidden action target") && badTarget.str().empty(),error);
+        if (targetHidden)
+            reopened.history().undo();
+    }
+    auto hidden = *reopened.object(missionId);
+    hidden.visible = false;
+    std::ostringstream badExport;
+    const bool hid = reopened.updateObjects({hidden},"Hide mission",error);
+    audit.check(page,"validation","A hidden event source blocks export with a Programming diagnostic",
+        hid && !WorldRuntime::exportScene(reopened,badExport,&error) && error.contains("Programming") && badExport.str().empty(),error);
+}
+
+void nativeGameplayWorkflow(const QDir &output,Audit &audit)
+{
+    const QString page = "Native Gameplay";
+    QTemporaryDir fixture(output.filePath("native-gameplay-XXXXXX"));
+    fixture.setAutoRemove(false);
+    const auto folder = fixture.filePath("Project");
+    ProjectStore store;
+    QString error;
+    if (!fixture.isValid() || !store.createStarterProject("Native Gameplay QA",{{"location",folder},{"starter","street"}},error)
+        || !store.addMeshPrimitive(worldforge::Primitive::Cube,{1,1,1},4,4,"Native Crate",error)) {
+        audit.check(page,"setup","Create native physics fixture",false,error);
+        return;
+    }
+    auto crate = *store.selectedObject();
+    crate.position = {70,30,1};
+    crate.details.insert("physics","Dynamic");
+    if (!store.updateObjects({crate},"Set native crate",error)) {
+        audit.check(page,"setup","Prepare dynamic crate",false,error);
+        return;
+    }
+    const QDir source(QDir(folder).filePath("Programming/NativeGameplay"));
+    const auto dll = source.filePath("build/Gameplay.dll");
+    const auto pdb = source.filePath("build/Gameplay.pdb");
+    const auto compiler = QDir(behaviorVisualStudio()).filePath("MSBuild/Current/Bin/MSBuild.exe");
+    if (!prepareNativeGameplay(source.absolutePath(),error) || !QFile::exists(compiler)) {
+        audit.check(page,"setup","Generate native Visual Studio project",false,error);
+        return;
+    }
+    QFile code(source.filePath("NativeGameplay.cpp"));
+    if (!code.open(QIODevice::ReadOnly)) {
+        audit.check(page,"setup","Open generated native source",false,code.errorString());
+        return;
+    }
+    auto text = code.readAll();
+    code.close();
+    text.replace("targetId = \"\"","targetId = \""+crate.id.toUtf8()+"\"");
+    const auto put = [&](const QByteArray &bytes) {
+        if (!code.open(QIODevice::WriteOnly))
+            return false;
+        const bool wrote = code.write(bytes) == bytes.size();
+        code.close();
+        return wrote;
+    };
+    if (!put(text)) {
+        audit.check(page,"setup","Write native target ID",false,code.errorString());
+        return;
+    }
+    bool built = false;
+    QString buildLog;
+    QTimer::singleShot(0,[&] {
+        auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        auto *build = dialog ? dialog->findChild<QPushButton *>("buildNativeGameplay") : nullptr;
+        auto *log = dialog ? dialog->findChild<QPlainTextEdit *>("nativeBuildOutput") : nullptr;
+        if (build && build->isEnabled()) {
+            build->click();
+            for (int i = 0; i < 600 && !build->isEnabled(); ++i)
+                QTest::qWait(50);
+            built = QFile::exists(store.nativeGameplayPath());
+        }
+        if (log)
+            buildLog = log->toPlainText();
+        if (dialog)
+            dialog->reject();
+    });
+    showNativeGameplay(store,nullptr);
+    audit.check(page,"C++","Editor builds and activates a native DLL with Visual Studio symbols",
+        built && QFile::exists(dll) && QFile::exists(pdb),built ? QString{} : buildLog);
+    WorldRuntime world;
+    if (!built || !world.start(store,true) || !world.position(crate.id)) {
+        audit.check(page,"setup","Start the editor runtime with the active DLL",false);
+        return;
+    }
+    const float base = world.position(crate.id)->z();
+    world.tick(0);
+    const auto before = world.position(crate.id)->z();
+    audit.check(page,"Play","Native startup looks up an object ID and moves its dynamic physics body",
+        world.nativeSteps() == 1 && before > base+0.04f,QString("Rise after one step %1 m").arg(before-base));
+
+    const auto compile = [&] {
+        QProcess process;
+        process.setWorkingDirectory(source.absolutePath());
+        process.start(compiler,{"NativeGameplay.vcxproj","/t:Rebuild","/nologo","/nodeReuse:false","/p:Configuration=Debug","/p:Platform=x64"});
+        const bool ok = process.waitForFinished(55000) && process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+        buildLog = QString::fromLocal8Bit(process.readAllStandardOutput()+process.readAllStandardError());
+        return ok;
+    };
+    const auto readActive = [&store] {
+        QFile file(store.nativeGameplayPath());
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
+    };
+    auto faster = text;
+    faster.replace("{0,0,8}","{0,0,12}");
+    const bool rebuilt = put(faster) && compile();
+    const bool activated = rebuilt && activateNativeGameplay(store,dll,error);
+    const bool staged = activated && world.stageNative(store.nativeGameplayPath(),error);
+    const auto unchanged = world.position(crate.id)->z() == before && world.nativeSteps() == 1;
+    if (staged)
+        world.tick(0);
+    const auto after = world.position(crate.id)->z();
+    const auto log = takeEditorLog();
+    const bool stopped = std::ranges::any_of(log,[](const auto &line) { return line.text.contains("Native gameplay stopped."); });
+    audit.check(page,"reload","Hot reload uses the same world and runs the new module at the next fixed update",
+        staged && unchanged && stopped && world.nativeSteps() == 2 && after-before > 0.08f,rebuilt ? error : buildLog);
+    const auto lastValid = readActive();
+    auto wrongAbi = faster;
+    wrongAbi.replace(",WF_GAME_ABI_V1,",",WF_GAME_ABI_V1+1,");
+    const bool compiledWrongAbi = put(wrongAbi) && compile();
+    const bool rejected = compiledWrongAbi && !activateNativeGameplay(store,dll,error) && error.contains("Incompatible");
+    world.tick(0);
+    audit.check(page,"reload","An incompatible replacement leaves the live and persisted modules running",
+        rejected && readActive() == lastValid && world.nativeSteps() == 3 && world.position(crate.id)->z() > after,error);
+    error.clear();
+    const bool sourceError = put(faster+"\n#error WorldForge_Native_Build_Test\n") && !compile()
+        && buildLog.contains("WorldForge_Native_Build_Test");
+    audit.check(page,"C++","A compiler error preserves the active game build",sourceError && readActive() == lastValid,
+        sourceError ? QString{} : buildLog);
+    put(faster);
+    world.stopNative();
+
+    const QDir package(fixture.filePath("Packaged Game"));
+    const bool packaged = exportNativeGame(store,package.absolutePath(),error);
+    const bool installedNotices = QDir(QCoreApplication::applicationDirPath()).exists("../licenses/Jolt-LICENSE.txt");
+    audit.check(page,"package","Export creates the game scene, standalone Player, DLL, symbols and installed notices",
+        packaged && package.exists("WorldForgePlayer.exe") && package.exists("Gameplay.dll") && package.exists("Gameplay.pdb")
+        && (!installedNotices || package.exists("licenses/Jolt-LICENSE.txt")),error);
+    if (!packaged)
+        return;
+    const auto verify = [&](const QStringList &arguments,const QString &reportPath) {
+        QProcess player;
+        player.setWorkingDirectory(package.absolutePath());
+        player.start(package.filePath("WorldForgePlayer.exe"),arguments);
+        const bool ok = player.waitForFinished(40000) && player.exitCode() == 0 && player.exitStatus() == QProcess::NormalExit;
+        QFile report(reportPath);
+        const auto data = report.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(report.readAll()).object() : QJsonObject{};
+        return std::pair{ok,data};
+    };
+    const auto nativeReport = output.filePath("native-player.json");
+    const auto [nativePassed,native] = verify({"--verify-packaged-street",nativeReport},nativeReport);
+    audit.check(page,"Player","The packaged Player loads the same native DLL and moves the object by ID",
+        nativePassed && native.value("nativeFixedUpdates").toInt() > 100 && native.value("maxNativeBodyRiseMeters").toDouble() > 5,
+        QString("Native updates %1 · rise %2 m").arg(native.value("nativeFixedUpdates").toInt())
+            .arg(native.value("maxNativeBodyRiseMeters").toDouble()));
+    const auto plainReport = output.filePath("plain-scene-player.json");
+    const auto [plainPassed,plain] = verify({"--verify-street",package.filePath("Game.wfplay"),plainReport},plainReport);
+    audit.check(page,"Player","Opening the same scene directly leaves its adjacent DLL inactive",
+        plainPassed && plain.value("nativeFixedUpdates").isDouble() && plain.value("nativeFixedUpdates").toInt() == 0);
+
+    const auto noGlobalLaunch = QByteArray(text).replace("targetId = \""+crate.id.toUtf8()+"\"","targetId = \"\"");
+    if (!put(noGlobalLaunch) || !compile() || !activateNativeGameplay(store,dll,error)) {
+        audit.check(page,"components","Build the typed native component fixture",false,error+buildLog);
+        return;
+    }
+    const auto makeCrate = [&](QString name,float x) -> QString {
+        if (!store.addMeshPrimitive(worldforge::Primitive::Cube,{1,1,1},4,4,name,error))
+            return {};
+        auto object = *store.selectedObject();
+        object.position = {x,30,1};
+        object.details.insert("physics","Dynamic");
+        return store.updateObjects({object},"Prepare native component crate",error) ? object.id : QString{};
+    };
+    const auto remote = makeCrate("Referenced Crate",75);
+    const auto dormant = makeCrate("Dormant Crate",80);
+    if (remote.isEmpty() || dormant.isEmpty()) {
+        audit.check(page,"components","Create additional component targets",false,error);
+        return;
+    }
+    store.addObject("Point Light","Lighting");
+    auto launcher = *store.selectedObject();
+    launcher.name = "Remote Launcher";
+    if (!store.updateObjects({launcher},"Set launcher type",error)) {
+        audit.check(page,"components","Create a non-physics script owner",false,error);
+        return;
+    }
+    const QString type = "worldforge.launch";
+    const auto imagePath = fixture.filePath("native-reference.png");
+    QImage nativeImage(2,2,QImage::Format_RGBA8888);
+    nativeImage.fill(Qt::white);
+    const auto textureReference = nativeImage.save(imagePath) ? store.importProjectTexture(imagePath,error) : QString{};
+    ProjectMaterial material;
+    material.name = "Native Reference Material";
+    material.textureId = textureReference;
+    const auto materialReference = store.saveProjectMaterial({},material,error);
+    store.select(crate.id);
+    bool usedPropertyControls = false;
+    QTimer::singleShot(0,[&] {
+        auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+        auto *speed = dialog ? dialog->findChild<QDoubleSpinBox *>("nativeProperty.speed") : nullptr;
+        auto *percent = dialog ? dialog->findChild<QSpinBox *>("nativeProperty.percent") : nullptr;
+        auto *mesh = dialog ? dialog->findChild<QComboBox *>("nativeProperty.mesh") : nullptr;
+        auto *materialPicker = dialog ? dialog->findChild<QComboBox *>("nativeProperty.material") : nullptr;
+        auto *texturePicker = dialog ? dialog->findChild<QComboBox *>("nativeProperty.texture") : nullptr;
+        auto *saveComponent = dialog ? dialog->findChild<QPushButton *>("saveNativeComponent") : nullptr;
+        if (speed && percent && mesh && materialPicker && texturePicker && saveComponent && mesh->findData(crate.meshAsset) > 0
+            && materialPicker->findData(materialReference) > 0 && texturePicker->findData(textureReference) > 0) {
+            speed->setValue(8);
+            percent->setValue(50);
+            mesh->setCurrentIndex(mesh->findData(crate.meshAsset));
+            materialPicker->setCurrentIndex(materialPicker->findData(materialReference));
+            texturePicker->setCurrentIndex(texturePicker->findData(textureReference));
+            saveComponent->click();
+            usedPropertyControls = store.object(crate.id)->details.value("nativeComponents").toObject().contains(type);
+        }
+        if (dialog)
+            dialog->reject();
+    });
+    editNativeComponents(store,nullptr);
+    const auto entry = [](QJsonObject values) {
+        return QJsonObject{{"enabled",true},{"properties",std::move(values)}};
+    };
+    const auto remoteEntry = entry({{"speed",writeNativeProperty({WF_GAME_REAL,10,{}})},
+        {"target",writeNativeProperty({WF_GAME_OBJECT,0,remote.toStdString()})}});
+    const bool attached = store.setNativeComponent(launcher.id,type,remoteEntry,error)
+        && store.setNativeComponent(dormant,type,entry({{"launch",writeNativeProperty({WF_GAME_BOOL,0,{}})},
+            {"percent",writeNativeProperty({WF_GAME_INT,double(INT32_MAX),{}})}}),error);
+    audit.check(page,"components","The inspector attaches schemas with typed values and mesh, material and texture references",
+        usedPropertyControls && attached,error);
+    auto renamed = *store.object(remote);
+    renamed.name = "Renamed Component Target";
+    const bool renamedTarget = store.updateObjects({renamed},"Rename script target",error);
+    const bool changed = store.setNativeComponent(launcher.id,type,entry({}),error);
+    if (changed)
+        store.history().undo();
+    const auto savedEntry = [&] { return store.object(launcher.id)->details.value("nativeComponents").toObject().value(type); };
+    const bool restored = savedEntry() == remoteEntry;
+    if (changed)
+        store.history().redo();
+    const bool reapplied = savedEntry() == entry({});
+    if (changed)
+        store.history().undo();
+    const bool saved = store.save(&error);
+    ProjectStore reopened;
+    audit.check(page,"components","Overrides and stable scene references survive undo, redo, rename and project reopen",
+        renamedTarget && restored && reapplied && saved && reopened.object(launcher.id)
+        && reopened.object(launcher.id)->details.value("nativeComponents").toObject().value(type) == remoteEntry,error);
+    WorldRuntime instanceWorld;
+    if (!instanceWorld.start(reopened,true) || !instanceWorld.position(crate.id) || !instanceWorld.position(remote)
+        || !instanceWorld.position(dormant)) {
+        audit.check(page,"components","Start the component scene",false,error);
+        return;
+    }
+    const auto firstZ = instanceWorld.position(crate.id)->z(), remoteZ = instanceWorld.position(remote)->z();
+    const auto dormantZ = instanceWorld.position(dormant)->z();
+    instanceWorld.tick(0);
+    const auto trace = takeEditorLog();
+    audit.check(page,"components","Two instances apply different speeds, defaults and object targets while false gates the third",
+        instanceWorld.position(crate.id)->z()-firstZ > 0.025f && instanceWorld.position(crate.id)->z()-firstZ < 0.05f
+        && instanceWorld.position(remote)->z()-remoteZ > 0.075f && instanceWorld.position(dormant)->z() <= dormantZ
+        && std::ranges::any_of(trace,[](const auto &row) { return row.text.contains("with a mesh reference"); }));
+    const auto activeWithComponents = readActive();
+    auto incompatible = noGlobalLaunch;
+    incompatible.replace("worldforge.launch","worldforge.incompatible");
+    const bool incompatibleRejected = put(incompatible) && compile() && !activateNativeGameplay(reopened,dll,error)
+        && error.contains("Missing native component type") && readActive() == activeWithComponents;
+    audit.check(page,"reload","A DLL that removes a live component type cannot replace the active build",
+        incompatibleRejected,error);
+    put(noGlobalLaunch);
+    instanceWorld.stopNative();
+
+    const QDir componentPackage(fixture.filePath("Packaged Components"));
+    error.clear();
+    const bool exported = exportNativeGame(reopened,componentPackage.absolutePath(),error);
+    if (!exported) {
+        audit.check(page,"Player","Export the native component scene",false,error);
+        return;
+    }
+    QFile nativeScene(componentPackage.filePath("Game.wfplay"));
+    std::istringstream nativeBytes(nativeScene.open(QIODevice::ReadOnly) ? nativeScene.readAll().toStdString() : std::string{});
+    const auto compiledScene = worldforge::readPlayable(nativeBytes);
+    const auto integerExact = compiledScene && std::ranges::any_of(compiledScene->nativeInstances,[&](const auto &instance) {
+        const auto percent = instance.properties.find("percent");
+        return instance.owner == dormant.toStdString() && percent != instance.properties.end()
+            && percent->second.kind == WF_GAME_INT && percent->second.number == double(INT32_MAX);
+    });
+    audit.check(page,"package","Native component export keeps full signed 32-bit integer precision",integerExact);
+    const auto assetIdsExact = compiledScene && std::ranges::any_of(compiledScene->nativeInstances,[&](const auto &instance) {
+        const auto has = [&](std::string_view id,std::uint32_t kind,const QString &reference) {
+            const auto property = instance.properties.find(id);
+            return property != instance.properties.end() && property->second.kind == kind
+                && property->second.reference == reference.toStdString();
+        };
+        return instance.owner == crate.id.toStdString() && has("mesh",WF_GAME_MESH,crate.meshAsset)
+            && has("material",WF_GAME_MATERIAL,materialReference) && has("texture",WF_GAME_TEXTURE,textureReference);
+    });
+    audit.check(page,"package","The exported component stores each asset reference with its original kind and ID",assetIdsExact);
+    const auto componentReport = output.filePath("native-components-player.json");
+    QProcess player;
+    player.setWorkingDirectory(componentPackage.absolutePath());
+    player.start(componentPackage.filePath("WorldForgePlayer.exe"),{"--verify-packaged-street",componentReport});
+    const bool playerOk = player.waitForFinished(40000) && player.exitCode() == 0;
+    QFile componentFile(componentReport);
+    const auto result = componentFile.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(componentFile.readAll()).object() : QJsonObject{};
+    const auto rises = result.value("nativeBodyRises").toObject();
+    audit.check(page,"Player","The packaged Player applies the same distinct instance settings to the referenced bodies",
+        playerOk && rises.value(crate.id).toDouble() > 0.4 && rises.value(crate.id).toDouble() < 1.2
+        && rises.value(remote).toDouble() > 4 && rises.value(dormant).isDouble() && rises.value(dormant).toDouble() == 0);
+    auto missing = remoteEntry;
+    auto properties = missing.value("properties").toObject();
+    properties.insert("target",writeNativeProperty({WF_GAME_OBJECT,0,"missing-target"}));
+    missing.insert("properties",properties);
+    QString missingError;
+    std::ostringstream untouched;
+    const bool missingRejected = reopened.setNativeComponent(launcher.id,type,missing,missingError)
+        && !WorldRuntime::exportScene(reopened,untouched,&missingError,true) && missingError.contains("missing")
+        && untouched.str().empty();
+    audit.check(page,"validation","A missing native object reference blocks game export with the field name",
+        missingRejected && missingError.contains("target"),missingError);
+}
+
+void surfaceLibraryWorkflow(const QDir &output,Audit &audit)
+{
+    const QString page = "Project surface assets";
+    QTemporaryDir directory(output.filePath("surface-fixture-XXXXXX"));
+    directory.setAutoRemove(false);
+    ProjectStore store;
+    QString error;
+    if (!directory.isValid() || !store.createStarterProject("Surface Library QA",
+        {{"location",directory.filePath("Street")},{"starter","street"}},error)) {
+        audit.check(page,"workflow","Create the two-mesh test project",false,error);
+        return;
+    }
+    const auto meshId = [&](const QString &name) {
+        const auto &assets = store.project()->assets;
+        const auto item = std::ranges::find(assets,name,&MeshAsset::name);
+        return item == assets.end() ? QString{} : item->id;
+    };
+    const auto first = meshId("Road Barrier"), second = meshId("Counter"), control = meshId("Sidewalk");
+    if (first.isEmpty() || second.isEmpty() || control.isEmpty()) {
+        audit.check(page,"workflow","Find both mesh assets and the independent material",false);
+        return;
+    }
+    const auto png = directory.filePath("Surface Color.png");
+    const auto jpeg = directory.filePath("Second Source.jpg");
+    QImage image(32,24,QImage::Format_RGB32);
+    image.fill(QColor(232,224,208));
+    const bool fixtures = image.save(png) && image.save(jpeg);
+    QFile corrupt(directory.filePath("Broken.png"));
+    if (corrupt.open(QIODevice::WriteOnly)) {
+        corrupt.write("broken");
+        corrupt.close();
+    }
+    const auto pngId = store.importProjectTexture(png,error);
+    const auto jpegId = store.importProjectTexture(jpeg,error);
+    const auto beforeRejected = store.history().index();
+    const bool rejected = store.importProjectTexture(corrupt.fileName(),error).isEmpty()
+        && store.history().index() == beforeRejected;
+    audit.check(page,"import","PNG and JPEG import, and corrupt images create no history or asset",fixtures && rejected
+        && !pngId.isEmpty() && !jpegId.isEmpty() && store.project()->surfaces.textures.size() == 2,error);
+    if (pngId.isEmpty() || jpegId.isEmpty())
+        return;
+    auto surface = ProjectMaterial{"Reusable Finish",pngId,{0.85f,0.26f,0.12f,1}};
+    const auto material = store.saveProjectMaterial({},surface,error);
+    const auto previousControl = store.meshAsset(control)->mesh;
+    const bool assigned = !material.isEmpty() && store.assignProjectMaterial(material,first,0,error)
+        && store.assignProjectMaterial(material,second,0,error);
+    const auto linked = [&](const ProjectStore &project,const QString &mesh,const ProjectMaterial &expected) {
+        const auto *asset = project.meshAsset(mesh);
+        if (!asset || asset->mesh->faces.empty())
+            return false;
+        return std::ranges::all_of(asset->mesh->faces,[&](const auto &face) {
+            const auto &slot = asset->mesh->materials[face.material];
+            return slot.sharedMaterialId == material.toStdString() && slot.color == expected.tint
+                && slot.name == expected.name.toStdString() && !slot.baseColorTexture.empty();
+        });
+    };
+    audit.check(page,"workflow","Two meshes link to the same project material",assigned
+        && linked(store,first,surface) && linked(store,second,surface),error);
+    if (!assigned)
+        return;
+
+    LiveViewport preview(store,true);
+    preview.resize(480,300);
+    preview.setModelShading(ModelShading::Material);
+    preview.setAssetPreview(store.meshAsset(first)->mesh);
+    preview.show();
+    const auto capture = [&](const QString &id) {
+        preview.setAssetPreview(store.meshAsset(id)->mesh);
+        return waitForRender(preview) ? preview.captureFrame() : QImage{};
+    };
+    const auto oldFrameA = capture(first),oldFrameB = capture(second);
+    const auto old = surface;
+    surface.tint = {0.15f,0.48f,0.92f,1};
+    const auto beforeEdit = store.history().index();
+    const bool changed = store.saveProjectMaterial(material,surface,error) == material;
+    const auto newFrameA = capture(first),newFrameB = capture(second);
+    newFrameA.save(output.filePath("shared-finish-barrier.png"));
+    newFrameB.save(output.filePath("shared-finish-counter.png"));
+    audit.check(page,"Vulkan","Editing the shared tint changes both rendered meshes",changed
+        && !oldFrameA.isNull() && !oldFrameB.isNull() && !newFrameA.isNull() && !newFrameB.isNull()
+        && oldFrameA != newFrameA && oldFrameB != newFrameB && store.meshAsset(control)->mesh == previousControl);
+    preview.hide();
+    const bool singleEdit = store.history().index() == beforeEdit+1;
+    if (singleEdit)
+        store.history().undo();
+    const bool undone = linked(store,first,old) && linked(store,second,old);
+    if (singleEdit)
+        store.history().redo();
+    audit.check(page,"undo","One undo and redo restore both linked slots and the library entry",singleEdit && undone
+        && linked(store,first,surface) && linked(store,second,surface) && store.project()->surfaces.materials.value(material) == surface);
+
+    auto edited = *store.meshAsset(first)->mesh;
+    auto expected = store.meshAsset(first)->mesh;
+    for (auto &vertex : edited.vertices)
+        vertex[2] *= 1.05f;
+    const auto geometry = exportGlb(edited,"Road Barrier",error);
+    const bool preserved = !geometry.isEmpty() && store.publishStudioMesh(first,geometry,expected.data(),error)
+        && linked(store,first,surface);
+    const auto geometryError = error;
+    edited.materials.front().name = "Ambiguous or missing link";
+    const auto invalid = exportGlb(edited,"Changed Slot",error);
+    const bool invalidRejected = !invalid.isEmpty()
+        && !store.publishStudioMesh(first,invalid,store.meshAsset(first)->mesh.data(),error)
+        && linked(store,first,surface);
+    audit.check(page,"publishing","Geometry publication preserves the link and a missing link is rejected",
+        preserved && invalidRejected,QString("Preserved %1. Rejected %2. Publish: %3. Invalid: %4")
+            .arg(preserved).arg(invalidRejected).arg(geometryError,error));
+    const bool stale = !store.publishStudioMesh(first,geometry,expected.data(),error);
+    audit.check(page,"validation","A stale draft and a missing texture reference are rejected",stale
+        && store.saveProjectMaterial(material,{"Invalid","missing",{1,1,1,1}},error).isEmpty()
+        && linked(store,first,surface),error);
+    if (!store.save(&error)) {
+        audit.check(page,"storage","Save both mesh assignments",false,error);
+        return;
+    }
+    const bool sourcesRemoved = QFile::remove(png) && QFile::remove(jpeg);
+    ProjectStore reopened;
+    const bool loaded = reopened.project() && sourcesRemoved && reopened.project()->surfaces.textures.size() == 2
+        && reopened.project()->surfaces.textures.value(pngId).width == 32
+        && linked(reopened,first,surface) && linked(reopened,second,surface);
+    audit.check(page,"storage","Reopen resolves both assignments after deleting the original image files",loaded,
+        QString("Source removed %1. Project %2. Textures %3. Slots %4/%5. %6")
+            .arg(sourcesRemoved).arg(reopened.project() != nullptr)
+            .arg(reopened.project() ? reopened.project()->surfaces.textures.size() : 0)
+            .arg(linked(reopened,first,surface)).arg(linked(reopened,second,surface)).arg(reopened.loadError()));
+    if (!loaded)
+        return;
+
+    {
+        MainWindow window;
+        window.resize(1300,850);
+        window.show();
+        QTest::qWait(100);
+        auto *search = window.findChild<QAction *>("searchStudioAssets");
+        bool filtered = false;
+        if (search && search->isVisible() && search->isEnabled()) {
+            QTimer::singleShot(0,&window,[&] {
+                auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                auto *kind = dialog ? dialog->findChild<QComboBox *>("projectAssetKind") : nullptr;
+                auto *list = dialog ? dialog->findChild<QListWidget *>("studioAssetResults") : nullptr;
+                if (kind && list) {
+                    kind->setCurrentText("Textures");
+                    filtered = list->count() == 2;
+                    kind->setCurrentText("Materials");
+                    filtered = filtered && list->count() == 1 && list->item(0)->text() == surface.name;
+                }
+                if (dialog)
+                    dialog->reject();
+            });
+            search->trigger();
+        }
+        auto *tiles = window.findChild<QListView *>("assetTiles");
+        const auto tile = [&](const QString &name) {
+            const auto found = tiles ? tiles->model()->match(tiles->model()->index(0,0),Qt::DisplayRole,name) : QModelIndexList{};
+            return found.value(0);
+        };
+        const auto paint = tile(surface.name);
+        bool materialDetails = false, textureDetails = false;
+        if (paint.isValid()) {
+            QTimer::singleShot(0,&window,[&] {
+                auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                auto *texture = dialog ? dialog->findChild<QComboBox *>("projectMaterialTexture") : nullptr;
+                auto *assign = dialog ? dialog->findChild<QPushButton *>("assignSavedMaterial") : nullptr;
+                materialDetails = dialog && dialog->objectName() == "projectMaterialDetails"
+                    && texture && texture->currentData().toString() == pngId && assign && assign->isEnabled();
+                if (dialog)
+                    dialog->reject();
+            });
+            QMetaObject::invokeMethod(tiles,"activated",Qt::DirectConnection,Q_ARG(QModelIndex,paint));
+        }
+        const auto swatch = tile("Surface Color");
+        if (swatch.isValid()) {
+            QTimer::singleShot(0,&window,[&] {
+                auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                textureDetails = dialog && dialog->objectName() == "projectTextureDetails";
+                if (dialog)
+                    dialog->reject();
+            });
+            QMetaObject::invokeMethod(tiles,"activated",Qt::DirectConnection,Q_ARG(QModelIndex,swatch));
+        }
+        audit.check(page,"navigation","Search filters and Content Browser opens both type-specific Details",filtered && materialDetails && textureDetails);
+        window.close();
+    }
+    const auto player = runStreetPlayer(reopened,output,"surface-library");
+    QFile playable(output.filePath("surface-library.wfplay"));
+    const bool opened = playable.open(QIODevice::ReadOnly);
+    std::istringstream exported(opened ? playable.readAll().toStdString() : std::string{});
+    const auto scene = worldforge::readPlayable(exported);
+    const auto textureBytes = reopened.project()->surfaces.textures.value(pngId).image;
+    const auto texturedDraws = scene ? std::ranges::count_if(scene->meshes,[&](const auto &mesh) {
+        return !mesh.vertices.empty() && std::ranges::equal(mesh.baseColorTexture,textureBytes,[](uint8_t a,char b) {
+            return a == uint8_t(b);
+        }) && mesh.vertices.front().color == worldforge::Point3{surface.tint[0],surface.tint[1],surface.tint[2]};
+    }) : 0;
+    audit.check(page,"runtime","The packaged Player loads both meshes with their shared base-color texture",
+        player.exitCode == 0 && player.report.value("texturedMeshes").toInt() == 2 && texturedDraws == 2,playerSummary(player));
+
+    const auto replacement = directory.filePath("Replacement.png");
+    QImage fresh(30,18,QImage::Format_RGB32);
+    fresh.fill(QColor(45,195,110));
+    const bool imageReady = fresh.save(replacement);
+    const auto liveBefore = reopened.history().index();
+    const auto staged = reopened.previewTextureReimport(pngId,replacement,error);
+    const bool previewOnly = staged && staged->after.width == 30
+        && reopened.project()->surfaces.textures.value(pngId).image == textureBytes
+        && reopened.history().index() == liveBefore;
+    const bool textureApplied = imageReady && staged && reopened.applyTextureReimport(*staged,error);
+    const bool textureRejected = textureApplied && !reopened.applyTextureReimport(*staged,error)
+        && !reopened.previewTextureReimport(pngId,corrupt.fileName(),error);
+    if (textureApplied)
+        reopened.history().undo();
+    audit.check(page,"reimport","Missing texture sources can be relinked and undo restores their bytes",
+        previewOnly && textureRejected && linked(reopened,first,surface) && linked(reopened,second,surface)
+        && reopened.project()->surfaces.textures.value(pngId).image == textureBytes
+        && reopened.history().index() == liveBefore,error);
+
+    {
+        QScopedPointer<QWidget> hub(createAssetHub(reopened,[](const QString &) {},nullptr));
+        auto *search = hub->findChild<QLineEdit *>("assetHubSearch");
+        auto *list = hub->findChild<QListWidget *>("assetHubAssets");
+        auto *usage = hub->findChild<QPlainTextEdit *>("assetHubUsage");
+        search->setText("Road Barrier");
+        for (int row = 0; row < list->count(); ++row)
+            if (list->item(row)->data(Qt::UserRole).toString() == pngId)
+                list->setCurrentRow(row);
+        audit.check(page,"navigation","Asset Hub finds a texture by usage and shows its missing source and references",
+            list->currentItem() && list->currentItem()->data(Qt::UserRole).toString() == pngId
+            && usage->toPlainText().contains("Source missing") && usage->toPlainText().contains("Reusable Finish")
+            && usage->toPlainText().contains("Road Barrier") && usage->toPlainText().contains("Counter"));
+        auto *review = hub->findChild<QPushButton *>("assetHubReimport");
+        bool reviewed = false;
+        if (review && review->isEnabled()) {
+            QTimer::singleShot(0,hub.data(),[&] {
+                auto *chooser = qobject_cast<QFileDialog *>(QApplication::activeModalWidget());
+                if (!chooser)
+                    return;
+                chooser->selectFile(replacement);
+                QTimer::singleShot(0,hub.data(),[&] {
+                    auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                    reviewed = dialog && dialog->objectName() == "assetHubReimportPreview"
+                        && std::ranges::any_of(dialog->findChildren<QLabel *>(),[](const auto *label) {
+                            return label->text().contains("30 × 18");
+                        });
+                    if (dialog)
+                        dialog->reject();
+                });
+                QMetaObject::invokeMethod(chooser,"accept",Qt::DirectConnection);
+            });
+            review->click();
+        }
+        audit.check(page,"reimport","Cancel from the Asset Hub image comparison preserves the texture and undo history",
+            reviewed && reopened.project()->surfaces.textures.value(pngId).image == textureBytes
+            && reopened.history().index() == liveBefore);
+    }
+
+    const auto saveGlb = [&](const QString &path,const worldforge::Mesh &mesh) {
+        const auto bytes = exportGlb(mesh,"Reimport Fixture",error);
+        QFile file(path);
+        return !bytes.isEmpty() && file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size();
+    };
+    const auto glbSource = directory.filePath("Reimport Fixture.glb");
+    const auto glbReplacement = directory.filePath("Changed Mesh.glb");
+    const auto base = worldforge::makePrimitive(worldforge::Primitive::Sphere,{2,2,2},32,16).value();
+    auto larger = base;
+    for (auto &vertex : larger.vertices)
+        vertex[2] *= 1.4f;
+    const auto beforeImport = reopened.history().index();
+    const bool imported = saveGlb(glbSource,base) && saveGlb(glbReplacement,larger) && reopened.importMesh(glbSource,error);
+    if (imported) {
+        const auto objectId = reopened.selection();
+        const auto id = reopened.selectedMesh()->id;
+        auto mesh = *reopened.selectedMesh()->mesh;
+        for (auto &vertex : mesh.vertices)
+            vertex[0] *= 0.9f;
+        const bool meshEdited = reopened.updateMesh(id,std::move(mesh),"Local Edit",error);
+        const std::vector<worldforge::MeshModifier> retained{
+            {worldforge::ModifierKind::Array,true,0,2,3}
+        };
+        const bool authored = reopened.selectMeshUvSet("Lightmap",true,false,error)
+            && reopened.setMeshModifiers(retained,error) && reopened.setMeshLod(0.25f,24,error);
+        reopened.addMeshInstance();
+        const auto linkedObject = reopened.selection();
+        const bool hasInstance = linkedObject != objectId && reopened.selectedMesh()->id == id;
+        const auto original = reopened.meshAsset(id)->mesh;
+        const auto meshReview = reopened.previewMeshReimport(id,glbReplacement,error);
+        const auto before = reopened.history().index();
+        const bool guarded = meshReview && !reopened.applyMeshReimport(*meshReview,false,error)
+            && reopened.history().index() == before && reopened.meshAsset(id)->mesh == original;
+        const bool applied = meshReview && reopened.applyMeshReimport(*meshReview,true,error);
+        const bool unchangedPlacement = applied && reopened.object(objectId) && reopened.object(objectId)->meshAsset == id;
+        const auto *updated = reopened.meshAsset(id);
+        const bool preservedAuthoring = applied && authored && hasInstance && updated
+            && updated->modifiers == retained && updated->evaluatedMesh
+            && updated->lodCell == 0.25f && updated->lodDistance == 24
+            && updated->otherUvSets.contains("Lightmap") && reopened.object(linkedObject)->meshAsset == id;
+        const bool rejectedStale = applied && !reopened.applyMeshReimport(*meshReview,true,error);
+        if (applied)
+            reopened.history().undo();
+        audit.check(page,"reimport","Mesh review protects local edits, preserves its placement and rejects stale previews",
+            meshEdited && guarded && unchangedPlacement && rejectedStale && reopened.meshAsset(id)->mesh == original,error);
+        audit.check(page,"modeling delivery","Reimport retains the named UV set, modifier stack, LOD settings and linked instance",
+            preservedAuthoring);
+        reopened.history().setIndex(beforeImport);
+    } else {
+        audit.check(page,"reimport","Prepare the mesh source and changed GLB",false,error);
+    }
+
+    const std::array<QColor,4> colors{QColor(145,138,245),QColor(0,190,220),QColor(184,0,0),QColor(15,245,70)};
+    for (std::size_t i = 0; i < colors.size(); ++i) {
+        fresh.fill(colors[i]);
+        const auto path = directory.filePath(QString("PBR Map %1.png").arg(i));
+        if (fresh.save(path))
+            surface.maps[i] = reopened.importProjectTexture(path,error);
+    }
+    surface.metallic = 0.72f;
+    surface.roughness = 0.56f;
+    surface.emission = 0.85f;
+    const bool materialSaved = std::ranges::none_of(surface.maps,&QString::isEmpty)
+        && reopened.saveProjectMaterial(material,surface,error) == material;
+    const auto hasChannels = [&](const worldforge::MeshMaterial &slot) {
+        const auto images = slot.previewTextures();
+        for (std::size_t i = 0; i < surface.maps.size(); ++i) {
+            const auto bytes = reopened.project()->surfaces.textures.value(surface.maps[i]).image;
+            if (bytes.isEmpty() || !std::ranges::equal(*images[i+1],bytes,[](uint8_t a,char b) { return a == uint8_t(b); }))
+                return false;
+        }
+        return slot.metallic == surface.metallic && slot.roughness == surface.roughness
+            && slot.emissive == worldforge::Point3{surface.emission,surface.emission,surface.emission};
+    };
+    const auto pbrFrame = [&] {
+        preview.show();
+        preview.setAssetPreview(reopened.meshAsset(first)->mesh);
+        const auto frame = waitForRender(preview) ? preview.captureFrame() : QImage{};
+        preview.hide();
+        return frame;
+    }();
+    pbrFrame.save(output.filePath("pbr-barrier.png"));
+    const auto &pbrMesh = *reopened.meshAsset(first)->mesh;
+    const auto &pbrSlot = pbrMesh.materials[pbrMesh.faces.front().material];
+    const auto studioGlb = exportGlb(pbrMesh,"Surface Studio Handoff",error,true);
+    const auto studioMesh = importGlb(studioGlb,error);
+    audit.check(page,"surface maps","Four map references, factors and a Vulkan render survive the Studio interchange",
+        materialSaved && hasChannels(pbrSlot) && !pbrFrame.isNull() && pbrFrame != newFrameA && studioMesh
+        && hasChannels(studioMesh->materials[studioMesh->faces.front().material]),error);
+    const bool pbrSaved = reopened.save(&error);
+    ProjectStore saved;
+    const auto pbrPlayer = runStreetPlayer(reopened,output,"surface-pbr");
+    audit.check(page,"runtime","Reopen keeps all map references and the packaged Player uploads all eight data maps",
+        pbrSaved && saved.project() && saved.project()->surfaces.materials.value(material) == surface
+        && pbrPlayer.exitCode == 0 && pbrPlayer.report.value("surfaceMaps").toInt() == 8,
+        playerSummary(pbrPlayer));
+
+    const auto sculptPath = qEnvironmentVariable("WORLDFORGE_SCULPT_TEST_GLB");
+    if (!sculptPath.isEmpty()) {
+        QFile glb(sculptPath);
+        QFile source(QFileInfo(sculptPath).dir().filePath("source.wfasset"));
+        const auto optimized = glb.open(QIODevice::ReadOnly) ? importGlb(glb.readAll(),error) : std::nullopt;
+        const bool delivered = optimized && source.open(QIODevice::ReadOnly)
+            && reopened.createStudioMesh("Workbench Sculpt",*optimized,source.readAll(),error);
+        if (delivered) {
+            const auto objectId = reopened.selection();
+            const auto assetId = reopened.selectedMesh()->id;
+            auto object = *reopened.selectedObject();
+            object.position = {12,9,1};
+            reopened.updateObject(object,"Position sculpt");
+            const bool sculptSaved = reopened.save(&error);
+            ProjectStore reopenedSculpt;
+            const auto *asset = reopenedSculpt.meshAsset(assetId);
+            QImage normal;
+            if (asset)
+                for (const auto &slot : asset->mesh->materials)
+                    if (!slot.normalTexture.empty()) {
+                        normal = QImage::fromData(slot.normalTexture.data(),int(slot.normalTexture.size()));
+                        break;
+                    }
+            bool varied = false;
+            for (int y = 0; !varied && y < normal.height(); ++y)
+                for (int x = 0; !varied && x < normal.width(); ++x) {
+                    const auto pixel = normal.pixel(x,y);
+                    varied = qBlue(pixel) > 96 && std::abs(qRed(pixel)-128) > 12;
+                }
+            const auto sculptPlayer = runStreetPlayer(reopenedSculpt,output,"sculpt-delivery");
+            audit.check(page,"sculpt delivery","The 600-triangle mesh, baked normals and editable sculpt survive reopen and Player export",
+                sculptSaved && asset && asset->mesh->faces.size() == 600 && reopenedSculpt.object(objectId)
+                && varied && QFile::exists(reopenedSculpt.studioSourcePath(*asset))
+                && sculptPlayer.exitCode == 0 && sculptPlayer.report.value("surfaceMaps").toInt() == 9,
+                error + " " + playerSummary(sculptPlayer));
+        } else {
+            audit.check(page,"sculpt delivery","Publish the reduced sculpt and archive its editable source",false,error);
+        }
+    }
+}
+
+void studioUvRoundTrip(const QDir &output,const QDir &root,Audit &audit)
+{
+    const QString page = "Studio UV exchange";
+    QTemporaryDir fixture(output.filePath("uv-exchange-XXXXXX"));
+    fixture.setAutoRemove(false);
+    ProjectStore store;
+    QString error;
+    if (!fixture.isValid() || !store.createStarterProject("Studio UV QA",
+        {{"location",fixture.filePath("UV Project")},{"starter","street"}},error)) {
+        audit.check(page,"setup","Create the UV round-trip project",false,error);
+        return;
+    }
+    store.addCube();
+    const auto id = store.selectedMesh()->id;
+    const auto firstPlacement = store.selection();
+    const bool created = store.selectMeshUvSet("Lightmap",true,false,error);
+    auto prop = *store.selectedMesh()->mesh;
+    prop.materials.push_back({"UV Trim",{0.65f,0.35f,0.2f,1}});
+    prop.faces.back().material = 1;
+    for (auto &face : prop.faces)
+        for (auto &corner : face.corners)
+            corner.uv = {0.11f+corner.uv[0]*0.39f,0.11f+corner.uv[1]*0.39f};
+    const bool edited = store.updateMesh(id,std::move(prop),"Author lightmap UVs",error)
+        && store.selectMeshUvSet("UV Map",false,false,error);
+    store.placeMesh(id);
+    const auto secondPlacement = store.selection();
+    const auto input = store.exportStudioInput(*store.meshAsset(id),error);
+    QFile file(fixture.filePath("input.glb"));
+    const bool prepared = created && edited && !input.isEmpty() && file.open(QIODevice::WriteOnly)
+        && file.write(input) == input.size();
+    file.close();
+    if (!prepared) {
+        audit.check(page,"setup","Stage the authored named UV layouts",false,error);
+        return;
+    }
+    QProcess studio;
+    studio.setProcessChannelMode(QProcess::MergedChannels);
+    studio.start(EmbeddedStudio::installedExecutable(),{"--background","--factory-startup","--python-exit-code","7",
+        "--python",root.filePath("Workspaces/StudioPublish.py"),"--python",root.filePath("Tests/StudioUvRoundTrip.py"),
+        "--",fixture.path()});
+    const bool staged = studio.waitForFinished(55000) && studio.exitStatus() == QProcess::NormalExit && studio.exitCode() == 0;
+    audit.check(page,"Studio","Studio restores the native UV layouts and stages two revisions",staged,QString::fromUtf8(studio.readAll()));
+    if (!staged)
+        return;
+    const auto readFile = [](const QString &path) {
+        QFile input(path);
+        return input.open(QIODevice::ReadOnly) ? input.readAll() : QByteArray{};
+    };
+    const auto revision = [&](const QString &marker) {
+        return QDir(fixture.filePath(QString::fromLatin1(readFile(fixture.filePath(marker))).trimmed()));
+    };
+    const auto apply = [&](const QString &marker,const QByteArray &overrideManifest = {}) {
+        const auto dir = revision(marker);
+        return store.publishStudioMesh(id,readFile(dir.filePath("mesh.glb")),store.meshAsset(id)->mesh.data(),error,
+            readFile(dir.filePath("source.wfasset")),overrideManifest.isEmpty() ? readFile(dir.filePath("uv-sets.json")) : overrideManifest);
+    };
+    const auto initial = store.meshAsset(id)->mesh;
+    const int before = store.history().index();
+    const bool rejected = !apply("with-lightmap",R"({"version":1,"names":["UV Map","UV Map"],"render":0})")
+        && store.history().index() == before && store.meshAsset(id)->mesh == initial;
+    audit.check(page,"validation","Duplicate UV names are rejected without changing the mesh or undo history",rejected,error);
+    const bool published = apply("with-lightmap");
+    const auto validLayout = [&](const ProjectStore &projects) {
+        const auto *asset = projects.meshAsset(id);
+        if (!asset || asset->activeUvSet != "UV Map" || !asset->otherUvSets.contains("Lightmap"))
+            return false;
+        const auto &layer = asset->otherUvSets["Lightmap"];
+        return !layer.needsUnwrap && layer.corners.size() == asset->mesh->faces.size()*3
+            && std::ranges::all_of(layer.corners,[](const auto &uv) { return uv[0] >= 0.30f && uv[0] <= 0.51f; })
+            && std::ranges::any_of(asset->mesh->faces,[&](const auto &face) {
+                return asset->mesh->materials[face.material].name == "UV Trim";
+            });
+    };
+    audit.check(page,"publish","The edited UVs and trim material return to the same placed asset",
+        published && validLayout(store) && store.object(firstPlacement)->meshAsset == id
+        && store.object(secondPlacement)->meshAsset == id,error);
+    if (!published)
+        return;
+    const auto publishedMesh = store.meshAsset(id)->mesh;
+    store.history().undo();
+    const bool restored = store.meshAsset(id)->mesh == initial;
+    store.history().redo();
+    const bool persisted = store.save(&error);
+    ProjectStore reopened;
+    const auto player = runStreetPlayer(reopened,output,"studio-uv-round-trip");
+    audit.check(page,"storage","Undo, redo, project reopen and standalone Play preserve the published prop",
+        restored && persisted && validLayout(reopened) && store.meshAsset(id)->mesh == publishedMesh
+        && player.exitCode == 0,playerSummary(player));
+    const bool changed = apply("ready");
+    audit.check(page,"validation","A removed lightmap is flagged for rebuilding after a topology edit",
+        changed && store.meshAsset(id)->otherUvSets.value("Lightmap").needsUnwrap
+        && store.meshAsset(id)->mesh->faces.size() > publishedMesh->faces.size(),error);
+}
+
+void studioCharacterRoundTrip(const QDir &output,const QDir &root,Audit &audit)
+{
+    namespace wf = worldforge;
+    const QString page = "Studio character clip";
+    QTemporaryDir fixture(output.filePath("character-XXXXXX"));
+    fixture.setAutoRemove(false);
+    const auto read = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
+    };
+    QFile input(fixture.filePath("input.glb"));
+    if (!fixture.isValid() || !input.open(QIODevice::WriteOnly)) {
+        audit.check(page,"setup","Create the Studio exchange directory",false);
+        return;
+    }
+    input.close();
+    QProcess studio;
+    studio.setProcessChannelMode(QProcess::MergedChannels);
+    studio.start(EmbeddedStudio::installedExecutable(),{"--background","--factory-startup","--python-exit-code","7",
+        "--python",root.filePath("Workspaces/StudioPublish.py"),"--python",root.filePath("Tests/StudioCharacterClip.py"),
+        "--",fixture.path()});
+    const bool published = studio.waitForFinished(55000) && studio.exitCode() == 0 && studio.exitStatus() == QProcess::NormalExit;
+    const auto log = QString::fromUtf8(studio.readAll());
+    audit.check(page,"Studio","An unweighted rig is rejected, then the weighted rig and Action publish and reopen",
+        published && log.contains("positive weight"),log);
+    if (!published)
+        return;
+    const QDir revision(fixture.filePath(QString::fromLatin1(read(fixture.filePath("ready"))).trimmed()));
+    const auto glb = read(revision.filePath("mesh.glb"));
+    const auto uvs = read(revision.filePath("uv-sets.json"));
+    const auto clip = read(revision.filePath("clip.wfmotion"));
+    QString error;
+    StudioMeshData imported;
+    const bool rejected = !importStudioGlb(glb,uvs,clip.chopped(4),imported,error);
+    auto mesh = importStudioGlb(glb,uvs,clip,imported,error);
+    auto projectReady = [&] {
+        const auto &data = imported.clip;
+        return mesh && data && data->name == "Looping Bend" && data->frameCount() == 13
+            && std::abs(data->duration()-0.5) < 0.0001;
+    };
+    audit.check(page,"validation","A truncated clip is rejected and the complete clip matches the GLB vertex map",
+        rejected && projectReady(),error);
+    ProjectStore store;
+    if (!projectReady() || !store.createStarterProject("Character QA",
+        {{"location",fixture.filePath("Character QA")},{"starter","street"}},error)
+        || !store.createStudioMesh("Looping Character",std::move(*mesh),read(revision.filePath("source.wfasset")),error,&imported)) {
+        audit.check(page,"setup","Import the skinned Studio asset and Action",false,error);
+        return;
+    }
+    const auto assetId = store.selectedMesh()->id;
+    auto object = *store.selectedObject();
+    object.position = {0,0,8};
+    store.updateObject(object,"Place Character");
+    const bool saved = store.save(&error);
+    ProjectStore reopened;
+    const auto *asset = reopened.meshAsset(assetId);
+    audit.check(page,"storage","The animation samples and editable rig survive project reopen",
+        saved && asset && asset->clip && asset->clip->samples.size() == imported.clip->samples.size()
+        && QFile::exists(reopened.studioSourcePath(*asset)),error);
+    if (!saved || !asset || !asset->clip)
+        return;
+
+    LiveViewport view(reopened,false);
+    view.resize(690,480);
+    view.show();
+    const bool playing = waitForRender(view) && view.start(LiveViewport::RunMode::Play);
+    if (playing) {
+        view.pause(true);
+        view.setCameraPreview({3,-5,10},{0,0,9});
+    }
+    const auto start = playing ? view.captureFrame() : QImage{};
+    for (int i = 0; playing && i < qRound(0.25/wf::WorldSimulation::stepSeconds); ++i)
+        view.step();
+    const auto bent = playing ? view.captureFrame() : QImage{};
+    view.stop();
+    view.hide();
+    const auto mask = [](const QImage &frame) {
+        QImage result(frame.size(),QImage::Format_Grayscale8);
+        int count = 0;
+        for (int y = 0; y < frame.height(); ++y)
+            for (int x = 0; x < frame.width(); ++x) {
+                const QColor pixel = frame.pixelColor(x,y);
+                const bool colored = pixel.red() > 120 && pixel.blue() > 120 && pixel.green() < 110;
+                result.scanLine(y)[x] = colored ? 255 : 0;
+                count += colored;
+            }
+        return std::pair{result,count};
+    };
+    const auto [startMask,startPixels] = mask(start);
+    const auto [bentMask,bentPixels] = mask(bent);
+    start.save(output.filePath("character-frame-01.png"));
+    bent.save(output.filePath("character-frame-07.png"));
+    audit.check(page,"Editor Play","Known animation frames render different character silhouettes",
+        playing && startPixels > 40 && bentPixels > 40 && startMask != bentMask,
+        QString("%1 and %2 character pixels").arg(startPixels).arg(bentPixels));
+    const auto player = runStreetPlayer(reopened,output,"studio-character");
+    audit.check(page,"Player","The packaged Player applies the deformation and loops the clip",
+        player.exitCode == 0 && player.report.value("clipMoved").toBool() && player.report.value("clipLooped").toBool(),
+        playerSummary(player));
 }
 
 void surfaceWorkflow(const QDir &output,Audit &audit)
@@ -4333,7 +6391,16 @@ int main(int argc, char **argv)
     const bool studio = app.arguments().size() == 4 && app.arguments().last() == "--studio-publishing";
     const bool forgeAi = app.arguments().size() == 4 && app.arguments().last() == "--forge-ai";
     const bool streetAudit = app.arguments().size() == 4 && app.arguments().last() == "--street";
-    if (!authoring && !benchmark && !studio && !forgeAi && !streetAudit && app.arguments().size() != 3)
+    const bool rendering = app.arguments().size() == 4 && app.arguments().last() == "--rendering";
+    const bool realism = app.arguments().size() == 4 && app.arguments().last() == "--realism";
+    const bool engineSession = app.arguments().size() == 4 && app.arguments().last() == "--engine-session";
+    const bool programming = app.arguments().size() == 4 && app.arguments().last() == "--programming";
+    const bool nativeGameplay = app.arguments().size() == 4 && app.arguments().last() == "--native-gameplay";
+    const bool surfaceLibrary = app.arguments().size() == 4 && app.arguments().last() == "--surface-library";
+    const bool studioUv = app.arguments().size() == 4 && app.arguments().last() == "--studio-uv";
+    const bool studioCharacter = app.arguments().size() == 4 && app.arguments().last() == "--studio-character";
+    if (!authoring && !benchmark && !studio && !forgeAi && !streetAudit && !rendering && !realism && !engineSession
+        && !surfaceLibrary && !studioUv && !studioCharacter && !programming && !nativeGameplay && app.arguments().size() != 3)
         return 2;
     const QDir output(app.arguments().at(1));
     if (!QDir().mkpath(output.absolutePath()))
@@ -4375,8 +6442,48 @@ int main(int argc, char **argv)
         controls.flush();
         return audit.failures ? 1 : 0;
     }
+    if (rendering) {
+        renderingWorkflow(output,root,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (realism) {
+        realismWorkflow(output,root,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
     if (streetAudit) {
         streetWorkflow(output,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (engineSession) {
+        engineSessionWorkflow(output,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (programming) {
+        programmingWorkflow(output,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (nativeGameplay) {
+        nativeGameplayWorkflow(output,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (surfaceLibrary) {
+        surfaceLibraryWorkflow(output,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (studioUv) {
+        studioUvRoundTrip(output,root,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (studioCharacter) {
+        studioCharacterRoundTrip(output,root,audit);
         controls.flush();
         return audit.failures ? 1 : 0;
     }
@@ -4398,7 +6505,6 @@ int main(int argc, char **argv)
     QTest::qWait(80);
     if (authoring) {
         liveAuthoring(window, output, audit);
-        sculptingWorkflow(window,output,audit);
         worldRuntimeWorkflow(window, output, audit);
         audit.check("Live Authoring", "workflow", "Close editor", window.close());
         MainWindow reopened;
@@ -4417,6 +6523,7 @@ int main(int argc, char **argv)
         modelingObjectWorkflow(audit);
         modelingDeliveryWorkflow(output,audit);
         modelingRetopologyWorkflow(output,audit);
+        sculptingWorkflow(output,audit);
         controls.flush();
         return audit.failures ? 1 : 0;
     }
@@ -4471,7 +6578,9 @@ int main(int argc, char **argv)
     sceneWorkflow(window, root, audit);
     controls.flush();
     for (int index = 0; index < tabs->count(); ++index) {
-        tabs->setCurrentIndex(index);
+        // Switching to a Studio workspace with a mesh selected asks before replacing a running Studio session;
+        // the closer cancels that, keeping the session.
+        withDialog([&] { tabs->setCurrentIndex(index); });
         const auto page = tabs->tabText(index);
         QApplication::processEvents();
         QSet<QAction *> menus;

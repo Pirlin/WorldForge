@@ -75,17 +75,60 @@ add_library(WorldForgeCore STATIC
     Engine/World/WorldSimulation.cpp Engine/World/WorldSimulation.h
     Engine/World/PlayableScene.cpp Engine/World/PlayableScene.h
     Engine/World/Gameplay.cpp Engine/World/Gameplay.h
+    Engine/World/NativeGameplay.cpp Engine/World/NativeGameplay.h Engine/World/WorldForgeNative.h
+    Engine/Render/ColorPipeline.h Engine/Render/Flip.cpp Engine/Render/Flip.h Engine/Render/AgxCurve.inc Engine/Render/AgxMatrices.inc
 )
 target_include_directories(WorldForgeCore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(WorldForgeCore PRIVATE Jolt manifold)
 worldforge_compile_options(WorldForgeCore)
 
+# Vulkan is optional at build time. Without the headers and glslang, the Player renders with
+# Direct3D 11 only and the editor has no live viewport.
+find_path(Vulkan_INCLUDE_DIR NAMES vulkan/vulkan.h
+    HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{LOCALAPPDATA}/WorldForge/Vulkan/Vulkan-Headers/include")
+find_program(WORLDFORGE_GLSLANG NAMES glslang glslangValidator
+    HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{LOCALAPPDATA}/WorldForge/Vulkan/glslang-16.6.0/bin")
+if(Vulkan_INCLUDE_DIR AND WORLDFORGE_GLSLANG)
+    add_library(WorldForgeVulkan STATIC
+        Engine/Render/Vulkan/VulkanApi.cpp Engine/Render/Vulkan/VulkanApi.h
+        Engine/Render/Vulkan/HdrFrame.cpp Engine/Render/Vulkan/HdrFrame.h)
+    target_include_directories(WorldForgeVulkan PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(WorldForgeVulkan SYSTEM PUBLIC "${Vulkan_INCLUDE_DIR}")
+    worldforge_compile_options(WorldForgeVulkan)
+    set(worldforge_shader_includes Engine/Render/Shaders/Lighting.glsl Engine/Render/Shaders/ColorPipeline.glsl
+        Engine/Render/Shaders/PlayView.glsl Engine/Render/Shaders/Shading.glsl Engine/Render/AgxCurve.inc Engine/Render/AgxMatrices.inc)
+    # Compiles GLSL to SPIR-V. With a variable name, the output is a C++ header that holds the words.
+    function(worldforge_spirv source output variable)
+        set(arguments -V "-I${CMAKE_CURRENT_SOURCE_DIR}")
+        if(variable)
+            list(APPEND arguments --vn ${variable})
+        endif()
+        get_filename_component(directory "${output}" DIRECTORY)
+        add_custom_command(OUTPUT "${output}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${directory}"
+            COMMAND "${WORLDFORGE_GLSLANG}" ${arguments} "${CMAKE_CURRENT_SOURCE_DIR}/${source}" -o "${output}"
+            DEPENDS "${source}" ${worldforge_shader_includes} VERBATIM)
+    endfunction()
+endif()
+
 if(WIN32)
-    add_executable(WorldForgePlayer WIN32 Player/main.cpp)
+    add_executable(WorldForgePlayer WIN32 Player/main.cpp Player/PlayerRender.h Player/ReferenceScene.cpp Player/ReferenceScene.h)
     target_link_libraries(WorldForgePlayer PRIVATE WorldForgeCore d3d11 dxgi d3dcompiler shell32 comdlg32
-        windowscodecs shlwapi ole32 psapi)
+        windowscodecs shlwapi ole32 psapi gdi32)
     target_compile_definitions(WorldForgePlayer PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     worldforge_compile_options(WorldForgePlayer)
+    if(TARGET WorldForgeVulkan)
+        foreach(shader Sky.vert Sky.frag Shadow.vert Display.vert Display.frag Temporal.frag Ambient.frag PlayScene.vert PlayScene.frag)
+            string(REPLACE "." "_" variable "${shader}")
+            set(output "${CMAKE_CURRENT_BINARY_DIR}/player-shaders/${variable}.h")
+            worldforge_spirv("Engine/Render/Shaders/${shader}" "${output}" "spirv_${variable}")
+            list(APPEND player_shaders "${output}")
+        endforeach()
+        target_sources(WorldForgePlayer PRIVATE Player/VulkanRenderer.cpp Player/VulkanRenderer.h ${player_shaders})
+        target_include_directories(WorldForgePlayer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/player-shaders")
+        target_link_libraries(WorldForgePlayer PRIVATE WorldForgeVulkan)
+        target_compile_definitions(WorldForgePlayer PRIVATE WORLDFORGE_PLAYER_VULKAN)
+    endif()
     install(TARGETS WorldForgePlayer RUNTIME DESTINATION bin)
 endif()
 
@@ -107,13 +150,19 @@ if(NOT WORLDFORGE_BUILD_EDITOR)
     return()
 endif()
 
-find_path(Vulkan_INCLUDE_DIR NAMES vulkan/vulkan.h
-    HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{LOCALAPPDATA}/WorldForge/Vulkan/Vulkan-Headers/include")
-find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Widgets Svg Network)
 qt_standard_project_setup()
 
 set(editor_sources
+    Components/AssetHub.h Components/AssetHub.cpp
+    Components/ProjectSurfaceDetails.h Components/ProjectSurfaceDetails.cpp
+    Components/GameplayAuthoring.h Components/GameplayAuthoring.cpp
+    Components/BehaviorEditor.h Components/BehaviorEditor.cpp
+    Components/BehaviorCode.h Components/BehaviorCode.cpp
+    Components/NativeGameplayEditor.h Components/NativeGameplayEditor.cpp
+    Components/LocalMultiplayer.h Components/LocalMultiplayer.cpp
     Components/WorldLightingVulkan.cpp Components/WorldLightingVulkan.h
+    Components/ViewportFrameVulkan.cpp Components/ViewportFrameVulkan.h
     App/EditorLog.cpp App/EditorLog.h
     Components/CommandTerminal.cpp Components/CommandTerminal.h
     Components/ProjectLauncher.cpp Components/ProjectLauncher.h
@@ -127,12 +176,14 @@ set(editor_sources
     State/ProjectStore.h State/ProjectStore.cpp
     State/GlbImport.h State/GlbImport.cpp
     State/StudioPublishReview.h State/StudioPublishReview.cpp
+    State/StudioClip.h State/StudioClip.cpp
     State/ForgeAi.h State/ForgeAi.cpp
     State/PlayableStreet.h State/PlayableStreet.cpp
     Workspaces/ForgeAiJob.h Workspaces/ForgeAiJob.cpp
     Components/ForgeAiPanel.h Components/ForgeAiPanel.cpp
     State/WorldScene.h State/WorldScene.cpp
     State/WorldRuntime.h State/WorldRuntime.cpp
+    State/NativeComponents.h State/NativeComponents.cpp
     Workspaces/WorkspaceCatalog.h Workspaces/WorkspaceCatalog.cpp
     Workspaces/StudioWorkspace.h Workspaces/StudioWorkspace.cpp
     Workspaces/StudioViews.h Workspaces/StudioViews.cpp
@@ -156,15 +207,15 @@ set(concept_art
     Docs/file_00000000ffdc81faa622de2e167904bf.png
 )
 
-find_program(WORLDFORGE_GLSLANG NAMES glslang glslangValidator
-    HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{LOCALAPPDATA}/WorldForge/Vulkan/glslang-16.6.0/bin")
-if(Vulkan_INCLUDE_DIR AND WORLDFORGE_GLSLANG)
-    foreach(shader Scene.vert Scene.frag Sky.vert Sky.frag Shadow.vert SelectionOutline.vert SelectionOutline.frag)
-        set(output "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader}.spv")
-        add_custom_command(OUTPUT "${output}"
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
-            COMMAND "${WORLDFORGE_GLSLANG}" -V "${CMAKE_CURRENT_SOURCE_DIR}/Components/Shaders/${shader}" -o "${output}"
-            DEPENDS "Components/Shaders/${shader}" "Components/Shaders/Lighting.glsl" VERBATIM)
+if(TARGET WorldForgeVulkan)
+    foreach(shader Components/Shaders/Scene.vert Components/Shaders/Scene.frag
+                   Components/Shaders/SelectionOutline.vert Components/Shaders/SelectionOutline.frag
+                   Engine/Render/Shaders/Sky.vert Engine/Render/Shaders/Sky.frag Engine/Render/Shaders/Shadow.vert
+                   Engine/Render/Shaders/Display.vert Engine/Render/Shaders/Display.frag Engine/Render/Shaders/Temporal.frag
+                   Engine/Render/Shaders/Ambient.frag)
+        get_filename_component(name "${shader}" NAME)
+        set(output "${CMAKE_CURRENT_BINARY_DIR}/shaders/${name}.spv")
+        worldforge_spirv("${shader}" "${output}" "")
         list(APPEND scene_shaders "${output}")
     endforeach()
     add_custom_target(WorldForgeSceneShaders DEPENDS ${scene_shaders})
@@ -173,11 +224,16 @@ else()
 endif()
 
 function(configure_editor target)
+    qt_add_resources(${target} "${target}_behavior_code" PREFIX "/"
+        FILES Resources/BehaviorCode/Behavior.cpp Resources/BehaviorCode/WorldForgeBehavior.h
+              Resources/BehaviorCode/WorldForgeGameplay.h Resources/BehaviorCode/Behavior.vcxproj
+              Resources/BehaviorCode/NativeGameplay.cpp Resources/BehaviorCode/NativeGameplay.vcxproj
+              Engine/World/WorldForgeNative.h Engine/World/WorldForgeNativeComponents.h)
     qt_add_resources(${target} "${target}_studio_publish" PREFIX "/"
         FILES Workspaces/StudioPublish.py Workspaces/StudioNavigation.py Workspaces/ForgeJob.py)
     worldforge_compile_options(${target})
     target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(${target} PRIVATE WorldForgeCore Qt6::Widgets Qt6::Svg)
+    target_link_libraries(${target} PRIVATE WorldForgeCore Qt6::Widgets Qt6::Svg Qt6::Network)
     if(WIN32)
         target_link_libraries(${target} PRIVATE pdh dxgi)
     endif()
@@ -197,6 +253,7 @@ function(configure_editor target)
     )
     if(TARGET WorldForgeSceneShaders)
         add_dependencies(${target} WorldForgeSceneShaders)
+        target_link_libraries(${target} PRIVATE WorldForgeVulkan)
         target_compile_definitions(${target} PRIVATE WORLDFORGE_VULKAN)
         target_include_directories(${target} SYSTEM PRIVATE "${Vulkan_INCLUDE_DIR}")
         qt_add_resources(${target} "${target}_scene_shaders" PREFIX "/"
@@ -221,8 +278,17 @@ if(BUILD_TESTING AND WORLDFORGE_BUILD_EDITOR_AUDIT)
     if(TARGET WorldForgeSceneShaders)
         add_test(NAME WorldForge.Authoring
             COMMAND WorldForgeEditorAudit "${CMAKE_CURRENT_BINARY_DIR}/authoring-qa" "${CMAKE_CURRENT_SOURCE_DIR}" --authoring)
-        set_tests_properties(WorldForge.Authoring PROPERTIES TIMEOUT 45)
+        set_tests_properties(WorldForge.Authoring PROPERTIES TIMEOUT 180)
+        add_test(NAME WorldForge.Rendering
+            COMMAND WorldForgeEditorAudit "${CMAKE_CURRENT_BINARY_DIR}/rendering-qa" "${CMAKE_CURRENT_SOURCE_DIR}" --rendering)
+        set_tests_properties(WorldForge.Rendering PROPERTIES TIMEOUT 120)
         if(TARGET WorldForgePlayer)
+            add_test(NAME WorldForge.EngineSession COMMAND WorldForgeEditorAudit
+                "${CMAKE_CURRENT_BINARY_DIR}/engine-session-qa" "${CMAKE_CURRENT_SOURCE_DIR}" --engine-session)
+            set_tests_properties(WorldForge.EngineSession PROPERTIES TIMEOUT 120)
+            add_test(NAME WorldForge.SurfaceLibrary COMMAND WorldForgeEditorAudit
+                "${CMAKE_CURRENT_BINARY_DIR}/surface-library-qa" "${CMAKE_CURRENT_SOURCE_DIR}" --surface-library)
+            set_tests_properties(WorldForge.SurfaceLibrary PROPERTIES TIMEOUT 120)
             set_tests_properties(WorldForge.Authoring PROPERTIES FIXTURES_SETUP PlayableScene)
             add_test(NAME WorldForge.Player COMMAND WorldForgePlayer --smoke-test
                 "${CMAKE_CURRENT_BINARY_DIR}/authoring-qa/outdoor.wfplay")
@@ -233,6 +299,13 @@ endif()
 
 install(TARGETS WorldForgeEditor RUNTIME DESTINATION bin BUNDLE DESTINATION .)
 if(WIN32)
+    set(WORLDFORGE_STUDIO_RUNTIME "" CACHE PATH "Installed WorldForge Studio runtime to bundle with the editor")
+    if(WORLDFORGE_STUDIO_RUNTIME)
+        if(NOT EXISTS "${WORLDFORGE_STUDIO_RUNTIME}/WorldForgeStudio.exe")
+            message(FATAL_ERROR "WORLDFORGE_STUDIO_RUNTIME must contain WorldForgeStudio.exe and its runtime files.")
+        endif()
+        install(DIRECTORY "${WORLDFORGE_STUDIO_RUNTIME}/" DESTINATION bin/Studio COMPONENT Studio)
+    endif()
     qt_generate_deploy_app_script(
         TARGET WorldForgeEditor
         OUTPUT_SCRIPT deploy_script

@@ -1,20 +1,30 @@
 #pragma once
 
+#include "Engine/Render/ShadowCascades.h"
+
 #include <QVulkanFunctions>
 #include <QVulkanWindow>
 #include <vector>
 #include <span>
 
+// Engine/Render/Shaders/Lighting.glsl
 struct LightingUniform {
-    float lightMatrix[16];
+    float cascadeMatrices[worldforge::shadow::cascadeCount][16]; // Engine/Render/ShadowCascades.h
+    float cascadeScales[worldforge::shadow::cascadeCount][4];   // meters per texel, depth range, slice end, unused
     float fogCenterRadius[4];
     float settings[4];
+    float sun[4];               // direction toward the sun, intensity
+    float skyIrradiance[9][4];  // spherical harmonics of irradiance / pi
+    float skyHorizon[4];        // w: number of lights
+    float skyZenith[4];
+    float skyGround[4];
+    float lights[16][4];        // position or direction, intensity (negative for directional)
 };
-static_assert(sizeof(LightingUniform) == 96);
+static_assert(sizeof(LightingUniform) == 816);
 
 class WorldLightingVulkan {
 public:
-    static constexpr uint32_t shadowSize = 1536;
+    static constexpr uint32_t shadowSize = worldforge::shadow::atlasSize; // the cascade atlas
     static constexpr uint32_t textureCapacity = 2048 * 2048;
     static constexpr uint32_t worldTextureCapacity = 1024 * 1024;
 

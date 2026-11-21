@@ -1,9 +1,11 @@
 #include "App/MainWindow.h"
 #include "App/EditorLog.h"
+#include "Components/LocalMultiplayer.h"
 
 #include <QApplication>
 #include <QFile>
 #include <QStyleFactory>
+#include <string_view>
 
 #ifdef Q_OS_WIN
 extern "C" {
@@ -13,6 +15,8 @@ __declspec(dllexport) unsigned long NvOptimusEnablement = 1;
 
 int main(int argc, char *argv[])
 {
+    if (argc == 3 && std::string_view(argv[1]) == "--loopback-client")
+        return runLocalMultiplayerClient(argc,argv);
     QApplication app(argc, argv);
     app.setOrganizationName("WorldForge");
     app.setApplicationName("WorldForge Editor");

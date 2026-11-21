@@ -11,6 +11,7 @@ class QLabel;
 class QLineEdit;
 class QListView;
 class QPlainTextEdit;
+class QPushButton;
 class QSpinBox;
 class QStandardItemModel;
 class QTabWidget;
@@ -54,9 +55,11 @@ private:
     QComboBox *group_;
     QComboBox *mesh_;
     QComboBox *materialSlot_;
+    QComboBox *behavior_ = nullptr;
+    QPushButton *behaviorComponents_ = nullptr;
     QLabel *meshInfo_;
     QLabel *geometryState_;
-    class QPushButton *materialColor_;
+    QPushButton *materialColor_;
     QDoubleSpinBox *intensity_;
     QComboBox *bodyMode_;
     QComboBox *colliderShape_ = nullptr;
@@ -97,6 +100,7 @@ signals:
     void meshImported();
     void newStudioAssetRequested();
     void editStudioAssetRequested(const QString &assetId);
+    void openAssetRequested(const QString &assetId);
 
 private:
     void rebuild();

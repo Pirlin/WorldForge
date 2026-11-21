@@ -59,6 +59,7 @@ struct WorldSimulation {
     std::vector<Joint> joints;
     float gravity = 9.81f;
     static constexpr float stepSeconds = 1.0f/120.0f;
+    bool launchUpward(std::size_t body,float speed);
     void step();
 private:
     struct Backend;

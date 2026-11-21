@@ -1,6 +1,7 @@
 #pragma once
 
 #include "State/ForgeAi.h"
+#include "Engine/World/Gameplay.h"
 
 // The playable street: a road with a side street, an enterable repair shop, a looping traffic route, and
 // the "Repair Run" mission. It is the test level for coordinated Forge AI edits.
@@ -17,9 +18,12 @@ struct Report {
     bool trafficLooped = false;
     float seconds = 0;
     float missionSeconds = 0;
+    worldforge::GameplayTrace trace;
+    bool gameplayVerified = true;
+    QStringList gameplayErrors;
     QStringList objectives;
     QString summary() const;
-    bool ok() const { return missionComplete && enteredShop && trafficLooped; }
+    bool ok() const { return missionComplete && enteredShop && trafficLooped && gameplayVerified; }
 };
 
 // Runs Play without a viewport: the autopilot completes the mission while traffic drives its route.

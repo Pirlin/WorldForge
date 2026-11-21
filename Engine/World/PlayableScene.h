@@ -1,7 +1,10 @@
 #pragma once
 
 #include "Engine/World/Gameplay.h"
+#include "Engine/World/NativeGameplay.h"
 #include "Engine/World/WorldSimulation.h"
+#include "Engine/Geometry/MeshClip.h"
+#include "Engine/Render/ColorPipeline.h"
 
 #include <iosfwd>
 
@@ -21,6 +24,11 @@ struct PlayMesh {
     float lodDistance = 0;
     // Encoded PNG or JPEG base-color map multiplied with the vertex colors, or empty.
     std::vector<std::uint8_t> baseColorTexture;
+    std::array<std::vector<std::uint8_t>,4> surfaceMaps;
+    Point3 emissive{};
+    float metallic = 0, roughness = 0.65f;
+    bool advancedSurface = false;
+    std::optional<MeshClip> clip;
 };
 
 struct PlayLight {
@@ -42,12 +50,25 @@ struct PlayableScene {
     bool shadows = true;
     Point3 localFogCenter{};
     float localFogRadius = 0, localFogDensity = 0;
+    // Camera exposure in stops (referenceEv100 minus EV100), whether auto exposure meters the frame
+    // instead, its compensation in stops, and the display view transform (format version 14).
+    float exposure = 0;
+    bool autoExposure = false;
+    float exposureCompensation = 0;
+    // Temporal anti-aliasing (format version 14).
+    bool temporalAntiAliasing = true;
+    // Ground-truth ambient occlusion darkens sky light in creases, corners and openings.
+    bool ambientOcclusion = true;
+    color::ViewTransform viewTransform = color::ViewTransform::AgX;
     Gameplay gameplay;
+    std::vector<NativeBodyBinding> nativeBodies;
+    std::vector<NativeInstance> nativeInstances;
 };
 
 // Pass `material` to keep only the faces that use that material slot.
 std::vector<PlayVertex> makePlayVertices(const Mesh &mesh, const Heightfield *terrain = nullptr, float foliageWind = 0,
-                                         std::optional<std::uint32_t> material = std::nullopt);
+                                         std::optional<std::uint32_t> material = std::nullopt,
+                                         std::vector<VertexIndex> *vertices = nullptr);
 bool writePlayable(std::ostream &output, const PlayableScene &scene);
 std::optional<PlayableScene> readPlayable(std::istream &input);
 void drivePlayer(BoxBody &body, Point3 spawn, float yaw, int forward, int sideways, bool jump, int &jumpBuffer);

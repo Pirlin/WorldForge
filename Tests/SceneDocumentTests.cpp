@@ -7,6 +7,11 @@
 #include "Engine/Geometry/MeshUv.h"
 #include "Engine/World/WorldSimulation.h"
 #include "Engine/World/PlayableScene.h"
+#include "Engine/Render/ColorPipeline.h"
+#include "Engine/Render/Flip.h"
+#include "Engine/Render/SkyLight.h"
+#include "Engine/Render/ShadowCascades.h"
+#include "Tests/AgxReference.h"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -27,6 +32,171 @@ void require(bool condition, const char *message)
         std::exit(EXIT_FAILURE);
     }
 }
+
+void checkFlip()
+{
+    constexpr int width = 48, height = 32;
+    const auto uniform = [](std::uint8_t r,std::uint8_t g,std::uint8_t b) {
+        std::vector<std::uint8_t> image;
+        for (int i = 0; i < width*height; ++i)
+            image.insert(image.end(),{r,g,b});
+        return image;
+    };
+    std::vector<std::uint8_t> pattern;
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x) {
+            const auto value = std::uint8_t((x*37+y*11)%200+20);
+            pattern.insert(pattern.end(),{value,std::uint8_t(255-value),std::uint8_t(value/2)});
+        }
+    require(flip::compare(pattern,pattern,width,height).mean < 1e-6, "FLIP finds no difference between identical images");
+    const double extreme = flip::compare(uniform(0,255,0),uniform(0,0,255),width,height).mean;
+    require(std::abs(extreme-1) < 1e-3, "FLIP rates green against blue as the largest difference");
+    const double blackWhite = flip::compare(uniform(0,0,0),uniform(255,255,255),width,height).mean;
+    require(blackWhite > 0.9 && blackWhite < 1, "FLIP rates black against white near the top of its range");
+    auto shifted = pattern;
+    for (auto &value : shifted)
+        value = std::uint8_t(std::min(255,value+3));
+    const double slight = flip::compare(pattern,shifted,width,height).mean;
+    auto edged = pattern;
+    for (int y = 10; y < 20; ++y)
+        for (int x = 10; x < 30; ++x)
+            for (int c = 0; c < 3; ++c)
+                edged[std::size_t(y*width+x)*3+c] = 255;
+    const double edge = flip::compare(pattern,edged,width,height).mean;
+    require(slight > 0 && slight < 0.12 && edge > slight*2.5, "FLIP rates a slight shift low and a new bright shape high");
+    require(flip::compare(pattern,pattern,width,height+1).error.empty(), "FLIP rejects images of the wrong size");
+}
+
+void checkColorPipeline()
+{
+    namespace color = worldforge::color;
+    for (const float value : {0.0f,0.002f,0.04f,0.2f,0.5f,0.9f,1.0f})
+        require(std::abs(color::linearToSrgb(color::srgbToLinear(value))-value) < 1e-5f, "sRGB decode and encode are inverses");
+    require(std::abs(color::linearToSrgb(0.214041f)-0.5f) < 1e-4f, "Linear 0.214 encodes to sRGB 0.5");
+    double greyWorst = 0, colorWorst = 0, colorTotal = 0;
+    int colors = 0;
+    for (const auto &sample : agxReference) {
+        const auto display = color::agx({float(sample.input[0]),float(sample.input[1]),float(sample.input[2])});
+        const bool grey = sample.input[0] == sample.input[1] && sample.input[1] == sample.input[2];
+        for (int channel = 0; channel < 3; ++channel) {
+            const double error = std::abs(double(display[channel])-sample.display[channel])*255;
+            (grey ? greyWorst : colorWorst) = std::max(grey ? greyWorst : colorWorst,error);
+            if (!grey) {
+                colorTotal += error;
+                ++colors;
+            }
+        }
+    }
+    if (greyWorst > 0.6 || colorWorst > 18 || colorTotal/colors > 1.5)
+        std::cerr << "AgX error against Studio: grey " << greyWorst << ", color worst " << colorWorst
+                  << ", color mean " << colorTotal/colors << " (8-bit levels)\n";
+    require(greyWorst <= 0.6, "AgX greys match Studio within 0.6 of an 8-bit level");
+    require(colorWorst <= 18 && colorTotal/colors <= 1.5, "AgX colors match Studio within the fitted tolerance");
+    const auto agxGrey = color::agx({0.18f,0.18f,0.18f});
+    const auto exposed = color::displayColor({0.09f,0.09f,0.09f},1,color::ViewTransform::AgX);
+    require(std::abs(agxGrey[1]-exposed[1]) < 1e-5f, "One stop of exposure doubles scene light");
+    require(std::abs(agxGrey[1]-0.4613f) < 0.002f, "AgX shows 18% grey like Studio does");
+    const auto clipped = color::displayColor({4,4,4},0,color::ViewTransform::Standard);
+    const auto rolled = color::displayColor({4,4,4},0,color::ViewTransform::AgX);
+    require(clipped[0] > 0.9999f && rolled[0] < 0.95f, "Standard clips highlights and AgX rolls them off");
+    require(std::abs(color::unitsFromLux(color::luxPerUnit)-1) < 1e-6f && std::abs(color::luxPerUnit-123532.6) < 1,
+            "One scene unit is about 123,500 lux, a bright midday sun");
+    require(color::stopsFromEv100(15) == 0 && color::ev100FromStops(-2) == 17, "EV100 15 is the reference exposure");
+    // A histogram as the display shader fills it: bin 1+floor((log2 L - low) * 63 / (high - low)).
+    const auto binOf = [](float luminance) {
+        const float stops = std::log2(luminance);
+        return 1+int((stops-color::meterLowStops)*63/(color::meterHighStops-color::meterLowStops));
+    };
+    std::array<std::uint32_t,color::meterBins> bins{};
+    bins[std::size_t(binOf(0.18f))] = 1000;
+    float average = 0;
+    require(color::meteredLuminance(bins,average) && std::abs(color::autoExposureStops(average,0)) < 0.2f,
+            "Auto exposure leaves a middle-grey scene at the reference exposure");
+    require(std::abs(color::autoExposureStops(average,1)-color::autoExposureStops(average,0)-1) < 1e-4f,
+            "Exposure compensation adds stops");
+    bins[std::size_t(binOf(100))] = 50;
+    bins[0] = 50;
+    float withOutliers = 0;
+    require(color::meteredLuminance(bins,withOutliers) && std::abs(withOutliers-average) < 0.01f,
+            "Auto exposure ignores the brightest and darkest tenth of the view");
+    std::array<std::uint32_t,color::meterBins> dim{};
+    dim[std::size_t(binOf(0.18f/64))] = 1000;
+    float dimAverage = 0;
+    require(color::meteredLuminance(dim,dimAverage) && std::abs(color::autoExposureStops(dimAverage,0)-6) < 0.2f,
+            "Auto exposure opens up six stops for a scene 64 times darker");
+    require(!color::meteredLuminance(std::array<std::uint32_t,color::meterBins>{},average), "An empty histogram meters nothing");
+    const float step = color::adaptExposure(0,4,0.1f), settled = color::adaptExposure(0,4,10);
+    require(step > 0 && step < 1 && std::abs(settled-4) < 1e-3f, "Exposure adapts gradually and settles on the target");
+    require(color::adaptExposure(0,-4,0.1f) < -step, "Eyes adapt to brightness faster than to darkness");
+    // Sky light: under a uniform sky of radiance L with no sun, a white floor reflects L, the ground below the
+    // horizon reflects groundAlbedo * L, and a wall sees half of each.
+    const float grey = 0.5f, radiance = color::srgbToLinear(grey);
+    const auto uniformSky = color::skyLight({grey,grey,grey},{grey,grey,grey},{0,0,1},0);
+    const auto floorLight = color::skyIrradiance(uniformSky,0,0,1), wallLight = color::skyIrradiance(uniformSky,1,0,0);
+    require(std::abs(uniformSky.ground[0]-color::groundAlbedo*radiance) < 0.01f*radiance, "The ground reflects a quarter of the sky");
+    require(std::abs(floorLight[1]-radiance) < 0.06f*radiance, "A floor under a uniform sky reflects the sky's radiance");
+    require(std::abs(wallLight[1]-0.5f*(1+color::groundAlbedo)*radiance) < 0.08f*radiance, "A wall sees half sky and half ground");
+    const auto sunny = color::skyLight({grey,grey,grey},{grey,grey,grey},{0,0,1},1);
+    require(sunny.ground[0] > uniformSky.ground[0]+0.2f && color::skyIrradiance(sunny,0,0,1)[0] > floorLight[0],
+            "Sunlight brightens the ground and the light it bounces");
+    require(color::skyAmbientScale({166/255.0f,197/255.0f,219/255.0f},{65/255.0f,119/255.0f,177/255.0f}) == 1,
+            "The default sky keeps the ambient light unchanged");
+    require(color::skyAmbientScale({0.03f,0.03f,0.06f},{0.01f,0.01f,0.03f}) < 0.01f, "A night sky gives almost no ambient light");
+}
+}
+
+// A perspective camera's clip-to-world matrix (Vulkan depth 0 near to 1 far), column-major.
+shadow::Matrix inverseCamera(shadow::Vector eye,shadow::Vector target,float verticalFov,float aspect,float nearPlane,
+                             float farPlane)
+{
+    using namespace shadow::detail;
+    const auto forward = normalized(subtract(target,eye));
+    const auto right = normalized(cross(forward,{0,0,1}));
+    const auto up = cross(right,forward);
+    const float tanHalf = std::tan(verticalFov/2);
+    const float k = (farPlane-nearPlane)/(farPlane*nearPlane);
+    // world * w = eye * w + forward + right * x * tanHalf * aspect + up * y * tanHalf, with w = 1/near - z k.
+    const auto column0 = scale(right,tanHalf*aspect), column1 = scale(up,tanHalf);
+    const auto column3 = add(scale(eye,1/nearPlane),forward);
+    return {column0[0],column0[1],column0[2],0, column1[0],column1[1],column1[2],0,
+            -eye[0]*k,-eye[1]*k,-eye[2]*k,-k, column3[0],column3[1],column3[2],1/nearPlane};
+}
+
+void checkShadowCascades()
+{
+    const shadow::Vector eye{0,-30,1.7f}, target{0,0,1.5f}, towardSun{-0.66f,0.71f,0.24f};
+    const auto camera = inverseCamera(eye,target,0.785f,16.0f/9,0.05f,1800);
+    const shadow::Bounds street{{-60,-60,0},{60,60,12}};
+    const auto cascades = shadow::fit(camera,towardSun,street);
+    for (int i = 1; i < shadow::cascadeCount; ++i)
+        require(cascades.scales[i][0] > cascades.scales[i-1][0] && cascades.scales[i][2] > cascades.scales[i-1][2],
+                "Shadow cascades grow coarser and reach farther in order");
+    require(cascades.scales[0][0] < 0.02f, "The nearest shadow cascade is finer than 2 cm per texel");
+    require(std::abs(cascades.scales[3][2]-90.0f) < 1.5f, "Shadow cascades end at the far side of the scene");
+    // Every scene point the camera sees falls inside some cascade, depth included.
+    for (float depth : {5.0f,15.0f,30.0f,50.0f,80.0f})
+        for (float side : {-0.9f,0.0f,0.9f}) {
+            const shadow::Vector point{side*depth*0.4f,eye[1]+depth,0.2f};
+            bool held = false;
+            for (int i = 0; i < shadow::cascadeCount && !held; ++i) {
+                const auto p = shadow::project(cascades,i,point);
+                held = p[0] > 0 && p[0] < 1 && p[1] > 0 && p[1] < 1 && p[2] > 0 && p[2] < 1;
+            }
+            require(held,"Every visible scene point falls inside a shadow cascade");
+        }
+    // Casters toward the sun stay in front of the receivers they shade.
+    const shadow::Vector receiver{0,-25,0};
+    const auto caster = shadow::detail::add(receiver,shadow::detail::scale(shadow::detail::normalized(towardSun),40));
+    const auto lit = shadow::project(cascades,0,receiver), blocking = shadow::project(cascades,0,caster);
+    require(blocking[2] > 0 && blocking[2] < lit[2] && std::abs(blocking[0]-lit[0]) < 1e-4f && std::abs(blocking[1]-lit[1]) < 1e-4f,
+            "A shadow caster toward the sun lands on the receiver's texel and nearer the sun");
+    // Moving the camera a fraction of a texel keeps each tile on the same texel grid.
+    const auto moved = shadow::fit(inverseCamera({0.003f,-30,1.7f},{0.003f,0,1.5f},0.785f,16.0f/9,0.05f,1800),towardSun,street);
+    for (int i = 0; i < shadow::cascadeCount; ++i) {
+        const auto a = shadow::project(cascades,i,receiver), b = shadow::project(moved,i,receiver);
+        const float texels = (a[0]-b[0])*float(shadow::tileSize);
+        require(std::abs(texels-std::round(texels)) < 1e-2f, "Shadow cascades move in whole texels");
+    }
 }
 
 int main(int argc,char *argv[])
@@ -52,6 +222,9 @@ int main(int argc,char *argv[])
         std::ofstream output(argv[1]);
         return writePlayable(output,sample) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    checkColorPipeline();
+    checkFlip();
+    checkShadowCascades();
     const auto example = Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAC");
     require(example && example->toString() == "a1723291-8a22-47dc-b098-1f6718cffaac", "GUID canonicalizes");
     require(!Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAX"), "Invalid GUID rejected");
@@ -664,6 +837,43 @@ int main(int argc,char *argv[])
             && streetLoaded->gameplay.vehicles.size() == 1 && streetLoaded->gameplay.missions.size() == 1
             && streetLoaded->gameplay.missions[0].name == mission.name,
             "Street package restores UVs, base-color maps, traffic, and missions");
+    {
+        // Mission text is limited in UTF-8 bytes. Three-byte characters reach the limit at 53 characters.
+        std::string name;
+        for (int i = 0; i < 40; ++i)
+            name += "\xe4\xbf\xae";
+        auto &missionText = street.gameplay.missions[0].name;
+        const auto original = std::exchange(missionText,name);
+        std::stringstream fits;
+        require(writePlayable(fits,street), "Serialize 120 bytes of multibyte mission text");
+        const auto multibyte = readPlayable(fits);
+        require(multibyte && multibyte->gameplay.missions[0].name == name, "Multibyte mission text survives the Player format");
+        for (int i = 0; i < 14; ++i)
+            missionText += "\xe4\xbf\xae";
+        std::stringstream overlong;
+        require(!writePlayable(overlong,street), "Refuse to write mission text the Player cannot read");
+        missionText = original;
+    }
+    {
+        // Exposure and view transform need Player format 14; default display settings keep the older format.
+        std::stringstream plain;
+        require(writePlayable(plain,street) && !plain.str().starts_with("WORLDFORGE_PLAY 14"),
+                "Default display settings keep the older Player format");
+        street.exposure = -1.5f;
+        street.viewTransform = color::ViewTransform::Standard;
+        std::stringstream display;
+        require(writePlayable(display,street) && display.str().starts_with("WORLDFORGE_PLAY 14"),
+                "Display settings use Player format 14");
+        const auto shown = readPlayable(display);
+        require(shown && shown->exposure == -1.5f && shown->viewTransform == color::ViewTransform::Standard
+                && shown->gameplay.missions.size() == 1,
+                "Exposure and view transform survive the Player format");
+        street.exposure = 18;
+        std::stringstream outOfRange;
+        require(!writePlayable(outOfRange,street), "Exposure outside the supported range is refused");
+        street.exposure = 0;
+        street.viewTransform = color::ViewTransform::AgX;
+    }
     const auto around = findPath(street.simulation,{0,0,1},{0,8,1},0.4f,0.15f,1.85f);
     require(around.size() >= 2 && std::ranges::all_of(around,[](const Point3 &p) { return std::abs(p[0]) > 4 || p[1] > 4.5f; }),
             "Path planning walks around a wall instead of through it");

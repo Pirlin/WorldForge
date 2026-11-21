@@ -74,14 +74,21 @@ bool readBase64(std::istream &in,std::size_t size,std::vector<std::uint8_t> &byt
     return bytes.size() == size;
 }
 
+constexpr std::size_t maxTextBytes = 160;
+
+bool fitsText(const std::string &text)
+{
+    return text.size() <= maxTextBytes;
+}
+
 bool readText(std::istream &in,std::string &text)
 {
-    return bool(in >> std::quoted(text)) && text.size() <= 160;
+    return bool(in >> std::quoted(text)) && fitsText(text);
 }
 }
 
 std::vector<PlayVertex> makePlayVertices(const Mesh &mesh,const Heightfield *terrain,float foliageWind,
-                                         std::optional<std::uint32_t> material)
+                                         std::optional<std::uint32_t> material,std::vector<VertexIndex> *indices)
 {
     std::vector<PlayVertex> vertices;
     for (const auto &face : mesh.faces) {
@@ -92,6 +99,8 @@ std::vector<PlayVertex> makePlayVertices(const Mesh &mesh,const Heightfield *ter
         visitFaceTriangles(mesh,face,[&](const auto &triangle) {
             for (const auto index : triangle) {
                 const auto &corner = face.corners[index];
+                if (indices)
+                    indices->push_back(corner.vertex);
                 const auto position = mesh.vertices[corner.vertex];
                 const auto direction = corner.normal == Point3{} ? normal : corner.normal;
                 vertices.push_back({position,direction,terrain ? terrain->surfaceColor(position,direction)
@@ -110,7 +119,21 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
     const auto &world = scene.simulation;
     if (scene.foliage.size() != world.terrains.size() || scene.player >= world.bodies.size())
         return false;
-    out << "WORLDFORGE_PLAY 5\n" << world.bodies.size() << ' ' << world.terrains.size() << ' '
+    const bool hasLaunch = std::ranges::any_of(scene.gameplay.behaviors,[](const BehaviorRule &rule) {
+        return rule.action == BehaviorRule::Action::LaunchUpward;
+    });
+    const bool hasRemoteLaunch = std::ranges::any_of(scene.gameplay.behaviors,[](const BehaviorRule &rule) {
+        return !rule.followLaunchTarget;
+    });
+    const bool display = scene.exposure != 0 || scene.viewTransform != color::ViewTransform::AgX || scene.autoExposure
+        || scene.exposureCompensation != 0 || !scene.temporalAntiAliasing || !scene.ambientOcclusion;
+    const int version = display ? 14 : !scene.nativeInstances.empty() ? 13 : !scene.nativeBodies.empty() ? 12
+        : hasRemoteLaunch ? 11 : hasLaunch ? 10 : 9;
+    if (!std::isfinite(scene.exposure) || scene.exposure < color::minimumExposure || scene.exposure > color::maximumExposure
+        || !std::isfinite(scene.exposureCompensation) || std::abs(scene.exposureCompensation) > color::maximumCompensation)
+        return false;
+    out << "WORLDFORGE_PLAY " << version << '\n'
+        << world.bodies.size() << ' ' << world.terrains.size() << ' '
         << world.joints.size() << ' ' << scene.meshes.size() << ' ' << scene.lights.size() << ' '
         << scene.player << ' ' << world.gravity << '\n';
     out << scene.sky << ' ' << scene.fogDensity << ' ' << scene.fogFalloff << ' ' << scene.fogHeight << ' ';
@@ -119,6 +142,10 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
     writeVector(out,scene.fog);
     out << scene.shadows << ' ' << scene.localFogRadius << ' ' << scene.localFogDensity << ' ';
     writeVector(out,scene.localFogCenter);
+    if (version >= 14)
+        out << scene.exposure << ' ' << int(scene.viewTransform) << ' ' << scene.autoExposure << ' '
+            << scene.exposureCompensation << ' ' << scene.temporalAntiAliasing << ' '
+            << scene.ambientOcclusion << ' ';
     out << '\n';
     for (const auto &body : world.bodies) {
         writeVector(out,body.position);
@@ -149,6 +176,7 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
         writeVector(out,light.vector);
         out << light.intensity << ' ' << light.directional << '\n';
     }
+    std::size_t remainingClipSamples = MeshClip::maxSamples*3;
     for (const auto &mesh : scene.meshes) {
         if (mesh.baseColorTexture.size() > MeshMaterial::maxTextureBytes)
             return false;
@@ -158,6 +186,34 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
         if (!mesh.baseColorTexture.empty()) {
             writeBase64(out,mesh.baseColorTexture);
             out << '\n';
+        }
+        out << mesh.advancedSurface << '\n';
+        if (mesh.advancedSurface) {
+            out << mesh.metallic << ' ' << mesh.roughness << ' ';
+            writeVector(out,mesh.emissive);
+            out << '\n';
+            for (const auto &map : mesh.surfaceMaps) {
+                if (map.size() > MeshMaterial::maxTextureBytes)
+                    return false;
+                out << map.size() << '\n';
+                if (!map.empty()) {
+                    writeBase64(out,map);
+                    out << '\n';
+                }
+            }
+        }
+        out << bool(mesh.clip) << '\n';
+        if (mesh.clip) {
+            const auto &clip = *mesh.clip;
+            if (!clip.valid(mesh.vertices.size()) || !mesh.lodVertices.empty() || clip.samples.size() > remainingClipSamples)
+                return false;
+            remainingClipSamples -= clip.samples.size();
+            out << std::quoted(clip.name) << ' ' << clip.framesPerSecond << ' ' << clip.frameCount() << '\n';
+            for (const auto &vertex : clip.samples) {
+                writeVector(out,vertex.position);
+                writeVector(out,vertex.normal);
+                out << '\n';
+            }
         }
         for (const auto *vertices : {&mesh.vertices,&mesh.lodVertices})
             for (const auto &vertex : *vertices) {
@@ -186,12 +242,90 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
         out << vehicle.body << ' ' << vehicle.route << '\n';
     }
     for (const auto &mission : play.missions) {
+        if (!fitsText(mission.name) || !fitsText(mission.goal) || !fitsText(mission.completionText))
+            return false;
         out << std::quoted(mission.name) << ' ' << std::quoted(mission.goal) << ' ';
         writeVector(out,mission.start);
         writeVector(out,mission.waypoint);
         writeVector(out,mission.target);
         out << mission.hasWaypoint << ' ' << mission.startRadius << ' ' << mission.waypointRadius << ' '
-            << mission.targetRadius << '\n';
+            << mission.targetRadius << ' ' << std::quoted(mission.completionText) << '\n';
+    }
+    if (play.beacons.size() > 32)
+        return false;
+    out << play.beacons.size() << '\n';
+    for (const auto &beacon : play.beacons) {
+        if (beacon.mission >= play.missions.size() || !(beacon.seconds >= 0.1f && beacon.seconds <= 15))
+            return false;
+        out << beacon.mission << ' ' << beacon.seconds << ' ';
+        writeVector(out,beacon.position);
+        writeVector(out,beacon.color);
+        out << '\n';
+    }
+    if (play.shots.size() > 32 || play.patrols.size() > 32)
+        return false;
+    out << play.showMissionHud << ' ' << play.shots.size() << ' ' << play.patrols.size() << '\n';
+    for (const auto &shot : play.shots) {
+        if (shot.mission >= play.missions.size() || !(shot.seconds >= 0.1f && shot.seconds <= 15))
+            return false;
+        out << shot.mission << ' ' << shot.seconds << ' ';
+        writeVector(out,shot.first);
+        writeVector(out,shot.last);
+        writeVector(out,shot.target);
+        out << '\n';
+    }
+    for (const auto &patrol : play.patrols) {
+        if (!(patrol.speed >= 0.1f && patrol.speed <= 10 && patrol.wait >= 0 && patrol.wait <= 15))
+            return false;
+        writeVector(out,patrol.start);
+        writeVector(out,patrol.destination);
+        out << patrol.speed << ' ' << patrol.wait << '\n';
+    }
+    if (play.behaviors.size() > 128 || play.behaviorBeacons.size() > 128)
+        return false;
+    out << play.behaviors.size() << ' ' << play.behaviorBeacons.size() << '\n';
+    for (const auto &rule : play.behaviors) {
+        if (!rule.valid(play.missions.size(),world.bodies.size(),play.behaviorBeacons.size())
+            || !rule.validBody(world))
+            return false;
+        out << std::quoted(rule.label) << ' ' << int(rule.event) << ' ' << int(rule.action) << ' '
+            << (rule.mission ? int(*rule.mission) : -1) << ' ' << (rule.requiredMission ? int(*rule.requiredMission) : -1)
+            << ' ' << rule.target << ' ' << rule.amount << ' ';
+        writeVector(out,rule.position);
+        if (version >= 11)
+            out << ' ' << int(rule.followLaunchTarget);
+        out << '\n';
+    }
+    for (const auto &beacon : play.behaviorBeacons) {
+        writeVector(out,beacon.position);
+        writeVector(out,beacon.color);
+        out << '\n';
+    }
+    if (version >= 12) {
+        if (scene.nativeBodies.size() > 256)
+            return false;
+        out << scene.nativeBodies.size() << '\n';
+        for (const auto &binding : scene.nativeBodies) {
+            if (binding.id.empty() || binding.id.size() > 128 || binding.index >= world.bodies.size())
+                return false;
+            out << std::quoted(binding.id) << ' ' << binding.index << '\n';
+        }
+    }
+    if (version >= 13) {
+        if (scene.nativeInstances.size() > 256)
+            return false;
+        out << std::setprecision(std::numeric_limits<double>::max_digits10) << scene.nativeInstances.size() << '\n';
+        for (const auto &instance : scene.nativeInstances) {
+            if (instance.owner.empty() || instance.owner.size() > 128 || instance.type.empty()
+                || instance.type.size() > 64 || instance.properties.size() > 32)
+                return false;
+            out << std::quoted(instance.owner) << ' ' << std::quoted(instance.type) << ' ' << instance.properties.size() << '\n';
+            for (const auto &[id,value] : instance.properties) {
+                if (id.empty() || id.size() > 64 || !value.valid())
+                    return false;
+                out << std::quoted(id) << ' ' << value.kind << ' ' << value.number << ' ' << std::quoted(value.reference) << '\n';
+            }
+        }
     }
     return bool(out);
 }
@@ -204,7 +338,7 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     std::string signature;
     int version;
     std::size_t bodies,terrains,joints,meshes,lights;
-    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 5
+    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 14
         || !(in >> bodies >> terrains >> joints >> meshes >> lights >> scene.player)
         || bodies > 257 || terrains > 256 || joints > 256 || meshes > 4096 || lights > 256 || scene.player >= bodies
         || !readValue(in,world.gravity,0,50) || !(in >> scene.sky)
@@ -215,6 +349,15 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     if (version >= 3 && (!(in >> scene.shadows) || !readValue(in,scene.localFogRadius,0,500)
         || !readValue(in,scene.localFogDensity,0,1) || !readVector(in,scene.localFogCenter,-100000,100000)))
         return {};
+    if (version >= 14) {
+        int transform = 0;
+        if (!readValue(in,scene.exposure,color::minimumExposure,color::maximumExposure) || !(in >> transform)
+            || transform < 0 || transform > 1 || !(in >> scene.autoExposure)
+            || !readValue(in,scene.exposureCompensation,-color::maximumCompensation,color::maximumCompensation)
+            || !(in >> scene.temporalAntiAliasing) || !(in >> scene.ambientOcclusion))
+            return {};
+        scene.viewTransform = color::ViewTransform(transform);
+    }
     world.bodies.resize(bodies);
     for (auto &body : world.bodies) {
         if (!readVector(in,body.position) || !readVector(in,body.halfSize,0.001f,5000000)
@@ -269,6 +412,7 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
             return {};
     scene.meshes.resize(meshes);
     std::size_t remaining = 1500000;
+    std::size_t remainingClipSamples = MeshClip::maxSamples*3;
     for (auto &mesh : scene.meshes) {
         std::size_t count;
         if (!(in >> mesh.body >> count) || mesh.body < -1 || mesh.body >= int(bodies) || count > remaining || count%3)
@@ -287,6 +431,40 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
             if (!(in >> textureBytes) || textureBytes > MeshMaterial::maxTextureBytes
                 || (textureBytes && !readBase64(in,textureBytes,mesh.baseColorTexture)))
                 return {};
+        }
+        if (version >= 7) {
+            if (!(in >> mesh.advancedSurface))
+                return {};
+            if (mesh.advancedSurface) {
+                if (!readValue(in,mesh.metallic,0,1) || !readValue(in,mesh.roughness,0,1)
+                    || !readVector(in,mesh.emissive,0,64))
+                    return {};
+                for (auto &map : mesh.surfaceMaps) {
+                    std::size_t bytes;
+                    if (!(in >> bytes) || bytes > MeshMaterial::maxTextureBytes
+                        || (bytes && !readBase64(in,bytes,map)))
+                        return {};
+                }
+            }
+        }
+        if (version >= 8) {
+            bool animated;
+            if (!(in >> animated))
+                return {};
+            if (animated) {
+                auto &clip = mesh.clip.emplace();
+                std::size_t frames;
+                if (lodCount || !count || !readText(in,clip.name) || clip.name.empty() || clip.name.size() > 128
+                    || !readValue(in,clip.framesPerSecond,1,120) || !(in >> frames) || frames < 2 || frames > MeshClip::maxFrames
+                    || count > std::min(remainingClipSamples,MeshClip::maxSamples)/frames)
+                    return {};
+                clip.vertexCount = count;
+                clip.samples.resize(count*frames);
+                remainingClipSamples -= clip.samples.size();
+                for (auto &vertex : clip.samples)
+                    if (!readVector(in,vertex.position,-1'000'000,1'000'000) || !readVector(in,vertex.normal,-1.01f,1.01f))
+                        return {};
+            }
         }
         mesh.vertices.resize(count);
         mesh.lodVertices.resize(lodCount);
@@ -321,8 +499,103 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
             if (!readText(in,mission.name) || !readText(in,mission.goal) || !readVector(in,mission.start)
                 || !readVector(in,mission.waypoint) || !readVector(in,mission.target) || !(in >> mission.hasWaypoint)
                 || !readValue(in,mission.startRadius,0.1f,100) || !readValue(in,mission.waypointRadius,0.1f,100)
-                || !readValue(in,mission.targetRadius,0.1f,100))
+                || !readValue(in,mission.targetRadius,0.1f,100)
+                || (version >= 6 && !readText(in,mission.completionText)))
                 return {};
+    }
+    if (version >= 6) {
+        auto &play = scene.gameplay;
+        std::size_t count = 0;
+        if (!(in >> count) || count > 32)
+            return {};
+        play.beacons.resize(count);
+        for (auto &beacon : play.beacons)
+            if (!(in >> beacon.mission) || beacon.mission >= play.missions.size()
+                || !readValue(in,beacon.seconds,0.1f,15) || !readVector(in,beacon.position)
+                || !readVector(in,beacon.color,0,1))
+                return {};
+        std::size_t shots = 0, patrols = 0;
+        if (!(in >> play.showMissionHud >> shots >> patrols) || shots > 32 || patrols > 32)
+            return {};
+        play.shots.resize(shots);
+        for (auto &shot : play.shots)
+            if (!(in >> shot.mission) || shot.mission >= play.missions.size()
+                || !readValue(in,shot.seconds,0.1f,15)
+                || !readVector(in,shot.first) || !readVector(in,shot.last) || !readVector(in,shot.target))
+                return {};
+        play.patrols.resize(patrols);
+        for (auto &patrol : play.patrols)
+            if (!readVector(in,patrol.start) || !readVector(in,patrol.destination)
+                || !readValue(in,patrol.speed,0.1f,10) || !readValue(in,patrol.wait,0,15)
+                || patrol.start == patrol.destination)
+                return {};
+    }
+    if (version >= 9) {
+        auto &play = scene.gameplay;
+        std::size_t count, effects;
+        if (!(in >> count >> effects) || count > 128 || effects > 128)
+            return {};
+        play.behaviors.resize(count);
+        for (auto &rule : play.behaviors) {
+            int event, action, mission, required;
+            if (!readText(in,rule.label) || !(in >> event >> action >> mission >> required >> rule.target)
+                || event < 0 || event > 2 || action < 0 || action > (version == 9 ? 1 : 2) || mission < -1 || required < -1
+                || !readValue(in,rule.amount,0.1f,15) || !readVector(in,rule.position))
+                return {};
+            if (version >= 11 && !(in >> rule.followLaunchTarget))
+                return {};
+            rule.event = BehaviorRule::Event(event);
+            rule.action = BehaviorRule::Action(action);
+            if (mission >= 0)
+                rule.mission = std::size_t(mission);
+            if (required >= 0)
+                rule.requiredMission = std::size_t(required);
+            if (!rule.valid(play.missions.size(),bodies,effects)
+                || !rule.validBody(world))
+                return {};
+        }
+        play.behaviorBeacons.resize(effects);
+        for (auto &beacon : play.behaviorBeacons)
+            if (!readVector(in,beacon.position) || !readVector(in,beacon.color,0,1))
+                return {};
+    }
+    if (version >= 12) {
+        std::size_t count;
+        if (!(in >> count) || count > 256)
+            return {};
+        while (count--) {
+            NativeBodyBinding binding;
+            if (!readText(in,binding.id) || binding.id.empty() || binding.id.size() > 128
+                || !(in >> binding.index) || binding.index >= bodies
+                || std::ranges::find(scene.nativeBodies,binding.id,&NativeBodyBinding::id) != scene.nativeBodies.end())
+                return {};
+            scene.nativeBodies.push_back(std::move(binding));
+        }
+    }
+    if (version >= 13) {
+        std::size_t count;
+        if (!(in >> count) || count > 256)
+            return {};
+        while (count--) {
+            NativeInstance instance;
+            std::size_t size;
+            if (!readText(in,instance.owner) || instance.owner.empty() || instance.owner.size() > 128
+                || !readText(in,instance.type) || instance.type.empty() || instance.type.size() > 64
+                || !(in >> size) || size > 32
+                || std::ranges::any_of(scene.nativeInstances,[&](const auto &prior) {
+                    return prior.owner == instance.owner && prior.type == instance.type;
+                }))
+                return {};
+            while (size--) {
+                std::string id;
+                NativePropertyValue value;
+                if (!readText(in,id) || id.empty() || id.size() > 64 || !(in >> value.kind >> value.number)
+                    || !readText(in,value.reference) || !value.valid()
+                    || !instance.properties.emplace(std::move(id),std::move(value)).second)
+                    return {};
+            }
+            scene.nativeInstances.push_back(std::move(instance));
+        }
     }
     in >> std::ws;
     if (!in.eof())

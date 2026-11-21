@@ -50,6 +50,18 @@ WorldAtmosphere readAtmosphere(const QJsonObject &details)
             environment.localFogCenter[i] = float(std::clamp(center.at(i).toDouble(),-100000.0,100000.0));
     environment.localFogRadius = float(std::clamp(details.value("localFogRadius").toDouble(),0.0,500.0));
     environment.localFogDensity = float(std::clamp(details.value("localFogDensity").toDouble(0.10),0.0,1.0));
+    // "ev100" is the authored camera exposure; projects from before photometric units store "exposure" in stops.
+    namespace units = worldforge::color;
+    const double stops = details.contains("ev100") ? units::stopsFromEv100(float(details.value("ev100").toDouble(15)))
+                                                   : details.value("exposure").toDouble();
+    environment.exposure = float(std::clamp(stops,double(units::minimumExposure),double(units::maximumExposure)));
+    environment.autoExposure = details.value("exposureMode").toString() == "Auto";
+    environment.temporalAntiAliasing = details.value("antiAliasing").toString() != "Off";
+    environment.ambientOcclusion = details.value("ambientOcclusion").toBool(true);
+    environment.exposureCompensation = float(std::clamp(details.value("exposureCompensation").toDouble(),
+        -double(units::maximumCompensation),double(units::maximumCompensation)));
+    environment.viewTransform = details.value("viewTransform").toString() == "Standard"
+        ? worldforge::color::ViewTransform::Standard : worldforge::color::ViewTransform::AgX;
     return environment;
 }
 
@@ -58,4 +70,31 @@ QVector3D sunDirection(const WorldAtmosphere &atmosphere)
     constexpr float radians = 0.01745329252f;
     const float azimuth = atmosphere.sunAzimuth*radians, elevation = atmosphere.sunElevation*radians;
     return {std::cos(azimuth)*std::cos(elevation),std::sin(azimuth)*std::cos(elevation),std::sin(elevation)};
+}
+
+float lightUnits(const SceneObject &object)
+{
+    namespace color = worldforge::color;
+    if (object.type == "Directional Light" && object.details.contains("illuminance"))
+        return color::unitsFromLux(std::clamp(object.details.value("illuminance").toDouble(),0.0,maximumIlluminance));
+    if (object.type == "Point Light" && object.details.contains("luminousIntensity"))
+        return color::unitsFromCandela(std::clamp(object.details.value("luminousIntensity").toDouble(),0.0,
+                                                  maximumLuminousIntensity));
+    return float(std::clamp(object.details.value("lightIntensity").toDouble(1),0.0,4.0));
+}
+
+double lightPhotometric(const SceneObject &object)
+{
+    const double units = lightUnits(object);
+    return object.type == "Point Light" ? worldforge::color::candelaFromUnits(float(units))
+                                        : worldforge::color::luxFromUnits(float(units));
+}
+
+void setLightPhotometric(QJsonObject &details,const QString &type,double value)
+{
+    details.remove("lightIntensity");
+    if (type == "Point Light")
+        details.insert("luminousIntensity",std::clamp(value,0.0,maximumLuminousIntensity));
+    else
+        details.insert("illuminance",std::clamp(value,0.0,maximumIlluminance));
 }

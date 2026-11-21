@@ -74,8 +74,12 @@ StudioPublishReview reviewStudioPublish(const Project &project, const MeshAsset 
         review.blocker = tr("The Studio mesh can't be used: %1").arg(QString::fromStdString(problem));
         return review;
     }
+    for (const auto &face : preview.faces)
+        worldforge::visitFaceTriangles(preview,face,[&](const auto &) { ++review.triangles; });
     const auto next = bounds(preview);
     if (asset) {
+        if (!asset->otherUvSets.isEmpty())
+            review.warnings << tr("Check the named UV sets after a topology change. Their layouts may need to be rebuilt.");
         if (const auto current = bounds(asset->evaluated())) {
             bool resized = false;
             for (int axis = 0; axis < 3; ++axis) {
@@ -122,9 +126,9 @@ QString StudioPublishReview::summary() const
     auto text = creating ? tr("Create “%1” and place it in this level?").arg(assetName)
         : tr("Update “%1” in %2?").arg(assetName,
               count(std::size_t(placements.size()), "%1 level placement", "%1 level placements"));
-    text += tr("\n\n%1 · %2 · %3\nYou can undo this edit.")
+    text += tr("\n\n%1 · %2 · %3 · %4\nYou can undo this edit.")
         .arg(count(vertices, "%1 vertex", "%1 vertices"), count(faces, "%1 face", "%1 faces"),
-             count(materials, "%1 material slot", "%1 material slots"));
+             count(triangles, "%1 triangle", "%1 triangles"), count(materials, "%1 material slot", "%1 material slots"));
     if (hasLod)
         text += tr("\nThe mesh has a generated LOD. Review it after publishing.");
     if (!warnings.isEmpty())

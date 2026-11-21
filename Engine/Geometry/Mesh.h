@@ -43,6 +43,11 @@ struct MeshMaterial {
     std::vector<std::uint8_t> normalTexture, metallicRoughnessTexture, occlusionTexture, emissiveTexture;
     Point3 emissive{};
     std::string sharedMaterialId;
+    bool hasAdvancedSurface() const {
+        return metallic != 0 || roughness != 0.65f || emissive != Point3{}
+            || !normalTexture.empty() || !metallicRoughnessTexture.empty()
+            || !occlusionTexture.empty() || !emissiveTexture.empty();
+    }
     auto previewTextures() const {
         return std::array{&baseColorTexture,&normalTexture,&metallicRoughnessTexture,&occlusionTexture,&emissiveTexture};
     }

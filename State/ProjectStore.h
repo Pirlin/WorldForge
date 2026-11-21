@@ -4,6 +4,7 @@
 #include "Engine/Geometry/Mesh.h"
 #include "Engine/Geometry/MeshModifiers.h"
 #include "Engine/Geometry/MeshUv.h"
+#include "Engine/World/Gameplay.h"
 
 #include <QHash>
 #include <QJsonObject>
@@ -15,6 +16,9 @@
 #include <QUndoStack>
 #include <QVector3D>
 #include <set>
+
+struct StudioMeshData;
+namespace worldforge { struct MeshClip; }
 
 struct SceneObject {
     QString id;
@@ -59,9 +63,68 @@ struct MeshAsset {
     worldforge::UvPins uvPins;
     QJsonObject revolveProfile;
     QString studioSourceHash;
+    QSharedPointer<const worldforge::MeshClip> clip;
     const worldforge::Mesh &evaluated() const { return evaluatedMesh ? *evaluatedMesh : *mesh; }
     bool operator==(const MeshAsset &) const = default;
 };
+
+struct ProjectTexture {
+    QString name;
+    QString fileName;
+    int width = 0;
+    int height = 0;
+    QByteArray image;
+    QString sourcePath;
+    bool operator==(const ProjectTexture &) const = default;
+};
+
+struct TextureReimport {
+    QString projectId, id;
+    ProjectTexture before, after;
+};
+
+struct MeshReimport {
+    QString projectId;
+    MeshAsset before, after;
+};
+
+struct ProjectMaterial {
+    QString name;
+    QString textureId;
+    std::array<float,4> tint{1,1,1,1};
+    // Normal, metallic-roughness, occlusion, emissive.
+    std::array<QString,4> maps;
+    float metallic = 0;
+    float roughness = 0.65f;
+    float emission = 1;
+    bool operator==(const ProjectMaterial &) const = default;
+};
+
+struct SurfaceLibrary {
+    QMap<QString,ProjectTexture> textures;
+    QMap<QString,ProjectMaterial> materials;
+    bool empty() const { return textures.isEmpty() && materials.isEmpty(); }
+    bool operator==(const SurfaceLibrary &) const = default;
+};
+
+struct ProjectBehavior {
+    QString name;
+    worldforge::BehaviorRule::Event event = worldforge::BehaviorRule::Event::PlayStarted;
+    worldforge::BehaviorRule::Action action = worldforge::BehaviorRule::Action::PulseBeacon;
+    QString mission, requiredMission;
+    float amount = 2;
+    bool operator==(const ProjectBehavior &) const = default;
+};
+
+struct BehaviorComponent {
+    QString assetId;
+    bool enabled = true;
+    QString targetId;
+    std::optional<float> amount;
+    bool operator==(const BehaviorComponent &) const = default;
+};
+
+QList<BehaviorComponent> behaviorComponents(const SceneObject &object);
 
 struct Project {
     QString id;
@@ -70,6 +133,8 @@ struct Project {
     std::optional<worldforge::SceneDocument> scene;
     QMap<QString, MeshAsset> assets;
     QJsonObject configuration;
+    SurfaceLibrary surfaces;
+    QMap<QString,ProjectBehavior> behaviors;
 };
 
 class ProjectStore : public QObject {
@@ -82,6 +147,7 @@ public:
     const SceneObject *selectedObject() const;
     const SceneObject *object(const QString &id) const;
     const QString &selection() const { return selection_; }
+    QString nativeGameplayPath() const;
     QUndoStack &history() { return history_; }
     bool isDirty() const { return dirty_; }
     QString loadError() const { return loadError_; }
@@ -120,18 +186,29 @@ public:
     bool reimportMesh(QString &error, bool replaceLocalEdits = false);
     bool publishStudioMesh(const QString &assetId, const QByteArray &glb,
                            const worldforge::Mesh *expected, QString &error,
-                           const QByteArray &studioSource = {});
-    bool createStudioMesh(const QString &name, worldforge::Mesh mesh, const QByteArray &studioSource, QString &error);
+                           const QByteArray &studioSource = {},const QByteArray &uvManifest = {},const QByteArray &clipData = {});
+    bool createStudioMesh(const QString &name, worldforge::Mesh mesh, const QByteArray &studioSource, QString &error,
+                          const StudioMeshData *studio = nullptr);
+    QByteArray exportStudioInput(const MeshAsset &asset,QString &error) const;
     QString studioSourcePath(const MeshAsset &asset) const;
     bool updateMesh(const QString &id, worldforge::Mesh mesh, const QString &label, QString &error,
                     const worldforge::Mesh *expected = nullptr,
                     std::optional<std::set<worldforge::MeshEdge>> seams = {},
-                    const QString &studioSourceHash = {}, const SceneObject *placement = nullptr);
+                    const QString &studioSourceHash = {}, const SceneObject *placement = nullptr,
+                    const StudioMeshData *studio = nullptr);
     // Publishes a staged Studio mesh and adds one placement of it as a single undoable edit.
     bool publishStudioMeshWithPlacement(const QString &assetId, const worldforge::Mesh *expected,
                                         worldforge::Mesh mesh, const QByteArray &studioSource,
                                         const SceneObject &placement, const QString &label, QString &error);
     bool linkMaterialSlot(const QString &target,int targetSlot,const QString &source,int sourceSlot,QString &error);
+    QString importProjectTexture(const QString &path,QString &error);
+    std::optional<TextureReimport> previewTextureReimport(const QString &id,const QString &path,QString &error) const;
+    std::optional<MeshReimport> previewMeshReimport(const QString &id,const QString &path,QString &error) const;
+    bool applyTextureReimport(const TextureReimport &preview,QString &error);
+    bool applyMeshReimport(const MeshReimport &preview,bool replaceLocalEdits,QString &error);
+    QString saveProjectMaterial(const QString &id,const ProjectMaterial &material,QString &error);
+    bool assignProjectMaterial(const QString &materialId,const QString &meshId,int slot,QString &error);
+    bool preserveProjectMaterials(const QString &meshId,worldforge::Mesh &mesh,QString &error) const;
     bool transformMeshComponents(const QMap<QString,std::set<int>> &selection,
         const QMatrix4x4 &worldTransform,QString &error);
     bool setMirrorX(bool enabled, QString &error);
@@ -143,6 +220,10 @@ public:
     void updateObject(const SceneObject &object, const QString &action);
     // Replaces several objects by ID as one undoable edit.
     bool updateObjects(const QList<SceneObject> &objects, const QString &action, QString &error);
+    QString saveBehavior(const QString &id,const ProjectBehavior &behavior,QString &error);
+    bool attachBehavior(const QString &objectId,const QString &behaviorId,QString &error);
+    bool setBehaviorComponents(const QString &objectId,const QList<BehaviorComponent> &components,QString &error);
+    bool setNativeComponent(const QString &objectId,const QString &type,std::optional<QJsonObject> component,QString &error);
     bool reparentObject(const QString &childId,const QString &parentId,QString &error);
     QMatrix4x4 worldMatrix(const QString &id) const;
     QMatrix4x4 parentMatrix(const SceneObject &object) const;
@@ -153,6 +234,7 @@ public:
     bool save(QString *error);
 
 signals:
+    void nativeGameplayChanged();
     void projectsChanged();
     void sceneChanged();
     void selectionChanged();
@@ -162,12 +244,14 @@ signals:
 private:
     void pushSceneEdit(const QList<SceneObject> &objects, const QString &selection, const QString &label);
     bool addMesh(worldforge::Mesh mesh,const QString &name,QString &error,const SceneObject *basis = nullptr,
-        const QJsonObject &profile = {}, const QString &studioSourceHash = {});
+        const QJsonObject &profile = {}, const QString &studioSourceHash = {},const StudioMeshData *studio = nullptr);
     bool storeStudioSource(const QByteArray &source, QString &hash, QString &error);
     bool pushProjectEdit(const QList<SceneObject> &objects,const QMap<QString,MeshAsset> &assets,
-                         const QString &selection,const QString &label,QString *error = nullptr);
+                         const QString &selection,const QString &label,QString *error = nullptr,
+                         const SurfaceLibrary *surfaces = nullptr,const QString &authoritativeUvAsset = {},
+                         const QMap<QString,ProjectBehavior> *behaviors = nullptr);
     bool applyScene(const QList<SceneObject> &objects, const QMap<QString, MeshAsset> &assets,
-                    const QString &selection);
+                    const QString &selection,const SurfaceLibrary &surfaces,const QMap<QString,ProjectBehavior> &behaviors);
     void activateProject(const QString &id);
     void setDirty(bool dirty);
     bool validName(const QString &name, const QString &ignoreId = {}) const;

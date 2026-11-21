@@ -15,6 +15,7 @@ public:
     bool isRunning() const;
     bool showWorkspace(const QString &workspace);
     bool prepareAsset(const QByteArray &glb,const QString &source);
+    bool closeForAssetSwitch();
     void clearAsset();
     QString stagedRevision() const;
     // The first installed WorldForgeStudio.exe, or an empty string when none is found.

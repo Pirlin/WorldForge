@@ -1,4 +1,7 @@
 #include "State/GlbImport.h"
+#include "Engine/Geometry/MeshClip.h"
+#include "State/StudioClip.h"
+#include "Engine/Render/ColorPipeline.h"
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -7,6 +10,7 @@
 #include <QObject>
 #include <QQuaternion>
 #include <QSet>
+#include <QStringList>
 #include <QtEndian>
 
 #include <bit>
@@ -86,7 +90,31 @@ struct Accessor {
 
 class Importer {
 public:
-    Importer(QJsonObject json, QByteArrayView bytes) : json_(std::move(json)), bin_(bytes) {}
+    Importer(QJsonObject json,QByteArrayView bytes,const QByteArray &uvManifest,GlbUvLayers &layers,GlbMotion *motion)
+        : json_(std::move(json)),bin_(bytes),layers_(layers),motion_(motion)
+    {
+        if (uvManifest.isEmpty())
+            return;
+        const auto manifest = QJsonDocument::fromJson(uvManifest).object();
+        const auto names = manifest.value("names").toArray();
+        require(uvManifest.size() <= 8192 && manifest.value("version").toInt() == 1
+                && manifest.value("names").isArray() && names.size() <= 8,
+                QStringLiteral("Studio UV manifest is invalid."));
+        activeUv_ = integer(manifest.value("render"),0);
+        require(activeUv_ < std::max<qsizetype>(1,names.size()),QStringLiteral("Studio render UV index is invalid."));
+        for (const auto &value : names) {
+            const auto name = value.toString();
+            require(!name.trimmed().isEmpty() && name.size() <= 64 && !uvNames_.contains(name),
+                    QStringLiteral("Studio UV layers must have unique names of up to 64 characters."));
+            uvNames_.append(name);
+        }
+        if (!uvNames_.isEmpty()) {
+            layers_.active = uvNames_.at(activeUv_);
+            for (const auto &name : uvNames_)
+                if (name != layers_.active)
+                    layers_.other.insert(name,{});
+        }
+    }
 
     wf::Mesh run()
     {
@@ -106,6 +134,9 @@ public:
             auto &slot = mesh_.materials.emplace_back(wf::MeshMaterial{material.value("name").toString("Material").toStdString(),
                 vector<4>(pbr.value("baseColorFactor"), {1,1,1,1}),
                 float(pbr.value("metallicFactor").toDouble(1)), float(pbr.value("roughnessFactor").toDouble(1))});
+            // glTF stores a linear base color factor; WorldForge material colors are sRGB-encoded.
+            for (int channel = 0; channel < 3; ++channel)
+                slot.color[channel] = wf::color::linearToSrgb(slot.color[channel]);
             slot.emissive = vector<3>(material.value("emissiveFactor"));
             const QJsonObject fields[]{pbr.value("baseColorTexture").toObject(),material.value("normalTexture").toObject(),
                 pbr.value("metallicRoughnessTexture").toObject(),material.value("occlusionTexture").toObject(),
@@ -120,13 +151,31 @@ public:
             visit(integer(node), QMatrix4x4(), 0);
         const auto error = wf::validateMesh(mesh_);
         require(error.empty(), QString::fromStdString(error));
+        if (motion_) {
+            const auto &source = motion_->source;
+            require(motionIndices_.size() == mesh_.vertices.size()
+                && motionIndices_.size() <= wf::MeshClip::maxSamples/source.frameCount(),
+                QStringLiteral("The animated mesh exceeds the vertex sample budget."));
+            auto mapped = QSharedPointer<wf::MeshClip>::create();
+            mapped->name = source.name;
+            mapped->framesPerSecond = source.framesPerSecond;
+            mapped->vertexCount = mesh_.vertices.size();
+            mapped->samples.reserve(source.frameCount()*mapped->vertexCount);
+            for (std::size_t frame = 0; frame < source.frameCount(); ++frame)
+                for (const auto vertex : motionIndices_)
+                    mapped->samples.push_back(source.samples[frame*source.vertexCount+vertex]);
+            motion_->mapped = std::move(mapped);
+        }
         return std::move(mesh_);
     }
 
 private:
     void readTexture(std::vector<std::uint8_t> &channel,const QJsonObject &color)
     {
-        if (integer(color.value("texCoord"),0) != 0 || color.contains("extensions"))
+        const auto uv = integer(color.value("texCoord"),0);
+        if (!uvNames_.isEmpty())
+            require(uv == activeUv_,QStringLiteral("Studio textures must use the render UV layer for this exchange."));
+        if (uv != activeUv_ || color.contains("extensions"))
             return;
         const auto texture = entry(json_.value("textures").toArray(),integer(color.value("index")));
         if (!texture.contains("source"))
@@ -208,17 +257,26 @@ private:
         require(positions.type == 5126 && !positions.normalized && positions.count <= limit
                 && mesh_.vertices.size() + positions.count <= limit,
                 QStringLiteral("GLB position accessor must use float triples within the geometry limit."));
-        std::optional<Accessor> normals, uvs, indices;
+        std::optional<Accessor> normals, indices;
+        std::array<std::optional<Accessor>,8> uvs;
+        std::array<std::vector<wf::Point2> *,8> other{};
         if (attributes.contains("NORMAL")) {
             normals = accessor(integer(attributes.value("NORMAL")), "VEC3", 3);
             require(normals->type == 5126 && !normals->normalized && normals->count == positions.count,
                     QStringLiteral("GLB normals must match the position count."));
         }
-        if (attributes.contains("TEXCOORD_0")) {
-            uvs = accessor(integer(attributes.value("TEXCOORD_0")), "VEC2", 2);
-            require(uvs->count == positions.count && ((uvs->type == 5126 && !uvs->normalized)
-                    || (uvs->normalized && (uvs->type == 5121 || uvs->type == 5123))),
+        for (int i = 0; i < std::max<qsizetype>(1,uvNames_.size()); ++i) {
+            const auto key = QStringLiteral("TEXCOORD_%1").arg(i);
+            if (!attributes.contains(key)) {
+                require(uvNames_.isEmpty(),QStringLiteral("The staged mesh is missing a named UV layer."));
+                continue;
+            }
+            auto &uv = uvs[i].emplace(accessor(integer(attributes.value(key)), "VEC2", 2));
+            require(uv.count == positions.count && ((uv.type == 5126 && !uv.normalized)
+                    || (uv.normalized && (uv.type == 5121 || uv.type == 5123))),
                     QStringLiteral("GLB UVs have an invalid type or count."));
+            if (i != activeUv_)
+                other[i] = &layers_.other[uvNames_.at(i)];
         }
         if (primitive.contains("indices")) {
             indices = accessor(integer(primitive.value("indices")), "SCALAR", 1);
@@ -227,6 +285,8 @@ private:
         const int count = indices ? indices->count : positions.count;
         require(count % 3 == 0 && mesh_.faces.size() + count/3 <= limit,
                 QStringLiteral("GLB index count does not describe complete triangles within the geometry limit."));
+        require(layers_.other.size() * (qsizetype(mesh_.faces.size())*3 + count) <= 4'000'000,
+                QStringLiteral("The named UV layers exceed the Studio exchange limit."));
         const auto material = qint64(integer(primitive.value("material"))) + 1;
         require(material >= 0 && std::size_t(material) < mesh_.materials.size(), QStringLiteral("GLB material is missing."));
         const auto determinant = matrix.determinant();
@@ -234,8 +294,27 @@ private:
                 QStringLiteral("GLB mesh node transform must be finite, affine, and invertible."));
         const auto normalMatrix = matrix.normalMatrix();
         const auto firstVertex = wf::VertexIndex(mesh_.vertices.size());
-        for (int i = 0; i < positions.count; ++i)
-            mesh_.vertices.push_back(zUp(matrix.map(QVector3D(positions.value(i, 0), positions.value(i, 1), positions.value(i, 2)))));
+        std::optional<Accessor> vertexMap;
+        if (motion_) {
+            vertexMap = accessor(integer(attributes.value("_WORLDFORGE_VERTEX")), "SCALAR", 1);
+            require(vertexMap->type == 5126 && !vertexMap->normalized && vertexMap->count == positions.count,
+                    QStringLiteral("The animated GLB has an invalid vertex map."));
+        }
+        for (int i = 0; i < positions.count; ++i) {
+            const auto position = zUp(matrix.map(QVector3D(positions.value(i,0),positions.value(i,1),positions.value(i,2))));
+            mesh_.vertices.push_back(position);
+            if (vertexMap) {
+                const auto raw = vertexMap->value(i,0);
+                require(raw >= 0 && raw < float(motion_->source.vertexCount) && raw == std::floor(raw),
+                        QStringLiteral("The animated GLB references a missing rig vertex."));
+                const auto index = std::size_t(raw);
+                const auto &reference = motion_->source.samples[index].position;
+                for (int axis = 0; axis < 3; ++axis)
+                    require(std::abs(reference[axis]-position[axis]) <= 0.001f+std::abs(reference[axis])*0.00001f,
+                            QStringLiteral("The animated GLB's first pose does not match its mesh."));
+                motionIndices_.push_back(index);
+            }
+        }
         for (int i = 0; i < count; i += 3) {
             wf::MeshFace face;
             face.material = std::uint32_t(material);
@@ -244,8 +323,18 @@ private:
                 const auto vertex = indices ? indices->index(offset) : quint32(offset);
                 require(vertex < quint32(positions.count), QStringLiteral("GLB triangle index is out of bounds."));
                 wf::MeshCorner corner{firstVertex + vertex};
-                if (uvs)
-                    corner.uv = {uvs->value(vertex, 0), 1.0f - uvs->value(vertex, 1)};
+                for (std::size_t channel = 0; channel < uvs.size(); ++channel) {
+                    if (!uvs[channel])
+                        continue;
+                    const wf::Point2 uv{uvs[channel]->value(vertex,0),1.0f-uvs[channel]->value(vertex,1)};
+                    require(std::isfinite(uv[0]) && std::isfinite(uv[1])
+                        && (uvNames_.isEmpty() || (std::abs(uv[0]) <= 1000 && std::abs(uv[1]) <= 1000)),
+                        QStringLiteral("GLB has a UV coordinate outside the supported range."));
+                    if (other[channel])
+                        other[channel]->push_back(uv);
+                    else
+                        corner.uv = uv;
+                }
                 if (normals) {
                     const QVector3D source(normals->value(vertex, 0), normals->value(vertex, 1), normals->value(vertex, 2));
                     QVector3D n;
@@ -262,11 +351,17 @@ private:
     QJsonObject json_;
     QByteArrayView bin_;
     QSet<int> visited_;
+    GlbUvLayers &layers_;
+    QStringList uvNames_;
+    int activeUv_ = 0;
+    GlbMotion *motion_;
+    std::vector<std::size_t> motionIndices_;
     wf::Mesh mesh_;
 };
 }
 
-std::optional<worldforge::Mesh> importGlb(const QByteArray &bytes, QString &error)
+std::optional<worldforge::Mesh> importGlb(const QByteArray &bytes,QString &error,const QByteArray &uvManifest,
+                                         GlbUvLayers *uvLayers,GlbMotion *motion)
 {
     try {
         require(bytes.size() >= 20 && bytes.size() <= 64*1024*1024, QStringLiteral("GLB is empty or exceeds 64 MiB."));
@@ -283,14 +378,43 @@ std::optional<worldforge::Mesh> importGlb(const QByteArray &bytes, QString &erro
         require(u32(binaryHeader + 4) == 0x004E4942 && binarySize % 4 == 0
                 && binarySize <= quint32(bytes.size() - binaryHeader - 8), QStringLiteral("GLB binary chunk is invalid."));
         error.clear();
-        return Importer(json.object(), QByteArrayView(bytes.constData() + binaryHeader + 8, binarySize)).run();
+        GlbUvLayers layers;
+        require(!motion || motion->source.valid(motion->source.vertexCount),QStringLiteral("The Studio clip is invalid."));
+        auto mesh = Importer(json.object(),QByteArrayView(bytes.constData()+binaryHeader+8,binarySize),uvManifest,layers,motion).run();
+        if (uvLayers)
+            *uvLayers = std::move(layers);
+        return mesh;
     } catch (const QString &message) {
         error = message;
         return std::nullopt;
     }
 }
 
-QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &error,bool studioTopology)
+std::optional<worldforge::Mesh> importStudioGlb(const QByteArray &bytes,const QByteArray &uvManifest,
+    const QByteArray &clipData,StudioMeshData &data,QString &error)
+{
+    GlbUvLayers layers;
+    std::optional<wf::Mesh> mesh;
+    data = {};
+    if (clipData.isEmpty()) {
+        mesh = importGlb(bytes,error,uvManifest,&layers);
+    } else {
+        const auto clip = readStudioClip(clipData);
+        if (!clip) {
+            error = QObject::tr("The staged animation clip is corrupt or exceeds the supported sample budget.");
+            return {};
+        }
+        GlbMotion motion{*clip,{}};
+        mesh = importGlb(bytes,error,uvManifest,&layers,&motion);
+        data.clip = std::move(motion.mapped);
+    }
+    if (mesh && !uvManifest.isEmpty())
+        data.uvs = std::move(layers);
+    return mesh;
+}
+
+QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &error,bool studioTopology,
+                     const GlbUvLayers &uvLayers)
 {
     constexpr qsizetype maxBytes = 64*1024*1024;
     error = QString::fromStdString(wf::validateMesh(mesh));
@@ -347,8 +471,10 @@ QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &e
     QJsonArray views, accessors, entries, materials, images, textures;
     for (const auto &mat : mesh.materials) {
         QJsonArray rgba;
-        for (const auto channel : mat.color)
-            rgba.append(double(std::clamp(channel,0.0f,1.0f)));
+        for (int channel = 0; channel < 4; ++channel) {
+            const float value = std::clamp(mat.color[channel],0.0f,1.0f);
+            rgba.append(double(channel < 3 ? wf::color::srgbToLinear(value) : value));
+        }
         QJsonObject pbr{{"baseColorFactor",rgba},{"metallicFactor",std::clamp(mat.metallic,0.0f,1.0f)},
             {"roughnessFactor",std::clamp(mat.roughness,0.0f,1.0f)}};
         QJsonObject material{{"name",QString::fromStdString(mat.name)},
@@ -422,7 +548,15 @@ QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &e
                     corner.normal[0],corner.normal[1],corner.normal[2]});
             faces.append(QJsonArray{int(face.material),corners});
         }
-        const auto topology = QJsonDocument(QJsonObject{{"vertices",positions},{"faces",faces}}).toJson(QJsonDocument::Compact);
+        QJsonArray layers;
+        for (auto it = uvLayers.other.cbegin(); it != uvLayers.other.cend(); ++it) {
+            QJsonArray coordinates;
+            for (const auto &uv : it.value())
+                coordinates.append(QJsonArray{uv[0],uv[1]});
+            layers.append(QJsonObject{{"name",it.key()},{"coordinates",coordinates}});
+        }
+        const auto topology = QJsonDocument(QJsonObject{{"vertices",positions},{"faces",faces},
+            {"activeUv",uvLayers.active},{"uvLayers",layers}}).toJson(QJsonDocument::Compact);
         meshEntry.insert("extras",QJsonObject{{"worldforgeTopology",QString::fromUtf8(topology)}});
     }
     QJsonObject document{{"asset",QJsonObject{{"version","2.0"},{"generator","WorldForge"}}},{"scene",0},

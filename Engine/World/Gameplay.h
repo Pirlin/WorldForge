@@ -33,12 +33,61 @@ struct Mission {
     float waypointRadius = 2;
     float targetRadius = 1.6f;
     State state = State::Waiting;
+    std::string completionText;
+};
+
+struct MissionBeacon {
+    std::size_t mission = 0;
+    Point3 position{};
+    Point3 color{1.0f, 0.65f, 0.15f};
+    float seconds = 2.0f;
+    float remaining = 0;
+    bool triggered = false;
+};
+
+struct MissionShot {
+    std::size_t mission = 0;
+    Point3 first{}, last{}, target{};
+    float seconds = 2;
+    float remaining = 0;
+    bool triggered = false;
+};
+
+struct NpcPatrol {
+    enum class State { Walking, Waiting, Returning };
+    Point3 start{}, destination{}, position{};
+    float speed = 2, wait = 1, remaining = 0;
+    State state = State::Walking;
+    bool resumed = false;
+};
+
+struct BehaviorRule {
+    enum class Event { PlayStarted, MissionCompleted, InteractNearby };
+    enum class Action { PulseBeacon, RaiseObject, LaunchUpward };
+    enum class Result { Waiting, ConditionFailed, Fired };
+    std::string label;
+    Event event = Event::PlayStarted;
+    Action action = Action::PulseBeacon;
+    std::optional<std::size_t> mission, requiredMission;
+    std::size_t target = 0;
+    Point3 position{};
+    float amount = 2;
+    Result result = Result::Waiting;
+    bool followLaunchTarget = true;
+    bool valid(std::size_t missions,std::size_t bodies,std::size_t beacons) const;
+    bool validBody(const WorldSimulation &world) const;
 };
 
 struct Gameplay {
     std::vector<TrafficRoute> routes;
     std::vector<TrafficVehicle> vehicles;
     std::vector<Mission> missions;
+    std::vector<MissionBeacon> beacons;
+    std::vector<MissionShot> shots;
+    std::vector<NpcPatrol> patrols;
+    std::vector<BehaviorRule> behaviors;
+    std::vector<MissionBeacon> behaviorBeacons;
+    bool showMissionHud = true;
 
     // Puts vehicles on their routes and sets the bodies they drive.
     void start(WorldSimulation &world);
@@ -50,7 +99,21 @@ struct Gameplay {
     std::optional<Point3> missionTarget() const;
     // True once every vehicle has completed at least one lap.
     bool trafficLooped() const;
+    const MissionShot *activeShot() const;
+    bool movesBody(std::size_t body) const;
     bool empty() const { return routes.empty() && missions.empty(); }
+};
+
+Mesh makeBeaconMesh(const MissionBeacon &beacon);
+Mesh makePatrolMesh(const NpcPatrol &patrol);
+Point3 shotPosition(const MissionShot &shot,float progress);
+
+struct GameplayTrace {
+    bool beaconActive = false, beaconEnded = false;
+    bool shotActive = false, shotEnded = false;
+    bool patrolWaited = false, patrolReturned = false;
+    void observe(const Gameplay &gameplay);
+    bool complete(const Gameplay &gameplay) const;
 };
 
 // Drives the player through the active mission for automated checks: walks the planned path to each

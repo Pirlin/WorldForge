@@ -1,10 +1,13 @@
 #include "State/WorldRuntime.h"
+#include "State/NativeComponents.h"
 #include "State/WorldScene.h"
 #include "Engine/World/PlayableScene.h"
 
 #include <QMatrix4x4>
 #include <QJsonArray>
 #include <QQuaternion>
+#include <QDebug>
+#include <QFileInfo>
 #include <algorithm>
 #include <cmath>
 
@@ -17,15 +20,40 @@ QQuaternion rotationOf(const worldforge::BoxBody &body)
     const auto &q = body.rotation;
     return {q[3],q[0],q[1],q[2]};
 }
+void logNative(std::string_view message) noexcept
+{
+    qInfo().noquote() << "C++ gameplay ·" << QString::fromUtf8(message.data(),qsizetype(message.size()));
+}
+// The Player reads gameplay text up to 160 UTF-8 bytes. Shorten by bytes, ending on a character boundary.
+std::string utf8Text(const QString &text,qsizetype maxBytes)
+{
+    auto bytes = text.toUtf8();
+    if (bytes.size() > maxBytes) {
+        auto end = maxBytes;
+        while (end > 0 && (quint8(bytes[end]) & 0xc0) == 0x80)
+            --end;
+        bytes.truncate(end);
+    }
+    return bytes.toStdString();
+}
+constexpr qsizetype missionTextBytes = 120;
+std::string missionName(const SceneObject &object)
+{
+    return utf8Text(object.details.value("mission").toString(),missionTextBytes);
+}
 }
 
-bool WorldRuntime::start(const ProjectStore &store, bool play)
+bool WorldRuntime::start(const ProjectStore &store, bool play, bool enableNative)
 {
     const auto *project = store.project();
     if (!project)
         return false;
+    stopNative();
     simulation_ = {};
+    clipTime_ = 0;
     bindings_.clear();
+    nativeBodies_.clear();
+    nativeInstances_.clear();
     player_.reset();
     clearInput();
     objects_ = project->objects;
@@ -89,6 +117,7 @@ bool WorldRuntime::start(const ProjectStore &store, bool play)
         for (auto &axis : half)
             axis = std::max(axis,0.025f);
         bindings_.insert(object.id,{simulation_.bodies.size(),center});
+        nativeBodies_.push_back({object.id.toStdString(),simulation_.bodies.size()});
         const auto q = QQuaternion::fromEulerAngles(object.rotation);
         worldforge::BoxBody collider{point(object.position+q.rotatedVector(center)),half,{},
             float(std::clamp(object.details.value("bounce").toDouble(),0.0,1.0)),body == "Dynamic"};
@@ -128,13 +157,41 @@ bool WorldRuntime::start(const ProjectStore &store, bool play)
         simulation_.bodies.back().friction = 0.05f;
         simulation_.bodies.back().shape = worldforge::BoxBody::Shape::Capsule;
     }
-    buildGameplay();
+    buildGameplay(project->behaviors);
+    behaviorResults_.assign(gameplay_.behaviors.size(),worldforge::BehaviorRule::Result::Waiting);
+    const auto module = store.nativeGameplayPath();
+    if (play && enableNative) {
+        QString error;
+        if (collectNativeInstances(store,nativeInstances_,error)) {
+            if (QFileInfo::exists(module))
+                stageNative(module,error);
+            else if (!nativeInstances_.empty())
+                error = QObject::tr("Build and activate the project's C++ gameplay module to run its native components.");
+        }
+        if (!error.isEmpty())
+            qWarning().noquote() << error;
+    }
     return true;
 }
 
-void WorldRuntime::buildGameplay()
+bool WorldRuntime::stageNative(const QString &path,QString &error)
+{
+    std::string detail;
+    if (native_.stage(std::filesystem::path(path.toStdWString()),detail,nativeInstances_))
+        return true;
+    error = QString::fromStdString(detail);
+    return false;
+}
+
+void WorldRuntime::stopNative()
+{
+    native_.stop(simulation_,nativeBodies_,player_,logNative);
+}
+
+void WorldRuntime::buildGameplay(const QMap<QString,ProjectBehavior> &behaviors)
 {
     gameplay_ = {};
+    gameplayErrors_.clear();
     QHash<QString,std::size_t> routes;
     for (const auto &object : objects_) {
         if (!object.visible || object.details.value("gameplay").toString() != "trafficRoute")
@@ -167,15 +224,18 @@ void WorldRuntime::buildGameplay()
     QMap<QString,worldforge::Mission> missions;
     for (const auto &object : objects_) {
         const auto role = object.details.value("gameplay").toString();
-        const auto name = object.details.value("mission").toString().left(120);
-        if (!object.visible || name.isEmpty() || !role.startsWith("mission"))
+        const auto name = missionName(object);
+        if (!object.visible || name.empty() || !role.startsWith("mission"))
             continue;
-        auto &mission = missions[name];
-        mission.name = name.toStdString();
+        auto &mission = missions[QString::fromStdString(name)];
+        mission.name = name;
         const auto radius = float(std::clamp(object.details.value("radius").toDouble(0),0.0,50.0));
         if (role == "missionStart") {
             mission.start = point(object.position);
-            mission.goal = object.details.value("goal").toString().left(120).toStdString();
+            mission.goal = utf8Text(object.details.value("goal").toString(),missionTextBytes);
+            mission.completionText = utf8Text(object.details.value("completionText").toString(),150);
+            if (object.details.contains("showMissionHud"))
+                gameplay_.showMissionHud = object.details.value("showMissionHud").toBool(true);
             if (radius > 0)
                 mission.startRadius = radius;
         } else if (role == "missionWaypoint") {
@@ -192,6 +252,147 @@ void WorldRuntime::buildGameplay()
     for (const auto &mission : missions)
         if (gameplay_.missions.size() < 32)
             gameplay_.missions.push_back(mission);
+    const auto visibleTarget = [this](const QString &id) -> const SceneObject * {
+        const auto found = std::ranges::find(objects_,id,&SceneObject::id);
+        return found != objects_.end() && found->visible ? &*found : nullptr;
+    };
+    for (const auto &object : objects_) {
+        if (!object.visible)
+            continue;
+        const auto waypointId = object.details.value("patrolWaypoint").toString();
+        if (const auto *waypoint = visibleTarget(waypointId);
+            waypoint && waypoint->position != object.position && gameplay_.patrols.size() < 32) {
+            gameplay_.patrols.push_back({point(object.position),point(waypoint->position),{},
+                float(std::clamp(object.details.value("patrolSpeed").toDouble(2),0.1,10.0)),
+                float(std::clamp(object.details.value("patrolWait").toDouble(1),0.0,15.0))});
+        } else if (!waypointId.isEmpty()) {
+            gameplayErrors_ << QObject::tr("%1 has a missing, hidden, or invalid patrol waypoint. Check the AI workspace.").arg(object.name);
+        }
+        if (object.details.value("gameplay").toString() != "missionStart")
+            continue;
+        const auto mission = std::ranges::find(gameplay_.missions,missionName(object),&worldforge::Mission::name);
+        if (mission == gameplay_.missions.end())
+            continue;
+        const auto index = std::size_t(mission-gameplay_.missions.begin());
+        const auto focusId = object.details.value("shotTarget").toString();
+        if (const auto *focus = visibleTarget(focusId);
+            focus && gameplay_.shots.size() < 32) {
+            const auto origin = focus->position + QVector3D(0,0,1.2f);
+            const auto offset = [&](const char *key,QVector3D fallback) {
+                const auto values = object.details.value(QLatin1String(key)).toArray();
+                return values.size() == 3
+                    ? QVector3D(float(values.at(0).toDouble()),float(values.at(1).toDouble()),float(values.at(2).toDouble()))
+                    : fallback;
+            };
+            const auto first = origin+offset("shotFirst",{3,-4,1.2f});
+            const auto last = origin+offset("shotLast",{-2,-3,1.1f});
+            const auto seconds = float(std::clamp(object.details.value("shotSeconds").toDouble(2),0.1,15.0));
+            if (first.z() >= origin.z()+0.0999f && last.z() >= origin.z()+0.0999f)
+                gameplay_.shots.push_back({index,point(first),point(last),point(origin),seconds});
+            else
+                gameplayErrors_ << QObject::tr("%1 has an invalid camera key. Check the Cinematic workspace.").arg(object.name);
+        } else if (!focusId.isEmpty()) {
+            gameplayErrors_ << QObject::tr("%1 has a missing or hidden camera target. Check the Cinematic workspace.").arg(object.name);
+        }
+        const auto targetId = object.details.value("completionBeacon").toString();
+        const auto *target = visibleTarget(targetId);
+        if (!target || gameplay_.beacons.size() >= 32) {
+            if (!targetId.isEmpty())
+                gameplayErrors_ << QObject::tr("%1 has a missing or hidden beacon target. Check the Programming workspace.").arg(object.name);
+            continue;
+        }
+        worldforge::MissionBeacon beacon;
+        beacon.mission = index;
+        beacon.position = point(target->position + QVector3D(0,0,1.2f));
+        beacon.seconds = float(std::clamp(object.details.value("beaconSeconds").toDouble(2),0.1,15.0));
+        const auto color = object.details.value("beaconColor").toArray();
+        if (color.size() == 3)
+            for (int i = 0; i < 3; ++i)
+                beacon.color[i] = float(std::clamp(color.at(i).toDouble(),0.0,1.0));
+        gameplay_.beacons.push_back(beacon);
+    }
+    using Rule = worldforge::BehaviorRule;
+    QHash<QString,const SceneObject *> byId;
+    for (const auto &object : objects_)
+        byId.insert(object.id,&object);
+    const auto missionIndex = [&](const QString &id) -> std::optional<std::size_t> {
+        const auto *marker = visibleTarget(id);
+        if (!marker || marker->details.value("gameplay").toString() != "missionStart")
+            return {};
+        const auto name = missionName(*marker);
+        if (std::ranges::count_if(objects_,[&](const SceneObject &object) {
+            return object.visible && object.details.value("gameplay").toString() == "missionStart"
+                && missionName(object) == name;
+        }) != 1)
+            return {};
+        const auto item = std::ranges::find(gameplay_.missions,name,&worldforge::Mission::name);
+        return item == gameplay_.missions.end() ? std::nullopt : std::optional(std::size_t(item-gameplay_.missions.begin()));
+    };
+    const auto addComponent = [&](const SceneObject &owner,const BehaviorComponent &component) {
+        const auto asset = behaviors.constFind(component.assetId);
+        if (asset == behaviors.cend() || gameplay_.behaviors.size() >= 128) {
+            gameplayErrors_ << QObject::tr("%1 has a missing behavior or exceeds the level's behavior budget.").arg(owner.name);
+            return;
+        }
+        const auto *target = component.targetId.isEmpty() ? &owner : visibleTarget(component.targetId);
+        if (!target) {
+            gameplayErrors_ << QObject::tr("%1 on %2 has a missing or hidden action target. Check Programming.").arg(asset->name,owner.name);
+            return;
+        }
+        Rule rule;
+        rule.label = utf8Text(asset->name.left(60)+" / "+owner.name.left(60),150);
+        rule.event = asset->event;
+        rule.action = asset->action;
+        rule.mission = missionIndex(asset->mission);
+        rule.requiredMission = missionIndex(asset->requiredMission);
+        rule.position = point(owner.position);
+        rule.amount = component.amount.value_or(asset->amount);
+        if ((!asset->mission.isEmpty() && !rule.mission) || (!asset->requiredMission.isEmpty() && !rule.requiredMission)) {
+            gameplayErrors_ << QObject::tr("%1 references a missing, hidden, or ambiguous mission. Check Programming.").arg(asset->name);
+            return;
+        }
+        if (rule.action == Rule::Action::RaiseObject) {
+            const auto body = bodyIndex(target->id);
+            const bool childHasCollider = std::ranges::any_of(objects_,[&](const SceneObject &candidate) {
+                if (!bindings_.contains(candidate.id))
+                    return false;
+                for (auto *parent = byId.value(candidate.parentId); parent; parent = byId.value(parent->parentId))
+                    if (parent->id == target->id)
+                        return true;
+                return false;
+            });
+            if (!body || simulation_.bodies[*body].dynamic || !target->parentId.isEmpty()
+                || childHasCollider
+                || std::ranges::any_of(simulation_.joints,[&](const auto &joint) {
+                    return joint.first == *body || joint.second == *body;
+                })) {
+                gameplayErrors_ << QObject::tr("%1 must be an unparented Static physics mesh without joints or child colliders for Raise Object.")
+                    .arg(target->name);
+                return;
+            }
+            rule.target = *body;
+        } else if (rule.action == Rule::Action::LaunchUpward) {
+            const auto body = bodyIndex(target->id);
+            if (!body || !simulation_.bodies[*body].dynamic || !target->parentId.isEmpty()) {
+                gameplayErrors_ << QObject::tr("%1 must be an unparented Dynamic physics mesh for Launch Upward.")
+                    .arg(target->name);
+                return;
+            }
+            rule.target = *body;
+            rule.followLaunchTarget = target->id == owner.id;
+        } else {
+            rule.target = gameplay_.behaviorBeacons.size();
+            worldforge::MissionBeacon beacon;
+            beacon.position = point(target->position+QVector3D(0,0,1.2f));
+            gameplay_.behaviorBeacons.push_back(beacon);
+        }
+        gameplay_.behaviors.push_back(std::move(rule));
+    };
+    for (const auto &object : objects_)
+        if (object.visible)
+            for (const auto &component : behaviorComponents(object))
+                if (component.enabled)
+                    addComponent(object,component);
     gameplay_.start(simulation_);
 }
 
@@ -208,11 +409,40 @@ QString WorldRuntime::objective() const
 
 void WorldRuntime::tick(float yaw)
 {
-    gameplay_.update(simulation_,player_,keys_.remove(Qt::Key_E));
-    if (player_)
+    clipTime_ += worldforge::WorldSimulation::stepSeconds;
+    const bool interact = keys_.remove(Qt::Key_E);
+    gameplay_.update(simulation_,player_,interact);
+    for (std::size_t i = 0; i < gameplay_.behaviors.size(); ++i) {
+        const auto &rule = gameplay_.behaviors[i];
+        if (behaviorResults_[i] == rule.result)
+            continue;
+        behaviorResults_[i] = rule.result;
+        QString result = QObject::tr("Action executed");
+        if (rule.result == worldforge::BehaviorRule::Result::ConditionFailed && rule.requiredMission)
+            result = QObject::tr("Condition failed. Mission %1 is incomplete.")
+                .arg(QString::fromStdString(gameplay_.missions[*rule.requiredMission].name));
+        qInfo().noquote() << QObject::tr("Behavior %1 · %2").arg(QString::fromStdString(rule.label), result);
+    }
+    const bool playerControl = !gameplay_.activeShot();
+    if (player_) {
+        const bool jump = keys_.remove(Qt::Key_Space);
         worldforge::drivePlayer(simulation_.bodies[*player_],point(spawn_),yaw,
-            int(keys_.contains(Qt::Key_W))-int(keys_.contains(Qt::Key_S)),
-            int(keys_.contains(Qt::Key_D))-int(keys_.contains(Qt::Key_A)),keys_.remove(Qt::Key_Space),jumpBuffer_);
+            playerControl ? int(keys_.contains(Qt::Key_W))-int(keys_.contains(Qt::Key_S)) : 0,
+            playerControl ? int(keys_.contains(Qt::Key_D))-int(keys_.contains(Qt::Key_A)) : 0,
+            playerControl && jump,jumpBuffer_);
+        if (native_.loaded()) {
+            std::uint32_t input = 0;
+            if (playerControl) {
+                if (keys_.contains(Qt::Key_W)) input |= WF_GAME_FORWARD;
+                if (keys_.contains(Qt::Key_S)) input |= WF_GAME_BACK;
+                if (keys_.contains(Qt::Key_A)) input |= WF_GAME_LEFT;
+                if (keys_.contains(Qt::Key_D)) input |= WF_GAME_RIGHT;
+                if (jump) input |= WF_GAME_JUMP;
+                if (interact) input |= WF_GAME_INTERACT;
+            }
+            native_.tick(simulation_,nativeBodies_,player_,input,logNative);
+        }
+    }
     simulation_.step();
 }
 
@@ -222,7 +452,7 @@ WorldRuntime::CollisionProbe WorldRuntime::probeCollision(const ProjectStore &st
     CollisionProbe probe;
     WorldRuntime runtime;
     approach.setZ(0);
-    if (approach.lengthSquared() < 1e-6f || !runtime.start(store,true) || !runtime.player_)
+    if (approach.lengthSquared() < 1e-6f || !runtime.start(store,true,false) || !runtime.player_)
         return probe;
     const auto index = runtime.bodyIndex(objectId);
     if (!index)
@@ -247,11 +477,16 @@ WorldRuntime::CollisionProbe WorldRuntime::probeCollision(const ProjectStore &st
     return probe;
 }
 
-bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output)
+bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QString *error,bool nativeBindings)
 {
     WorldRuntime runtime;
-    if (!runtime.start(store,true))
+    if (!runtime.start(store,true,false))
         return false;
+    if (!runtime.gameplayErrors().isEmpty()) {
+        if (error)
+            *error = runtime.gameplayErrors().join('\n');
+        return false;
+    }
     worldforge::PlayableScene scene;
     scene.player = *runtime.player_;
     const auto *environment = store.environment();
@@ -272,7 +507,13 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output)
     scene.localFogCenter = point(atmosphere.localFogCenter);
     scene.localFogRadius = atmosphere.localFogRadius;
     scene.localFogDensity = atmosphere.localFogDensity;
-    std::size_t vertices = 0;
+    scene.exposure = atmosphere.exposure;
+    scene.autoExposure = atmosphere.autoExposure;
+    scene.temporalAntiAliasing = atmosphere.temporalAntiAliasing;
+    scene.ambientOcclusion = atmosphere.ambientOcclusion;
+    scene.exposureCompensation = atmosphere.exposureCompensation;
+    scene.viewTransform = atmosphere.viewTransform;
+    std::size_t vertices = 0, animationSamples = 0;
     bool hasSun = false;
     for (const auto &object : runtime.objects_) {
         if (!object.visible)
@@ -289,7 +530,7 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output)
             hasSun |= directional;
             const auto direction = object.id == "sun" && object.rotation.isNull() ? sunDirection(atmosphere) : q.rotatedVector({0,0,1});
             scene.lights.push_back({point(directional ? direction : object.position),
-                float(std::clamp(object.details.value("lightIntensity").toDouble(1),0.0,4.0)),directional});
+                lightUnits(object),directional});
             continue;
         }
         const auto asset = runtime.assets_.constFind(object.meshAsset);
@@ -305,7 +546,8 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output)
             driver = &*parent;
             driverIndex = runtime.bodyIndex(driver->id);
         }
-        const bool moving = driverIndex && runtime.simulation_.bodies[*driverIndex].dynamic;
+        const bool moving = driverIndex && (runtime.simulation_.bodies[*driverIndex].dynamic
+            || runtime.gameplay_.movesBody(*driverIndex));
         const auto &mesh = asset->evaluated();
         for (const auto *level : {&mesh,asset->lodMesh.data()})
             if (level)
@@ -323,19 +565,32 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output)
         } else
             transform = runtime.authoredMatrices_.value(object.id);
         const auto normals = transform.normalMatrix();
-        // Textured materials become separate draws so the Player can bind each base-color map.
+        // Split surface draws so the Player can bind each material's maps and factors.
         std::vector<std::optional<std::uint32_t>> parts{std::nullopt};
-        if (std::ranges::any_of(mesh.materials,[](const auto &slot) { return !slot.baseColorTexture.empty(); })) {
+        if (std::ranges::any_of(mesh.materials,[](const auto &slot) {
+            return !slot.baseColorTexture.empty() || slot.hasAdvancedSurface();
+        })) {
             parts.clear();
             for (std::uint32_t slot = 0; slot < mesh.materials.size(); ++slot)
                 parts.push_back(slot);
         }
         for (const auto &part : parts) {
-            worldforge::PlayMesh draw{moving ? int(*driverIndex) : -1,worldforge::makePlayVertices(mesh,nullptr,0,part)};
+            std::vector<worldforge::VertexIndex> clipIndices;
+            worldforge::PlayMesh draw{moving ? int(*driverIndex) : -1,
+                worldforge::makePlayVertices(mesh,nullptr,0,part,asset->clip ? &clipIndices : nullptr)};
             if (draw.vertices.empty() || scene.meshes.size() >= 4096)
                 continue;
-            if (part)
-                draw.baseColorTexture = mesh.materials[*part].baseColorTexture;
+            if (part) {
+                const auto &slot = mesh.materials[*part];
+                draw.baseColorTexture = slot.baseColorTexture;
+                draw.advancedSurface = slot.hasAdvancedSurface();
+                draw.metallic = slot.metallic;
+                draw.roughness = slot.roughness;
+                draw.emissive = slot.emissive;
+                const auto maps = slot.previewTextures();
+                for (std::size_t i = 0; i < draw.surfaceMaps.size(); ++i)
+                    draw.surfaceMaps[i] = *maps[i+1];
+            }
             if (asset->lodMesh) {
                 draw.lodVertices = worldforge::makePlayVertices(*asset->lodMesh,nullptr,0,part);
                 draw.lodDistance = asset->lodDistance;
@@ -344,18 +599,59 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output)
             }
             if (!draw.lodVertices.empty())
                 draw.lodOrigin = point(transform.map(QVector3D()));
+            const auto place = [&](auto &vertex) {
+                vertex.position = point(transform.map(vector(vertex.position)));
+                QVector3D normal;
+                for (int row = 0; row < 3; ++row)
+                    normal[row] = normals(row,0)*vertex.normal[0]+normals(row,1)*vertex.normal[1]+normals(row,2)*vertex.normal[2];
+                vertex.normal = point(normal.normalized());
+            };
             for (auto *level : {&draw.vertices,&draw.lodVertices})
-                for (auto &v : *level) {
-                    v.position = point(transform.map(vector(v.position)));
-                    QVector3D normal;
-                    for (int row = 0; row < 3; ++row)
-                        normal[row] = normals(row,0)*v.normal[0] + normals(row,1)*v.normal[1] + normals(row,2)*v.normal[2];
-                    v.normal = point(normal.normalized());
+                for (auto &vertex : *level)
+                    place(vertex);
+            if (asset->clip) {
+                const auto &source = *asset->clip;
+                const auto frames = source.frameCount();
+                if (clipIndices.size() > worldforge::MeshClip::maxSamples/frames
+                    || clipIndices.size()*frames > worldforge::MeshClip::maxSamples*3-animationSamples) {
+                    if (error)
+                        *error = QObject::tr("%1 exceeds the Player's animation sample budget. Reduce the mesh or shorten the clip.").arg(asset->name);
+                    return false;
                 }
+                animationSamples += clipIndices.size()*frames;
+                auto &clip = draw.clip.emplace();
+                clip.name = source.name;
+                clip.framesPerSecond = source.framesPerSecond;
+                clip.vertexCount = clipIndices.size();
+                clip.samples.reserve(clip.vertexCount*frames);
+                for (std::size_t frame = 0; frame < frames; ++frame)
+                    for (const auto vertex : clipIndices) {
+                        auto &sample = clip.samples.emplace_back(source.samples[frame*source.vertexCount+vertex]);
+                        place(sample);
+                    }
+            }
             scene.meshes.push_back(std::move(draw));
         }
     }
     scene.gameplay = runtime.gameplay_;
+    if (nativeBindings) {
+        scene.nativeBodies = std::move(runtime.nativeBodies_);
+        QString problem;
+        if (!collectNativeInstances(store,scene.nativeInstances,problem)) {
+            if (error)
+                *error = problem;
+            return false;
+        }
+        if (!scene.nativeInstances.empty()) {
+            worldforge::NativeGameplay candidate;
+            std::string message;
+            if (!candidate.stage(std::filesystem::path(store.nativeGameplayPath().toStdWString()),message,scene.nativeInstances)) {
+                if (error)
+                    *error = QString::fromStdString(message);
+                return false;
+            }
+        }
+    }
     scene.simulation = std::move(runtime.simulation_);
     if (!hasSun)
         scene.lights.insert(scene.lights.begin(),{point(sunDirection(atmosphere)),1,true});
@@ -372,7 +668,7 @@ QHash<QString,QMatrix4x4> WorldRuntime::renderMatrices() const
     for (const auto &object : objects_) {
         byId.insert(object.id,&object);
         const auto body = bodyIndex(object.id);
-        if (!body || !simulation_.bodies[*body].dynamic)
+        if (!body || (!simulation_.bodies[*body].dynamic && !gameplay_.movesBody(*body)))
             continue;
         const auto moved = position(object.id);
         const auto rotated = rotation(object.id);

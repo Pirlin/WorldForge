@@ -1,13 +1,17 @@
 #include "State/ProjectStore.h"
 #include "State/GlbImport.h"
+#include "State/NativeComponents.h"
+#include "State/StudioClip.h"
 #include "State/WorldScene.h"
 #include "State/PlayableStreet.h"
 #include "Engine/Geometry/MeshTopology.h"
 
 #include <QDir>
+#include <QBuffer>
 #include <QCryptographicHash>
 #include <QFile>
 #include <QFileInfo>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -28,7 +32,8 @@
 
 namespace {
 namespace wf = worldforge;
-constexpr int projectSchemaVersion = 1;
+constexpr int projectSchemaVersion = 6;
+constexpr int maxBehaviorComponents = 16;
 
 QDir sceneDirectory(const QDir &index,const QJsonObject &configuration)
 {
@@ -57,7 +62,8 @@ MeshAsset independentAsset(MeshAsset asset, const QString &name)
     asset.name = name;
     asset.sourcePath.clear();
     asset.sourceHash.clear();
-    asset.studioSourceHash.clear();
+    if (!asset.clip)
+        asset.studioSourceHash.clear();
     asset.locallyEdited = false;
     return asset;
 }
@@ -238,6 +244,31 @@ void invalidateOtherUvSets(MeshAsset &asset)
 {
     for (auto &set : asset.otherUvSets)
         set.needsUnwrap = true;
+}
+
+bool replaceStudioUvs(MeshAsset &target,const GlbUvLayers &layers,QString &error)
+{
+    if (layers.other.size() > 7) {
+        error = QObject::tr("Studio publishing supports up to eight UV layers.");
+        return false;
+    }
+    const auto active = layers.active.isEmpty() ? QStringLiteral("UV Map") : layers.active;
+    auto previous = target.otherUvSets;
+    previous.insert(target.activeUvSet,captureUvSet(target));
+    previous.remove(active);
+    for (auto &layout : previous)
+        layout.needsUnwrap = true;
+    for (auto it = layers.other.cbegin(); it != layers.other.cend(); ++it)
+        previous.insert(it.key(),MeshUvSet{it.value()});
+    if (previous.size() > 7) {
+        error = QObject::tr("The published layers and retained layouts exceed eight UV layers. Keep their original names in Studio.");
+        return false;
+    }
+    target.activeUvSet = active;
+    target.otherUvSets = std::move(previous);
+    target.uvSeams.clear();
+    target.uvPins.clear();
+    return true;
 }
 
 bool readUvPins(const QJsonValue &value,const wf::Mesh &mesh,bool stale,wf::UvPins &pins)
@@ -580,7 +611,8 @@ bool evaluateModifiers(MeshAsset &asset,const QMap<QString,MeshAsset> &assets,QS
     return true;
 }
 
-bool evaluateProjectMeshes(QMap<QString,MeshAsset> &assets,const QMap<QString,MeshAsset> *before,QString &error)
+bool evaluateProjectMeshes(QMap<QString,MeshAsset> &assets,const QMap<QString,MeshAsset> *before,QString &error,
+                           const QString &authoritativeUvAsset = {})
 {
     QSet<QString> visiting, finished, changed;
     const auto evaluate = [&](auto &&self,const QString &id,int depth) -> bool {
@@ -597,6 +629,13 @@ bool evaluateProjectMeshes(QMap<QString,MeshAsset> &assets,const QMap<QString,Me
         visiting.insert(id);
         const auto asset = assets.value(id);
         const auto prior = before ? before->constFind(id) : QMap<QString,MeshAsset>::const_iterator{};
+        if (asset.clip && (!asset.modifiers.empty() || asset.lodCell > 0
+            || asset.clip->vertexCount != asset.mesh->vertices.size()
+            || (before && prior != before->cend() && prior->clip == asset.clip && prior->mesh != asset.mesh
+                && (prior->mesh->vertices != asset.mesh->vertices || !sameMeshTopology(*prior->mesh,*asset.mesh))))) {
+            error = QObject::tr("%1 uses a Studio animation clip. Edit its geometry and deformation in Studio.").arg(asset.name);
+            return false;
+        }
         bool dirty = !before || prior == before->cend() || asset.mesh != prior->mesh
             || asset.modifiers != prior->modifiers || asset.lodCell != prior->lodCell;
         for (const auto &modifier : asset.modifiers) {
@@ -608,7 +647,7 @@ bool evaluateProjectMeshes(QMap<QString,MeshAsset> &assets,const QMap<QString,Me
             dirty |= changed.contains(target);
         }
         if (dirty) {
-            if (before && prior != before->cend() && asset.mesh != prior->mesh
+            if (id != authoritativeUvAsset && before && prior != before->cend() && asset.mesh != prior->mesh
                 && (!asset.otherUvSets.isEmpty() || !asset.uvPins.empty()) && !sameMeshTopology(*prior->mesh,*asset.mesh)) {
                 auto &updated = assets[id];
                 invalidateOtherUvSets(updated);
@@ -763,10 +802,200 @@ std::optional<MeshAsset> readAsset(const QJsonObject &row)
     } else if (row.value("mirrorX").toBool()) {
         asset.modifiers.push_back({});
     }
+    if (row.contains("meshClip")) {
+        const auto encoded = row.value("meshClip").toString().toLatin1();
+        if (encoded.size() > 16'001'024)
+            return {};
+        const auto decoded = QByteArray::fromBase64Encoding(encoded,QByteArray::AbortOnBase64DecodingErrors);
+        auto clip = decoded ? readStudioClip(decoded.decoded) : std::nullopt;
+        if (!clip || clip->vertexCount != asset.mesh->vertices.size())
+            return {};
+        asset.clip = QSharedPointer<wf::MeshClip>::create(std::move(*clip));
+    }
     return asset;
 }
 
-QJsonObject writeAsset(const MeshAsset &asset)
+std::optional<QSize> surfaceImageSize(const QByteArray &image,bool decode)
+{
+    if (image.isEmpty() || image.size() > qsizetype(wf::MeshMaterial::maxTextureBytes))
+        return {};
+    QBuffer data;
+    data.setData(image);
+    data.open(QIODevice::ReadOnly);
+    QImageReader reader(&data);
+    const auto format = reader.format();
+    const auto size = reader.size();
+    if ((format != "png" && format != "jpeg") || !size.isValid() || size.width() > 8192
+        || size.height() > 8192 || qint64(size.width())*size.height() > 32*1024*1024
+        || (decode && reader.read().isNull()))
+        return {};
+    return size;
+}
+
+bool validSurfaceName(const QString &name)
+{
+    return !name.trimmed().isEmpty() && name.size() <= 120;
+}
+
+bool validBehavior(const ProjectBehavior &behavior)
+{
+    return validSurfaceName(behavior.name) && behavior.name == behavior.name.trimmed()
+        && int(behavior.event) >= 0 && int(behavior.event) <= 2
+        && int(behavior.action) >= 0 && behavior.action <= wf::BehaviorRule::Action::LaunchUpward
+        && (behavior.event == wf::BehaviorRule::Event::MissionCompleted) == !behavior.mission.isEmpty()
+        && behavior.amount >= 0.1f && behavior.amount <= 15;
+}
+
+bool validBehaviorComponents(const QJsonValue &stored)
+{
+    if (stored.isUndefined())
+        return true;
+    if (!stored.isArray() || stored.toArray().size() > maxBehaviorComponents)
+        return false;
+    QSet<QString> assets;
+    for (const auto &value : stored.toArray()) {
+        const auto row = value.toObject();
+        const auto id = row.value("asset").toString();
+        const auto amount = row.value("amount");
+        if (id.isEmpty() || assets.contains(id) || !row.value("enabled").isBool()
+            || (row.contains("target") && !row.value("target").isString())
+            || (!amount.isUndefined() && (!amount.isDouble() || !(amount.toDouble() >= 0.1 && amount.toDouble() <= 15))))
+            return false;
+        assets.insert(id);
+    }
+    return true;
+}
+
+bool validProjectMaterial(const ProjectMaterial &material,const SurfaceLibrary &library)
+{
+    const auto hasTexture = [&](const QString &id) { return id.isEmpty() || library.textures.contains(id); };
+    return validSurfaceName(material.name)
+        && hasTexture(material.textureId) && std::ranges::all_of(material.maps,hasTexture)
+        && material.metallic >= 0 && material.metallic <= 1
+        && material.roughness >= 0 && material.roughness <= 1
+        && material.emission >= 0 && material.emission <= 1
+        && std::ranges::all_of(material.tint,[](float channel) { return channel >= 0 && channel <= 1; });
+}
+
+wf::MeshMaterial resolveProjectMaterial(const QString &id,const ProjectMaterial &material,const SurfaceLibrary &library)
+{
+    wf::MeshMaterial resolved;
+    resolved.name = material.name.toStdString();
+    resolved.color = material.tint;
+    resolved.sharedMaterialId = id.toStdString();
+    const auto images = resolved.previewTextures();
+    const std::array textureIds{material.textureId,material.maps[0],material.maps[1],material.maps[2],material.maps[3]};
+    for (std::size_t i = 0; i < images.size(); ++i)
+        if (const auto texture = library.textures.constFind(textureIds[i]); texture != library.textures.cend())
+            images[i]->assign(texture->image.begin(),texture->image.end());
+    resolved.metallic = material.metallic;
+    resolved.roughness = material.roughness;
+    if (!resolved.emissiveTexture.empty())
+        resolved.emissive = {material.emission,material.emission,material.emission};
+    return resolved;
+}
+
+bool resolveLibrarySlots(QMap<QString,MeshAsset> &assets,const SurfaceLibrary &library,QString &error)
+{
+    if (library.materials.isEmpty())
+        return true;
+    QMap<QString,wf::MeshMaterial> resolved;
+    for (auto it = assets.begin(); it != assets.end(); ++it) {
+        std::optional<wf::Mesh> replacement;
+        for (std::size_t slot = 0; slot < it->mesh->materials.size(); ++slot) {
+            const auto &old = it->mesh->materials[slot];
+            const auto id = QString::fromStdString(old.sharedMaterialId);
+            const auto entry = library.materials.constFind(id);
+            if (entry == library.materials.cend())
+                continue;
+            auto material = resolved.constFind(id);
+            if (material == resolved.cend())
+                material = resolved.insert(id,resolveProjectMaterial(id,*entry,library));
+            if (old == *material)
+                continue;
+            if (!replacement)
+                replacement = *it->mesh;
+            replacement->materials[slot] = *material;
+        }
+        if (replacement) {
+            const auto invalid = QString::fromStdString(wf::validateMesh(*replacement));
+            if (!invalid.isEmpty()) {
+                error = QObject::tr("%1. %2").arg(it->name,invalid);
+                return false;
+            }
+            it->mesh = QSharedPointer<wf::Mesh>::create(std::move(*replacement));
+        }
+    }
+    return true;
+}
+
+std::optional<SurfaceLibrary> readSurfaceLibrary(const QJsonValue &value)
+{
+    SurfaceLibrary library;
+    if (value.isUndefined())
+        return library;
+    if (!value.isObject())
+        return {};
+    const auto section = value.toObject();
+    if (!section.value("textures").isArray() || !section.value("materials").isArray())
+        return {};
+    constexpr auto encodedLimit = qsizetype((wf::MeshMaterial::maxTextureBytes+2)/3*4);
+    for (const auto &entry : section.value("textures").toArray()) {
+        const auto row = entry.toObject();
+        const auto id = row.value("id").toString();
+        const auto name = row.value("name").toString();
+        const auto encoded = row.value("image").toString().toLatin1();
+        if (!wf::Guid::parse(id.toStdString()) || library.textures.contains(id)
+            || !validSurfaceName(name) || encoded.size() > encodedLimit)
+            return {};
+        auto result = QByteArray::fromBase64Encoding(encoded,QByteArray::AbortOnBase64DecodingErrors);
+        const auto size = result ? surfaceImageSize(result.decoded,false) : std::nullopt;
+        if (!size)
+            return {};
+        library.textures.insert(id,{name,row.value("fileName").toString(),size->width(),size->height(),
+            std::move(result.decoded),row.value("sourcePath").toString()});
+    }
+    for (const auto &entry : section.value("materials").toArray()) {
+        const auto row = entry.toObject();
+        const auto id = row.value("id").toString();
+        ProjectMaterial material{row.value("name").toString(),row.value("textureId").toString(),meshVector<4>(row.value("tint"))};
+        if (row.contains("maps")) {
+            const auto maps = row.value("maps").toArray();
+            if (maps.size() != qsizetype(material.maps.size()))
+                return {};
+            for (qsizetype i = 0; i < maps.size(); ++i) {
+                if (!maps[i].isString())
+                    return {};
+                material.maps[i] = maps[i].toString();
+            }
+        }
+        material.metallic = float(row.value("metallic").toDouble(material.metallic));
+        material.roughness = float(row.value("roughness").toDouble(material.roughness));
+        material.emission = float(row.value("emission").toDouble(material.emission));
+        if (!wf::Guid::parse(id.toStdString()) || library.materials.contains(id) || !validProjectMaterial(material,library))
+            return {};
+        library.materials.insert(id,std::move(material));
+    }
+    return library;
+}
+
+QJsonObject writeSurfaceLibrary(const SurfaceLibrary &library)
+{
+    QJsonArray textures, materials;
+    for (auto it = library.textures.cbegin(); it != library.textures.cend(); ++it)
+        textures.append(QJsonObject{{"id",it.key()},{"name",it->name},{"fileName",it->fileName},{"sourcePath",it->sourcePath},
+            {"image",QString::fromLatin1(it->image.toBase64())}});
+    for (auto it = library.materials.cbegin(); it != library.materials.cend(); ++it) {
+        QJsonArray maps;
+        for (const auto &map : it->maps)
+            maps.append(map);
+        materials.append(QJsonObject{{"id",it.key()},{"name",it->name},{"textureId",it->textureId},{"tint",meshVector(it->tint)},
+            {"maps",maps},{"metallic",it->metallic},{"roughness",it->roughness},{"emission",it->emission}});
+    }
+    return {{"textures",textures},{"materials",materials}};
+}
+
+QJsonObject writeAsset(const MeshAsset &asset,const SurfaceLibrary &library)
 {
     QJsonArray vertices, faces, materials;
     for (const auto &vertex : asset.mesh->vertices)
@@ -783,7 +1012,7 @@ QJsonObject writeAsset(const MeshAsset &asset)
         const QString keys[]{"baseColorTexture","normalTexture","metallicRoughnessTexture","occlusionTexture","emissiveTexture"};
         const auto images = material.previewTextures();
         for (unsigned i = 0; i < images.size(); ++i)
-            if (!images[i]->empty())
+            if (!images[i]->empty() && !library.materials.contains(QString::fromStdString(material.sharedMaterialId)))
                 row.insert(keys[i],QString::fromLatin1(QByteArrayView(
                     reinterpret_cast<const char *>(images[i]->data()),images[i]->size()).toByteArray().toBase64()));
         if (material.emissive != wf::Point3{})
@@ -813,12 +1042,15 @@ QJsonObject writeAsset(const MeshAsset &asset)
     }
     const bool legacyMirror = asset.modifiers.size() == 1 && asset.modifiers.front().kind == wf::ModifierKind::Mirror
         && asset.modifiers.front().enabled && asset.modifiers.front().axis == 0;
-    return {{"id", asset.id}, {"name", asset.name}, {"sourcePath", asset.sourcePath}, {"sourceHash", asset.sourceHash},
+    QJsonObject row{{"id", asset.id}, {"name", asset.name}, {"sourcePath", asset.sourcePath}, {"sourceHash", asset.sourceHash},
             {"studioSourceHash", asset.studioSourceHash},
             {"locallyEdited", asset.locallyEdited}, {"mirrorX", legacyMirror},{"modifiers",modifiers},{"uvSeams",seams},
             {"activeUvSet",asset.activeUvSet},{"otherUvSets",uvSets},{"uvPins",writeUvPins(asset.uvPins)},
             {"lodCell",asset.lodCell},{"lodDistance",asset.lodDistance},
             {"vertices", vertices}, {"faces", faces}, {"materials", materials},{"revolveProfile",asset.revolveProfile}};
+    if (asset.clip)
+        row.insert("meshClip",QString::fromLatin1(writeStudioClip(*asset.clip).toBase64()));
+    return row;
 }
 
 class UndoSceneEdit : public QUndoCommand {
@@ -897,7 +1129,7 @@ bool ProjectStore::load(const QString &fileName, bool *newerSchema)
         return false;
     const bool versioned = fileName.endsWith(".wfproject");
     const int projectVersion = data.value("schemaVersion").toInt();
-    if (versioned && projectVersion != projectSchemaVersion) {
+    if (versioned && (projectVersion < 1 || projectVersion > projectSchemaVersion)) {
         if (newerSchema)
             *newerSchema = projectVersion > projectSchemaVersion;
         return false;
@@ -949,8 +1181,26 @@ bool ProjectStore::load(const QString &fileName, bool *newerSchema)
                 return false;
             project.assets.insert(asset->id, *asset);
         }
+        const auto library = readSurfaceLibrary(scene.value("surfaceLibrary"));
+        if (!library)
+            return false;
+        project.surfaces = *library;
+        const auto behaviors = scene.value("behaviors");
+        if (!behaviors.isUndefined() && (!behaviors.isObject() || behaviors.toObject().size() > 256))
+            return false;
+        const auto definitions = behaviors.toObject();
+        for (auto it = definitions.constBegin(); it != definitions.constEnd(); ++it) {
+            const auto row = it.value().toObject();
+            ProjectBehavior behavior{row.value("name").toString(),wf::BehaviorRule::Event(row.value("event").toInt(-1)),
+                wf::BehaviorRule::Action(row.value("action").toInt(-1)),row.value("mission").toString(),
+                row.value("requiredMission").toString(),float(row.value("amount").toDouble(0))};
+            if (!wf::Guid::parse(it.key().toStdString()) || !validBehavior(behavior))
+                return false;
+            project.behaviors.insert(it.key(),std::move(behavior));
+        }
         QString modifierError;
-        if (!evaluateProjectMeshes(project.assets,nullptr,modifierError))
+        if (!resolveLibrarySlots(project.assets,project.surfaces,modifierError)
+            || !evaluateProjectMeshes(project.assets,nullptr,modifierError))
             return false;
         QSet<QString> objectIds;
         for (const auto &value : scene.value("objects").toArray()) {
@@ -962,6 +1212,10 @@ bool ProjectStore::load(const QString &fileName, bool *newerSchema)
                 return false;
             objectIds.insert(object.id);
             if (!object.meshAsset.isEmpty() && !project.assets.contains(object.meshAsset))
+                return false;
+            if (!validBehaviorComponents(object.details.value("behaviorComponents")))
+                return false;
+            if (!validNativeComponentData(object.details.value("nativeComponents")))
                 return false;
             project.objects.append(object);
         }
@@ -1014,7 +1268,7 @@ bool ProjectStore::save(QString *error)
         const auto &scene = *project.scene;
         QJsonArray objects, assets;
         for (const auto &asset : project.assets)
-            assets.append(writeAsset(asset));
+            assets.append(writeAsset(asset,project.surfaces));
         for (const auto &object : project.objects) {
             QJsonObject row{{"id", object.id}, {"name", object.name}, {"type", object.type},
                 {"guid", guidText(objectGuid(scene.projectId(), object.id))},
@@ -1032,9 +1286,19 @@ bool ProjectStore::save(QString *error)
             objects.append(row);
         }
         const auto sceneFile = guidText(scene.sceneId()) + '-' + generation + ".wfscene";
-        const auto sceneBytes = QJsonDocument(QJsonObject{{"schemaVersion", int(wf::sceneSchemaVersion)},
+        QJsonObject content{{"schemaVersion", int(wf::sceneSchemaVersion)},
             {"projectGuid", guidText(scene.projectId())}, {"sceneGuid", guidText(scene.sceneId())},
-            {"revision", QString::number(scene.revision())}, {"objects", objects}, {"meshAssets", assets}}).toJson(QJsonDocument::Compact);
+            {"revision", QString::number(scene.revision())}, {"objects", objects}, {"meshAssets", assets}};
+        if (!project.surfaces.empty())
+            content.insert("surfaceLibrary",writeSurfaceLibrary(project.surfaces));
+        if (!project.behaviors.isEmpty()) {
+            QJsonObject behaviors;
+            for (auto it = project.behaviors.cbegin(); it != project.behaviors.cend(); ++it)
+                behaviors.insert(it.key(),QJsonObject{{"name",it->name},{"event",int(it->event)},{"action",int(it->action)},
+                    {"mission",it->mission},{"requiredMission",it->requiredMission},{"amount",it->amount}});
+            content.insert("behaviors",behaviors);
+        }
+        const auto sceneBytes = QJsonDocument(content).toJson(QJsonDocument::Compact);
         const auto sceneDir = sceneDirectory(dir,project.configuration);
         if (!QDir().mkpath(sceneDir.absolutePath())) {
             *error = tr("Could not create the scene directory for %1.").arg(project.name);
@@ -1049,7 +1313,30 @@ bool ProjectStore::save(QString *error)
         projects.append(QJsonObject{{"id", project.id}, {"name", project.name}, {"sceneFile", sceneFile},
                                     {"sceneHash", checksum(sceneBytes)}, {"configuration",project.configuration}});
     }
-    const auto bytes = QJsonDocument(QJsonObject{{"schemaVersion", projectSchemaVersion},
+    int version = 1;
+    for (const auto &item : projects_) {
+        if (std::ranges::any_of(item.objects,[](const SceneObject &object) {
+                return object.details.contains("nativeComponents");
+            })) {
+            version = projectSchemaVersion;
+            break;
+        }
+        if (std::ranges::any_of(item.objects,[](const SceneObject &object) {
+                return object.details.contains("behaviorComponents");
+            })) {
+            version = std::max(version,5);
+        }
+        if (std::ranges::any_of(item.behaviors,[](const ProjectBehavior &behavior) {
+                return behavior.action == wf::BehaviorRule::Action::LaunchUpward;
+            })) {
+            version = std::max(version,4);
+        }
+        if (!item.behaviors.isEmpty())
+            version = std::max(version,3);
+        else if (!item.surfaces.empty())
+            version = std::max(version,2);
+    }
+    const auto bytes = QJsonDocument(QJsonObject{{"schemaVersion", version},
         {"activeProject", activeId_}, {"selection", selection_}, {"projects", projects}}).toJson();
     if ((!persistedManifest_.isEmpty() && !atomicWrite(previousPath, persistedManifest_, message))
         || !atomicWrite(path_, bytes, message)) {
@@ -1137,6 +1424,15 @@ void ProjectStore::removeUnusedDemoObjects()
     auto objects = active->objects;
     objects.removeIf([active](const SceneObject &object) { return isUntouchedDemo(*active, object); });
     pushSceneEdit(objects, selection_, tr("Remove unused demo objects"));
+}
+
+QString ProjectStore::nativeGameplayPath() const
+{
+    if (!project())
+        return {};
+    const auto key = QCryptographicHash::hash(project()->id.toUtf8(),QCryptographicHash::Sha256).toHex();
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation))
+        .filePath("NativeGameplay/"+QString::fromLatin1(key)+"/Gameplay.dll");
 }
 
 void ProjectStore::select(const QString &id)
@@ -1301,12 +1597,15 @@ void ProjectStore::pushSceneEdit(const QList<SceneObject> &objects, const QStrin
 }
 
 bool ProjectStore::pushProjectEdit(const QList<SceneObject> &objects,const QMap<QString,MeshAsset> &assets,
-                                  const QString &selection,const QString &label,QString *error)
+                                  const QString &selection,const QString &label,QString *error,const SurfaceLibrary *surfaces,
+                                  const QString &authoritativeUvAsset,const QMap<QString,ProjectBehavior> *behaviors)
 {
     const auto *active = project();
     if (!active)
         return false;
-    if (active->objects == objects && active->assets == assets)
+    const auto library = surfaces ? *surfaces : active->surfaces;
+    const auto rules = behaviors ? *behaviors : active->behaviors;
+    if (active->objects == objects && active->assets == assets && active->surfaces == library && active->behaviors == rules)
         return true;
     if (!editedScene(*active, objects)) {
         const auto reason = tr("The scene rejected this edit. Check the name and transform values.");
@@ -1318,7 +1617,8 @@ bool ProjectStore::pushProjectEdit(const QList<SceneObject> &objects,const QMap<
     }
     auto evaluated = assets;
     QString reason;
-    if (active->assets != assets && !evaluateProjectMeshes(evaluated,&active->assets,reason)) {
+    const bool resolved = (active->assets == assets && active->surfaces == library) || resolveLibrarySlots(evaluated,library,reason);
+    if (!resolved || (active->assets != evaluated && !evaluateProjectMeshes(evaluated,&active->assets,reason,authoritativeUvAsset))) {
         if (error)
             *error = reason;
         emit editRejected(reason);
@@ -1326,14 +1626,18 @@ bool ProjectStore::pushProjectEdit(const QList<SceneObject> &objects,const QMap<
     }
     const auto previous = active->objects;
     const auto previousAssets = active->assets;
+    const auto previousLibrary = active->surfaces;
+    const auto previousRules = active->behaviors;
     history_.push(new UndoSceneEdit(label,
-        [this, objects, evaluated, selection] { applyScene(objects, evaluated, selection); },
-        [this, previous, previousAssets, selection = selection_] { applyScene(previous, previousAssets, selection); }));
+        [this, objects, evaluated, selection, library, rules] { applyScene(objects, evaluated, selection, library,rules); },
+        [this, previous, previousAssets, selection = selection_, previousLibrary, previousRules] {
+            applyScene(previous, previousAssets, selection, previousLibrary,previousRules);
+        }));
     return true;
 }
 
 bool ProjectStore::applyScene(const QList<SceneObject> &objects, const QMap<QString, MeshAsset> &assets,
-                              const QString &selection)
+                              const QString &selection,const SurfaceLibrary &surfaces,const QMap<QString,ProjectBehavior> &behaviors)
 {
     auto match = std::ranges::find(projects_, activeId_, &Project::id);
     if (match == projects_.end())
@@ -1344,6 +1648,8 @@ bool ProjectStore::applyScene(const QList<SceneObject> &objects, const QMap<QStr
     match->scene = std::move(updated);
     match->objects = objects;
     match->assets = assets;
+    match->surfaces = surfaces;
+    match->behaviors = behaviors;
     selection_ = object(selection) ? selection : QString();
     projectSelections_.insert(activeId_, selection_);
     setDirty(true);
@@ -1411,7 +1717,7 @@ bool ProjectStore::updateRevolvedMesh(const QString &id,wf::Mesh mesh,const QJso
 }
 
 bool ProjectStore::addMesh(wf::Mesh mesh,const QString &name,QString &error,const SceneObject *basis,
-                          const QJsonObject &profile,const QString &studioSourceHash)
+                          const QJsonObject &profile,const QString &studioSourceHash,const StudioMeshData *studio)
 {
     const auto *active = project();
     if (!active || name.trimmed().isEmpty()) {
@@ -1424,6 +1730,14 @@ bool ProjectStore::addMesh(wf::Mesh mesh,const QString &name,QString &error,cons
                     QSharedPointer<wf::Mesh>::create(std::move(mesh)), {}};
     asset.revolveProfile = profile;
     asset.studioSourceHash = studioSourceHash;
+    if (studio)
+        asset.clip = studio->clip;
+    if (studio && studio->uvs) {
+        const auto &uvLayers = *studio->uvs;
+        asset.activeUvSet = uvLayers.active.isEmpty() ? QStringLiteral("UV Map") : uvLayers.active;
+        for (auto it = uvLayers.other.cbegin(); it != uvLayers.other.cend(); ++it)
+            asset.otherUvSets.insert(it.key(),MeshUvSet{it.value()});
+    }
     SceneObject object;
     object.id = newId();
     object.name = asset.name;
@@ -1474,7 +1788,11 @@ void ProjectStore::setAtmosphere(const QJsonObject &settings)
         return;
     auto objects = active->objects;
     if (const auto *old = environment()) {
-        std::ranges::find(objects, old->id, &SceneObject::id)->details = settings;
+        auto updated = settings;
+        for (const auto *key : {"behaviorAsset","behaviorComponents","nativeComponents"})
+            if (old->details.contains(key))
+                updated.insert(key,old->details.value(key));
+        std::ranges::find(objects, old->id, &SceneObject::id)->details = updated;
     } else {
         SceneObject object;
         object.id = newId();
@@ -1791,45 +2109,98 @@ bool ProjectStore::importMesh(const QString &fileName, QString &error, bool repl
     }
     if (reimport && found->sourceHash == hash && !found->locallyEdited)
         return true;
+    if (reimport) {
+        const auto preview = previewMeshReimport(found->id,path,error);
+        return preview && applyMeshReimport(*preview,replaceLocalEdits,error);
+    }
     auto mesh = importGlb(bytes, error);
     if (!mesh)
         return false;
     auto assets = active->assets;
     auto objects = active->objects;
-    auto selection = selection_;
-    MeshAsset asset{reimport ? found->id : newId(),
-        reimport ? found->name : QFileInfo(path).completeBaseName().simplified().left(64), path, hash, false,
+    MeshAsset asset{newId(),QFileInfo(path).completeBaseName().simplified().left(64), path, hash, false,
         QSharedPointer<wf::Mesh>::create(std::move(*mesh)), {}};
     if (asset.name.isEmpty())
         asset.name = tr("Imported Mesh");
-    if (reimport) {
-        asset.modifiers = found->modifiers;
-        asset.otherUvSets = found->otherUvSets;
-        asset.otherUvSets.remove(asset.activeUvSet);
-        if (found->activeUvSet != asset.activeUvSet)
-            asset.otherUvSets.insert(found->activeUvSet,captureUvSet(*found));
-        asset.lodCell = found->lodCell;
-        asset.lodDistance = found->lodDistance;
-        if (found->activeUvSet == asset.activeUvSet) {
-            asset.uvSeams = remapSeams(*found->mesh,*asset.mesh,found->uvSeams);
-        } else {
-            const auto previous = found->otherUvSets.constFind(asset.activeUvSet);
-            if (previous != found->otherUvSets.cend() && !previous->needsUnwrap)
-                asset.uvSeams = remapSeams(*found->mesh,*asset.mesh,previous->seams);
-        }
-    }
-    if (!reimport) {
-        SceneObject object;
-        object.id = newId();
-        object.name = asset.name;
-        object.type = "Static Mesh";
-        object.group = "Props";
-        object.meshAsset = asset.id;
-        objects.append(object);
-        selection = object.id;
-    }
+    SceneObject object;
+    object.id = newId();
+    object.name = asset.name;
+    object.type = "Static Mesh";
+    object.group = "Props";
+    object.meshAsset = asset.id;
+    objects.append(object);
     assets.insert(asset.id, asset);
-    return pushProjectEdit(objects,assets,selection,reimport ? tr("Reimport GLB") : tr("Import GLB"),&error);
+    return pushProjectEdit(objects,assets,object.id,tr("Import GLB"),&error);
+}
+
+std::optional<MeshReimport> ProjectStore::previewMeshReimport(const QString &id,const QString &fileName,QString &error) const
+{
+    const auto *current = meshAsset(id);
+    const auto path = QFileInfo(fileName).canonicalFilePath();
+    QFile input(path);
+    constexpr qint64 limit = 64*1024*1024;
+    if (!current || current->sourcePath.isEmpty() || path.isEmpty() || !input.open(QIODevice::ReadOnly) || input.size() > limit) {
+        error = tr("Choose a readable GLB source up to 64 MiB for an imported mesh.");
+        return {};
+    }
+    if (std::ranges::any_of(project()->assets,[&](const auto &other) { return other.id != id && other.sourcePath == path; })) {
+        error = tr("That source is already tracked by another mesh asset.");
+        return {};
+    }
+    const auto bytes = input.read(limit+1);
+    auto mesh = importGlb(bytes,error);
+    if (!mesh)
+        return {};
+    if (!preserveProjectMaterials(id,*mesh,error))
+        return {};
+    MeshAsset replacement{id,current->name,path,checksum(bytes),false,QSharedPointer<wf::Mesh>::create(std::move(*mesh)),{}};
+    replacement.modifiers = current->modifiers;
+    replacement.otherUvSets = current->otherUvSets;
+    replacement.otherUvSets.remove(replacement.activeUvSet);
+    if (current->activeUvSet != replacement.activeUvSet)
+        replacement.otherUvSets.insert(current->activeUvSet,captureUvSet(*current));
+    replacement.lodCell = current->lodCell;
+    replacement.lodDistance = current->lodDistance;
+    if (current->activeUvSet == replacement.activeUvSet) {
+        replacement.uvSeams = remapSeams(*current->mesh,*replacement.mesh,current->uvSeams);
+        replacement.uvPins = current->uvPins;
+    } else if (const auto previous = current->otherUvSets.constFind(replacement.activeUvSet);
+             previous != current->otherUvSets.cend() && !previous->needsUnwrap) {
+        replacement.uvSeams = remapSeams(*current->mesh,*replacement.mesh,previous->seams);
+        replacement.uvPins = previous->pins;
+    }
+    auto proposed = project()->assets;
+    proposed.insert(id,replacement);
+    if (!evaluateProjectMeshes(proposed,&project()->assets,error))
+        return {};
+    replacement.evaluatedMesh = proposed[id].evaluatedMesh;
+    replacement.lodMesh = proposed[id].lodMesh;
+    return MeshReimport{project()->id,*current,std::move(replacement)};
+}
+
+bool ProjectStore::applyMeshReimport(const MeshReimport &preview,bool replaceLocalEdits,QString &error)
+{
+    const auto *current = meshAsset(preview.before.id);
+    if (!project() || project()->id != preview.projectId || !current || *current != preview.before) {
+        error = tr("This mesh changed after preview. Review the updated asset before reimporting.");
+        return false;
+    }
+    if (current->locallyEdited && !replaceLocalEdits) {
+        error = tr("Confirm replacement of local mesh edits before reimporting.");
+        return false;
+    }
+    if (!current->locallyEdited && current->sourcePath == preview.after.sourcePath
+        && current->sourceHash == preview.after.sourceHash)
+        return true;
+    if (std::ranges::any_of(project()->assets,[&](const auto &other) {
+        return other.id != current->id && other.sourcePath == preview.after.sourcePath;
+    })) {
+        error = tr("That source is now tracked by another mesh.");
+        return false;
+    }
+    auto assets = project()->assets;
+    assets.insert(current->id,preview.after);
+    return pushProjectEdit(project()->objects,assets,selection_,tr("Reimport GLB"),&error);
 }
 
 QString ProjectStore::studioSourcePath(const MeshAsset &asset) const
@@ -1843,7 +2214,8 @@ QString ProjectStore::studioSourcePath(const MeshAsset &asset) const
 }
 
 bool ProjectStore::publishStudioMesh(const QString &assetId,const QByteArray &glb,
-                                     const wf::Mesh *expected,QString &error,const QByteArray &studioSource)
+                                     const wf::Mesh *expected,QString &error,const QByteArray &studioSource,
+                                     const QByteArray &uvManifest,const QByteArray &clipData)
 {
     const auto *asset = meshAsset(assetId);
     if (!asset || !expected || asset->mesh.data() != expected) {
@@ -1854,20 +2226,31 @@ bool ProjectStore::publishStudioMesh(const QString &assetId,const QByteArray &gl
         error = tr("Choose a GLB no larger than 64 MiB.");
         return false;
     }
-    if (!asset->modifiers.empty() || !asset->otherUvSets.isEmpty()) {
-        error = tr("Studio publishing currently supports one UV set and no WorldForge modifiers.");
+    if (!asset->modifiers.empty() || (!asset->otherUvSets.isEmpty() && uvManifest.isEmpty())) {
+        error = tr("Reopen the asset in an updated Studio session with its named UV layers. WorldForge modifiers must be applied before publishing.");
         return false;
     }
-    auto mesh = importGlb(glb,error);
-    if (!mesh)
+    StudioMeshData data;
+    auto mesh = importStudioGlb(glb,uvManifest,clipData,data,error);
+    if (!mesh || !preserveProjectMaterials(assetId,*mesh,error))
         return false;
     QString sourceHash;
     if (!studioSource.isEmpty() && !storeStudioSource(studioSource,sourceHash,error))
         return false;
-    return updateMesh(assetId,std::move(*mesh),tr("Publish Studio Mesh"),error,expected,{},sourceHash);
+    return updateMesh(assetId,std::move(*mesh),tr("Publish Studio Mesh"),error,expected,{},sourceHash,nullptr,&data);
 }
 
-bool ProjectStore::createStudioMesh(const QString &name,wf::Mesh mesh,const QByteArray &studioSource,QString &error)
+QByteArray ProjectStore::exportStudioInput(const MeshAsset &asset,QString &error) const
+{
+    GlbUvLayers layers{asset.activeUvSet,{}};
+    for (auto it = asset.otherUvSets.cbegin(); it != asset.otherUvSets.cend(); ++it)
+        if (!it->needsUnwrap)
+            layers.other.insert(it.key(),it->corners);
+    return exportGlb(*asset.mesh,asset.name,error,true,layers);
+}
+
+bool ProjectStore::createStudioMesh(const QString &name,wf::Mesh mesh,const QByteArray &studioSource,QString &error,
+                                    const StudioMeshData *studio)
 {
     if (!project() || name.trimmed().isEmpty()) {
         error = tr("Open a project and enter a mesh name.");
@@ -1876,7 +2259,7 @@ bool ProjectStore::createStudioMesh(const QString &name,wf::Mesh mesh,const QByt
     error = QString::fromStdString(wf::validateMesh(mesh));
     QString sourceHash;
     return error.isEmpty() && storeStudioSource(studioSource,sourceHash,error)
-        && addMesh(std::move(mesh),name,error,nullptr,{},sourceHash);
+        && addMesh(std::move(mesh),name,error,nullptr,{},sourceHash,studio);
 }
 
 bool ProjectStore::storeStudioSource(const QByteArray &source,QString &hash,QString &error)
@@ -1917,7 +2300,7 @@ bool ProjectStore::reimportMesh(QString &error, bool replaceLocalEdits)
 
 bool ProjectStore::updateMesh(const QString &id, wf::Mesh mesh, const QString &label, QString &error,
                               const wf::Mesh *expected,std::optional<std::set<wf::MeshEdge>> seams,
-                              const QString &studioSourceHash,const SceneObject *placement)
+                              const QString &studioSourceHash,const SceneObject *placement,const StudioMeshData *studio)
 {
     const auto *asset = meshAsset(id);
     if (!asset) {
@@ -1935,17 +2318,32 @@ bool ProjectStore::updateMesh(const QString &id, wf::Mesh mesh, const QString &l
         error = tr("The staged placement is invalid or already exists.");
         return false;
     }
+    const auto &library = project()->surfaces;
+    for (const auto &slot : mesh.materials) {
+        const auto materialId = QString::fromStdString(slot.sharedMaterialId);
+        const auto material = library.materials.constFind(materialId);
+        if (material == library.materials.cend())
+            continue;
+        const auto old = std::ranges::find(asset->mesh->materials,slot.sharedMaterialId,&wf::MeshMaterial::sharedMaterialId);
+        if ((old != asset->mesh->materials.end() && *old == slot) || slot == resolveProjectMaterial(materialId,*material,library))
+            continue;
+        error = tr("Edit the reusable material in its Material Details, or make this slot independent first.");
+        return false;
+    }
     const bool changed = *asset->mesh != mesh;
-    if (!placement && !changed && (!seams || *seams == asset->uvSeams)
+    const auto *uvLayers = studio && studio->uvs ? &*studio->uvs : nullptr;
+    if (!uvLayers && (!studio || studio->clip == asset->clip) && !placement && !changed && (!seams || *seams == asset->uvSeams)
         && (studioSourceHash.isEmpty() || studioSourceHash == asset->studioSourceHash))
         return true;
     auto assets = project()->assets;
     auto &updated = assets[id];
-    if (!studioSourceHash.isEmpty() && studioSourceHash != updated.studioSourceHash) {
+    if (studio)
+        updated.clip = studio->clip;
+    if (uvLayers && !replaceStudioUvs(updated,*uvLayers,error))
+        return false;
+    const bool sourceChanged = !studioSourceHash.isEmpty() && studioSourceHash != updated.studioSourceHash;
+    if (sourceChanged)
         updated.studioSourceHash = studioSourceHash;
-        if (!changed)
-            updated.mesh = QSharedPointer<wf::Mesh>::create(std::move(mesh));
-    }
     if (seams || !updated.uvSeams.empty()) {
         const wf::MeshTopology topology(mesh);
         if (seams) {
@@ -1996,12 +2394,14 @@ bool ProjectStore::updateMesh(const QString &id, wf::Mesh mesh, const QString &l
         if (geometryChanged)
             updated.revolveProfile = {};
         updated.mesh = QSharedPointer<wf::Mesh>::create(std::move(mesh));
+    } else if (sourceChanged || uvLayers || (studio && studio->clip != asset->clip)) {
+        updated.mesh = QSharedPointer<wf::Mesh>::create(std::move(mesh));
     }
     updated.locallyEdited = true;
     auto objects = project()->objects;
     if (placement)
         objects.append(*placement);
-    return pushProjectEdit(objects,assets,placement ? placement->id : selection_,label,&error);
+    return pushProjectEdit(objects,assets,placement ? placement->id : selection_,label,&error,nullptr,uvLayers ? id : QString{});
 }
 
 bool ProjectStore::publishStudioMeshWithPlacement(const QString &assetId,const wf::Mesh *expected,wf::Mesh mesh,
@@ -2016,6 +2416,8 @@ bool ProjectStore::publishStudioMeshWithPlacement(const QString &assetId,const w
         error = tr("Studio publishing currently supports one UV set and no WorldForge modifiers.");
         return false;
     }
+    if (!preserveProjectMaterials(assetId,mesh,error))
+        return false;
     QString sourceHash;
     if (!studioSource.isEmpty() && !storeStudioSource(studioSource,sourceHash,error))
         return false;
@@ -2051,6 +2453,117 @@ bool ProjectStore::linkMaterialSlot(const QString &target,int targetSlot,const Q
     assets[target].mesh = QSharedPointer<wf::Mesh>::create(std::move(mesh));
     assets[target].locallyEdited = true;
     return pushProjectEdit(project()->objects,assets,selection_,tr("Link Material Slot"),&error);
+}
+
+QString ProjectStore::importProjectTexture(const QString &path,QString &error)
+{
+    const auto *active = project();
+    QFile file(path);
+    if (!active || !file.open(QIODevice::ReadOnly) || file.size() > qsizetype(wf::MeshMaterial::maxTextureBytes)) {
+        error = tr("Open a project and select a readable PNG or JPEG up to 16 MiB.");
+        return {};
+    }
+    auto bytes = file.read(qint64(wf::MeshMaterial::maxTextureBytes)+1);
+    const auto size = surfaceImageSize(bytes,true);
+    if (!size) {
+        error = tr("Choose a valid PNG or JPEG no larger than 8192 pixels per side and 32 megapixels.");
+        return {};
+    }
+    const QFileInfo info(path);
+    const auto id = newId();
+    auto library = active->surfaces;
+    const auto name = info.completeBaseName().trimmed().left(120);
+    library.textures.insert(id,{name.isEmpty() ? tr("Texture") : name,info.fileName(),
+        size->width(),size->height(),std::move(bytes),info.canonicalFilePath()});
+    return pushProjectEdit(active->objects,active->assets,selection_,tr("Import Project Texture"),&error,&library) ? id : QString{};
+}
+
+std::optional<TextureReimport> ProjectStore::previewTextureReimport(const QString &id,const QString &path,QString &error) const
+{
+    const auto *active = project();
+    QFile file(path);
+    if (!active || !active->surfaces.textures.contains(id) || !file.open(QIODevice::ReadOnly)
+        || file.size() > qsizetype(wf::MeshMaterial::maxTextureBytes)) {
+        error = tr("Choose a readable PNG or JPEG up to 16 MiB.");
+        return {};
+    }
+    auto bytes = file.read(qint64(wf::MeshMaterial::maxTextureBytes)+1);
+    const auto size = surfaceImageSize(bytes,true);
+    if (!size) {
+        error = tr("Choose a valid PNG or JPEG no larger than 8192 pixels per side and 32 megapixels.");
+        return {};
+    }
+    const auto before = active->surfaces.textures.value(id);
+    const QFileInfo info(path);
+    return TextureReimport{active->id,id,before,{before.name,info.fileName(),size->width(),size->height(),
+        std::move(bytes),info.canonicalFilePath()}};
+}
+
+bool ProjectStore::applyTextureReimport(const TextureReimport &preview,QString &error)
+{
+    const auto *active = project();
+    if (!active || active->id != preview.projectId || !active->surfaces.textures.contains(preview.id)
+        || active->surfaces.textures.value(preview.id) != preview.before) {
+        error = tr("This texture changed after preview. Review the updated asset before reimporting.");
+        return false;
+    }
+    auto library = active->surfaces;
+    library.textures[preview.id] = preview.after;
+    return pushProjectEdit(active->objects,active->assets,selection_,tr("Reimport Texture"),&error,&library);
+}
+
+QString ProjectStore::saveProjectMaterial(const QString &id,const ProjectMaterial &material,QString &error)
+{
+    const auto *active = project();
+    if (!active || (!id.isEmpty() && !active->surfaces.materials.contains(id))
+        || !validProjectMaterial(material,active->surfaces)) {
+        error = tr("Enter a material name, use factors from 0 to 1, and choose textures from this project.");
+        return {};
+    }
+    auto library = active->surfaces;
+    const auto key = id.isEmpty() ? newId() : id;
+    auto saved = material;
+    saved.name = saved.name.trimmed();
+    library.materials.insert(key,std::move(saved));
+    return pushProjectEdit(active->objects,active->assets,selection_,tr("Save Project Material"),&error,&library) ? key : QString{};
+}
+
+bool ProjectStore::assignProjectMaterial(const QString &materialId,const QString &meshId,int slot,QString &error)
+{
+    const auto *active = project();
+    const auto *asset = meshAsset(meshId);
+    if (!active || !asset || !active->surfaces.materials.contains(materialId)
+        || slot < 0 || std::size_t(slot) >= asset->mesh->materials.size()) {
+        error = tr("Choose an existing project material and mesh slot.");
+        return false;
+    }
+    auto candidate = *asset->mesh;
+    candidate.materials[slot] = resolveProjectMaterial(materialId,active->surfaces.materials.value(materialId),active->surfaces);
+    return updateMesh(meshId,std::move(candidate),tr("Assign Project Material"),error,asset->mesh.data());
+}
+
+bool ProjectStore::preserveProjectMaterials(const QString &meshId,wf::Mesh &mesh,QString &error) const
+{
+    const auto *asset = meshAsset(meshId);
+    if (!asset)
+        return false;
+    for (const auto &slot : asset->mesh->materials) {
+        if (!project()->surfaces.materials.contains(QString::fromStdString(slot.sharedMaterialId)))
+            continue;
+        const auto matches = [&slot](const auto &material) { return material.name == slot.name; };
+        const auto original = std::ranges::find_if(asset->mesh->materials,[&](const auto &material) {
+            return matches(material) && material.sharedMaterialId != slot.sharedMaterialId;
+        });
+        auto destination = std::ranges::find_if(mesh.materials,matches);
+        if (original != asset->mesh->materials.end() || destination == mesh.materials.end()
+            || std::ranges::count_if(mesh.materials,matches) != 1) {
+            error = tr("Studio could not match linked material “%1”. Keep its name unique and unchanged, or make the slot independent.")
+                .arg(QString::fromStdString(slot.name));
+            return false;
+        }
+        *destination = slot;
+    }
+    return true;
 }
 
 bool ProjectStore::transformMeshComponents(const QMap<QString,std::set<int>> &selection,
@@ -2288,6 +2801,153 @@ bool ProjectStore::updateObjects(const QList<SceneObject> &objects, const QStrin
         *match = object;
     }
     return pushProjectEdit(after, project()->assets, selection_, action, &error);
+}
+
+QString ProjectStore::saveBehavior(const QString &id,const ProjectBehavior &behavior,QString &error)
+{
+    const auto *active = project();
+    if (!active || !validBehavior(behavior) || (!id.isEmpty() && !active->behaviors.contains(id))
+        || (id.isEmpty() && active->behaviors.size() >= 256)) {
+        error = tr("Choose a behavior name, event, and action. A project supports up to 256 behavior assets.");
+        return {};
+    }
+    const auto validMission = [this](const QString &id) {
+        const auto *target = object(id);
+        return id.isEmpty() || (target && target->visible && target->details.value("gameplay").toString() == "missionStart");
+    };
+    if (!validMission(behavior.mission) || !validMission(behavior.requiredMission)) {
+        error = tr("Choose a visible mission start for the event or condition.");
+        return {};
+    }
+    auto rules = active->behaviors;
+    const auto key = id.isEmpty() ? newId() : id;
+    rules.insert(key,behavior);
+    return pushProjectEdit(active->objects,active->assets,selection_,tr("Save Behavior"),&error,nullptr,{},&rules)
+        ? key : QString{};
+}
+
+QList<BehaviorComponent> behaviorComponents(const SceneObject &object)
+{
+    QList<BehaviorComponent> result;
+    if (object.details.contains("behaviorComponents")) {
+        for (const auto &value : object.details.value("behaviorComponents").toArray()) {
+            const auto row = value.toObject();
+            BehaviorComponent component{row.value("asset").toString(),row.value("enabled").toBool(true),row.value("target").toString(),{}};
+            if (row.contains("amount"))
+                component.amount = float(row.value("amount").toDouble());
+            result.append(component);
+        }
+    } else if (const auto asset = object.details.value("behaviorAsset").toString(); !asset.isEmpty()) {
+        result.append({asset,true,{},{}});
+    }
+    return result;
+}
+
+bool ProjectStore::attachBehavior(const QString &objectId,const QString &behaviorId,QString &error)
+{
+    const auto *owner = object(objectId);
+    if (!owner) {
+        error = tr("Choose a level object and a behavior asset.");
+        return false;
+    }
+    auto components = behaviorComponents(*owner);
+    if (components.isEmpty()) {
+        if (!behaviorId.isEmpty())
+            components.append({behaviorId,true,{},{}});
+    } else if (behaviorId.isEmpty()) {
+        components.removeFirst();
+    } else if (components.front().assetId != behaviorId) {
+        components.front() = {behaviorId,true,{},{}};
+    }
+    return setBehaviorComponents(objectId,components,error);
+}
+
+bool ProjectStore::setBehaviorComponents(const QString &objectId,const QList<BehaviorComponent> &components,QString &error)
+{
+    const auto *owner = object(objectId);
+    if (!owner || components.size() > maxBehaviorComponents) {
+        error = tr("Choose a level object. Each object supports up to %1 behavior components.").arg(maxBehaviorComponents);
+        return false;
+    }
+    const auto previous = behaviorComponents(*owner);
+    QSet<QString> used;
+    for (const auto &component : components) {
+        if (component.assetId.isEmpty() || used.contains(component.assetId)
+            || (component.amount && !(*component.amount >= 0.1f && *component.amount <= 15))) {
+            error = tr("Each behavior asset can be attached once per object. Overrides must be between 0.1 and 15.");
+            return false;
+        }
+        used.insert(component.assetId);
+        const auto asset = project()->behaviors.constFind(component.assetId);
+        if (asset == project()->behaviors.cend() && !previous.contains(component)) {
+            error = tr("Choose an existing behavior asset.");
+            return false;
+        }
+        if (!component.enabled || asset == project()->behaviors.cend())
+            continue;
+        const auto *target = component.targetId.isEmpty() ? owner : object(component.targetId);
+        if (!target || (!component.targetId.isEmpty() && !target->visible)) {
+            error = tr("Choose a visible action target.");
+            return false;
+        }
+        const auto physics = target->details.value("physics").toString();
+        using Action = wf::BehaviorRule::Action;
+        if (asset->action != Action::PulseBeacon
+            && (target->meshAsset.isEmpty() || !target->parentId.isEmpty()
+                || physics != (asset->action == Action::RaiseObject ? "Static" : "Dynamic"))) {
+            error = asset->action == Action::RaiseObject ? tr("Raise Object requires an unparented mesh with Static physics.")
+                : tr("Launch Upward requires an unparented mesh with Dynamic physics.");
+            return false;
+        }
+    }
+    if (components == previous)
+        return true;
+    auto copy = *owner;
+    copy.details.remove("behaviorAsset");
+    copy.details.remove("behaviorComponents");
+    if (components.size() == 1 && components.front().enabled
+        && components.front().targetId.isEmpty() && !components.front().amount) {
+        copy.details.insert("behaviorAsset",components.front().assetId);
+    } else if (!components.isEmpty()) {
+        QJsonArray rows;
+        for (const auto &component : components) {
+            QJsonObject row{{"asset",component.assetId},{"enabled",component.enabled}};
+            if (!component.targetId.isEmpty())
+                row.insert("target",component.targetId);
+            if (component.amount)
+                row.insert("amount",double(*component.amount));
+            rows.append(row);
+        }
+        copy.details.insert("behaviorComponents",rows);
+    }
+    return updateObjects({copy},tr("Edit Behavior Components"),error);
+}
+
+bool ProjectStore::setNativeComponent(const QString &objectId,const QString &type,std::optional<QJsonObject> component,QString &error)
+{
+    const auto *owner = object(objectId);
+    if (!owner || isLegacyPlaceholder(*owner) || type.isEmpty()) {
+        error = tr("Select a scene object and a native component type.");
+        return false;
+    }
+    auto entries = owner->details.value("nativeComponents").toObject();
+    const auto previous = entries;
+    if (component)
+        entries.insert(type,*component);
+    else
+        entries.remove(type);
+    if (!validNativeComponentData(entries)) {
+        error = tr("Invalid native component settings. An object supports up to 16 native components.");
+        return false;
+    }
+    if (entries == previous)
+        return true;
+    auto object = *owner;
+    if (entries.isEmpty())
+        object.details.remove("nativeComponents");
+    else
+        object.details.insert("nativeComponents",entries);
+    return updateObjects({object},tr("Edit Native Component"),error);
 }
 
 void ProjectStore::deleteObject()

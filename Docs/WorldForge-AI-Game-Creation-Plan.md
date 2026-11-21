@@ -1,5 +1,7 @@
 # WorldForge AI-Assisted Game Creation Plan
 
+**Status: Complete.** All four phases were implemented and passed their automated checks on the GTX 1650 development machine. The delivered milestone covers one barrier and one playable street.
+
 WorldForge should let a creator describe an asset or gameplay change, edit it by hand in Studio or World Editor, and test it in a playable game. This plan starts with one concrete road barrier and expands to one playable street. A large open-world game is the long-term benchmark. The street is the first test of whether the workflow scales across art, gameplay, and the runtime.
 
 ## Starting point
@@ -7,7 +9,7 @@ WorldForge should let a creator describe an asset or gameplay change, edit it by
 - The embedded Blender-based Studio already hosts the authoring workspaces. **Edit Selected Mesh in Studio**, **Publish to WorldForge**, and **Apply Studio Update** provide an existing static-mesh publishing path.
 - Studio saves editable `.wfasset` revisions. The existing publishing audit covers two materials, UVs, multiple placed instances, undo and redo, stale revision rejection, and reopening. The barrier adds cross-workspace sculpting and texture painting to that path.
 - The starter cube opens in Sculpting with detail ready to use. The barrier must exercise an asset selected in an actual project, including the low-poly preparation and the game mesh that gets published.
-- The current Studio entry point restricts authoring to one UV set and meshes without WorldForge modifiers. Keep those cases visible as limits until they have their own verified round trips.
+- The Forge AI barrier command uses one UV set and meshes without WorldForge modifiers. Manual Studio publishing can exchange named UV layouts.
 
 See the [Studio implementation plan](WorldForge-Studio-Implementation-Plan.md) for the integration baseline and the [development audit](Development-Audit.md) for prior verification.
 
@@ -18,9 +20,7 @@ See the [Studio implementation plan](WorldForge-Studio-Implementation-Plan.md) f
 | 3 | One prompt that produces a reviewable, undoable barrier edit | Phases 1 and 2 |
 | 4 | A playable street that proves coordinated AI-assisted edits | Phase 3 |
 
-## Remaining work in build order
-
-Phases 1–4 pass their automated checks on the GTX 1650 development machine. All five build steps below are done. The open items are listed under **Still open**.
+## Completed work in build order
 
 | Order | Work | Verified |
 | --- | --- | --- |
@@ -30,8 +30,11 @@ Phases 1–4 pass their automated checks on the GTX 1650 development machine. Al
 | 4 · Phase 3 | **Forge AI** in the World Editor toolbar plans a barrier request as four typed commands. It runs the bevel and stripe paint in a background Studio job on a working copy and applies the result as one undoable change. | 13 checks in the [Forge AI audit](../build/audit/final-forge-ai/controls.csv). See Phase 3. |
 | 5 · Phase 4 | The **Playable Street** starter template, traffic and missions in editor Play and the standalone Player, base-color textures in the Player, and coordinated street requests in Forge AI. | 12 checks in the [street audit](../build/audit/phase4-street-final/controls.csv). See Phase 4. |
 
-### Still open
+## Follow-up development and release verification
 
+The [next development plan](WorldForge-Next-Development-Plan.md) schedules eight hours of Content Browser and engine development and records the reusable asset work that follows.
+
+- **Asset library follow-ups.** Search Assets and Content Browser now support reusable base-color textures and materials. The next asset workflow is Asset Hub usage tracking and reimport. Reusable PBR maps and older Studio source round trips are tracked in the [next development plan](WorldForge-Next-Development-Plan.md#reusable-base-color-assets).
 - **Clean Windows PC.** The Editor-to-Player workflow has not been run on a clean Windows install. It needs a separate machine or VM. See the [Windows release checklist](WorldForge-Studio-Implementation-Plan.md#phase-6--release-and-maintain-the-windows-build).
 - **Forge AI understands a fixed set of requests.** Its planner is rule-based. It reads barrier style requests and street requests that move the repair shop entrance or route traffic. Requests outside that set get an explanation of what is supported. No language model is connected yet. The typed commands are the interface a model would produce.
 - **No viewport preview before apply.** The Forge AI preview shows the review text, the stripe texture, and the target position. It does not draw a ghost of the barrier in the viewport before it is applied.
@@ -47,7 +50,7 @@ Phases 1–4 pass their automated checks on the GTX 1650 development machine. Al
 - [x] Preview and publish through the existing Studio exchange. Verify that every instance of the barrier updates in place. Preserve per-instance transforms and related scene references. Keep the existing collider settings and surface any collision bounds that need review.
 - [x] Test undo and redo, save and reopen the project, reopen the editable source, and run Play. Exercise a stale revision, a missing texture, and an invalid mesh payload. Verify that the rejected publish leaves the last successful revision usable.
 
-**Verified in the Phase 1 build.** Studio performed sculpt and Texture Paint brush strokes, packed the unsaved paint pixels, and reopened the editable source with the paint intact. The editor audit confirmed the same named asset across Studio tabs and rendered the published paint on both placements after reopening. Blender shortcuts were checked in the embedded viewport with Tab, an axis-constrained move, Ctrl+Z, and F3 search. In-editor Play uses the World Editor base-color maps. The standalone Player currently exports material colors without texture maps. See the [live paint test](../build/audit/phase1-studio-live-paint-a0fc5c/result) and [editor audit](../build/audit/phase1-live-paint-editor/controls.csv).
+**Verified in the Phase 1 build.** Studio performed sculpt and Texture Paint brush strokes, packed the unsaved paint pixels, and reopened the editable source with the paint intact. The editor audit confirmed the same named asset across Studio tabs and rendered the published paint on both placements after reopening. Blender shortcuts were checked in the embedded viewport with Tab, an axis-constrained move, Ctrl+Z, and F3 search. In-editor Play used the World Editor base-color maps. Phase 4 added base-color map support to the standalone Player. See the [live paint test](../build/audit/phase1-studio-live-paint-a0fc5c/result) and [editor audit](../build/audit/phase1-live-paint-editor/controls.csv).
 
 **Pass when** both barrier instances show the sculpt and texture after reopening, the original placements and unrelated prop are intact, the source can still be edited, and Play loads the published result.
 

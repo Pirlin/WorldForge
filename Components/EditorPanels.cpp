@@ -1,4 +1,7 @@
+#include "Components/BehaviorEditor.h"
+#include "Components/NativeGameplayEditor.h"
 #include "Components/EditorPanels.h"
+#include "Components/ProjectSurfaceDetails.h"
 #include "Components/CommandTerminal.h"
 #include "State/WorldScene.h"
 
@@ -566,6 +569,28 @@ Inspector::Inspector(ProjectStore &store, QWidget *parent)
     geometryState_->setWordWrap(true);
     meshForm->addRow(geometryState_);
 
+    auto *logic = section(sections,tr("Behavior"));
+    auto *logicForm = new QFormLayout(logic);
+    behavior_ = new QComboBox(logic);
+    behavior_->setObjectName("objectBehavior");
+    logicForm->addRow(tr("First behavior"),behavior_);
+    behaviorComponents_ = new QPushButton(tr("Manage Components…"),logic);
+    behaviorComponents_->setObjectName("detailsManageBehaviorComponents");
+    logicForm->addRow(behaviorComponents_);
+    connect(behaviorComponents_,&QPushButton::clicked,this,[this] {
+        editBehaviorComponents(store_,store_.selection(),this);
+    });
+    auto *nativeComponents = new QPushButton(tr("Native Components…"),logic);
+    nativeComponents->setObjectName("detailsNativeComponents");
+    logicForm->addRow(nativeComponents);
+    connect(nativeComponents,&QPushButton::clicked,this,[this] { editNativeComponents(store_,this); });
+    connect(behavior_,&QComboBox::activated,this,[this] {
+        QString error;
+        if (!store_.attachBehavior(store_.selection(),behavior_->currentData().toString(),error)) {
+            QMessageBox::warning(this,tr("Attach Behavior"),error);
+            refresh();
+        }
+    });
     auto *surface = section(sections, tr("Material"));
     auto *materialForm = new QFormLayout(surface);
     materialForm->setContentsMargins(12, 4, 8, 5);
@@ -604,8 +629,10 @@ Inspector::Inspector(ProjectStore &store, QWidget *parent)
     });
     auto *light = section(sections, tr("Light"));
     auto *lightForm = new QFormLayout(light);
-    intensity_->setRange(0, 4);
-    intensity_->setSingleStep(0.1);
+    // Photometric units: lux for directional lights, candela for point lights (see Engine/Render/ColorPipeline.h).
+    intensity_->setRange(0, maximumLuminousIntensity);
+    intensity_->setDecimals(0);
+    intensity_->setSingleStep(1000);
     intensity_->setAccessibleName(tr("Light intensity"));
     lightForm->addRow(tr("Intensity"), intensity_);
     connect(intensity_, &QDoubleSpinBox::editingFinished, this, &Inspector::apply);
@@ -762,6 +789,21 @@ void Inspector::refresh()
     }
     geometryState_->setText(asset ? (asset->sourcePath.isEmpty() ? tr("Native mesh") : QFileInfo(asset->sourcePath).fileName())
         : (object->type == "Static Mesh" ? tr("This object has no renderable asset. Assign a project mesh.") : QString()));
+    const auto *selected = store_.selectedObject();
+    const auto components = selected ? behaviorComponents(*selected) : QList<BehaviorComponent>{};
+    const auto behaviorId = components.isEmpty() ? QString{} : components.front().assetId;
+    const QSignalBlocker behaviorSignals(behavior_);
+    behavior_->clear();
+    behavior_->addItem(tr("None"),QString{});
+    if (const auto *project = store_.project())
+        for (auto it = project->behaviors.cbegin(); it != project->behaviors.cend(); ++it)
+            behavior_->addItem(it->name,it.key());
+    if (!behaviorId.isEmpty() && behavior_->findData(behaviorId) < 0)
+        behavior_->addItem(tr("Missing Behavior"),behaviorId);
+    behavior_->setCurrentIndex(behavior_->findData(behaviorId));
+    behavior_->setEnabled(selected && components.size() <= 1);
+    behaviorComponents_->setEnabled(selected);
+    behaviorComponents_->setText(tr("Manage Components (%1)…").arg(components.size()));
     const int materialIndex = materialSlot_->currentIndex();
     materialSlot_->clear();
     if (asset)
@@ -771,7 +813,12 @@ void Inspector::refresh()
         materialSlot_->setCurrentIndex(materialIndex);
     const bool light = object->type == "Directional Light" || object->type == "Point Light";
     intensity_->setEnabled(light);
-    intensity_->setValue(object->details.value("lightIntensity").toDouble(1));
+    const bool point = object->type == "Point Light";
+    intensity_->setSuffix(point ? tr(" cd") : tr(" lx"));
+    intensity_->setMaximum(point ? maximumLuminousIntensity : maximumIlluminance);
+    intensity_->setToolTip(point ? tr("Luminous intensity in candela. A bright street lamp is a few thousand candela.")
+                                 : tr("Illuminance in lux. A clear midday sun is about 100,000 lux, an overcast sky about 10,000."));
+    intensity_->setValue(light ? lightPhotometric(*object) : 0);
     bodyMode_->setEnabled(asset != nullptr);
     bodyMode_->setCurrentIndex(std::max(0,bodyMode_->findData(object->details.value("physics").toString())));
     colliderShape_->setEnabled(asset && bodyMode_->currentIndex() > 0);
@@ -846,7 +893,10 @@ void Inspector::apply()
         if (!next.meshAsset.isEmpty() && next.type == "Empty")
             next.type = "Static Mesh";
     } else if (sender() == intensity_) {
-        next.details.insert("lightIntensity", intensity_->value());
+        // Leaving the field without editing keeps an older project's unitless value as it is.
+        if (std::abs(intensity_->value() - std::round(lightPhotometric(*current))) < 0.5)
+            return;
+        setLightPhotometric(next.details, next.type, intensity_->value());
     } else if (sender() == bodyMode_) {
         next.details.insert("physics", bodyMode_->currentData().toString());
     } else if (sender() == colliderShape_) {
@@ -994,6 +1044,12 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
         store_.placeMesh(tiles_->currentIndex().data(IdRole).toString());
     });
     addMenu->addAction(tr("New Studio Asset…"), this, &ContentBrowser::newStudioAssetRequested);
+    addMenu->addAction(tr("New Behavior…"),this,[this] { editBehaviorAsset(store_,{},this); });
+    addMenu->addAction(tr("Import Texture…"),this,[this] { projectSurfaces::importTexture(store_,this); });
+    addMenu->addAction(tr("New Material…"),this,[this] {
+        const auto *mesh = store_.selectedMesh();
+        projectSurfaces::editMaterial(store_,{},mesh ? mesh->id : QString{},this);
+    });
     add->setMenu(addMenu);
     auto *import = textButton("import", tr("Import"));
     connect(import, &QToolButton::clicked, this, [this] {
@@ -1016,12 +1072,14 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
     auto *copy = iconButton("copy", tr("Copy asset name"), commands);
     auto *link = iconButton("link", tr("Copy asset ID"), commands);
     connect(copy, &QToolButton::clicked, this, [this] {
-        if (const auto *asset = store_.meshAsset(tiles_->currentIndex().data(IdRole).toString()))
-            QApplication::clipboard()->setText(asset->name);
+        const auto index = tiles_->currentIndex();
+        if (index.isValid())
+            QApplication::clipboard()->setText(index.data(AssetNameRole).toString());
     });
     connect(link, &QToolButton::clicked, this, [this] {
-        if (const auto *asset = store_.meshAsset(tiles_->currentIndex().data(IdRole).toString()))
-            QApplication::clipboard()->setText(asset->id);
+        const auto index = tiles_->currentIndex();
+        if (index.isValid())
+            QApplication::clipboard()->setText(index.data(IdRole).toString());
     });
     bar->addWidget(copy);
     bar->addWidget(link);
@@ -1105,7 +1163,11 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
         if (id.isEmpty())
             return;
         QMenu menu(tiles_);
-        menu.addAction(tr("Edit in Studio"), this, [this, id] { emit editStudioAssetRequested(id); });
+        menu.addAction(tr("Open Asset"), this, [this, id] { emit openAssetRequested(id); });
+        if (store_.meshAsset(id)) {
+            menu.addAction(tr("Edit in Studio"), this, [this, id] { emit editStudioAssetRequested(id); });
+            menu.addAction(tr("Add to Level"), this, [this, id] { store_.placeMesh(id); });
+        }
         menu.exec(tiles_->viewport()->mapToGlobal(point));
     });
     auto *tileDelegate = new AssetTileDelegate(tiles_);
@@ -1155,7 +1217,9 @@ ContentBrowser::ContentBrowser(ProjectStore &store, QWidget *parent)
             store_.select(instance->id);
     });
     connect(tiles_, &QListView::activated, this, [this](const QModelIndex &index) {
-        store_.placeMesh(index.data(IdRole).toString());
+        const auto id = index.data(IdRole).toString();
+        if (!id.isEmpty())
+            emit openAssetRequested(id);
     });
     connect(&store_, &ProjectStore::sceneChanged, this, &ContentBrowser::rebuild);
     connect(&store_, &ProjectStore::selectionChanged, this, &ContentBrowser::syncSelection);
@@ -1169,7 +1233,8 @@ void ContentBrowser::rebuild()
     assetModel_->clear();
     const auto *project = store_.project();
     const auto query = search_->text().trimmed();
-    path_->setText(tr("Content  ›  Meshes"));
+    path_->setText(project && (!project->surfaces.empty() || !project->behaviors.isEmpty())
+        ? tr("Content") : tr("Content  ›  Meshes"));
     QList<const MeshAsset *> assets;
     if (project) {
         for (const auto &asset : project->assets) {
@@ -1193,6 +1258,24 @@ void ContentBrowser::rebuild()
             .arg(asset->evaluated().vertices.size()).arg(asset->evaluated().faces.size()));
         assetModel_->appendRow(tile);
     }
+    if (project) {
+        const auto surfaceTile = [&](const QString &id,const QString &name,const QString &type,const QString &icon) {
+            auto *tile = item(name,editorIcon(icon,QColor("#a78be6")));
+            tile->setData(id,IdRole);
+            tile->setData(name,AssetNameRole);
+            tile->setData(type,AssetTypeRole);
+            assetModel_->appendRow(tile);
+        };
+        for (auto it = project->surfaces.textures.cbegin(); it != project->surfaces.textures.cend(); ++it)
+            if (it->name.contains(query,Qt::CaseInsensitive) || it->fileName.contains(query,Qt::CaseInsensitive))
+                surfaceTile(it.key(),it->name,tr("Texture"),"layers");
+        for (auto it = project->surfaces.materials.cbegin(); it != project->surfaces.materials.cend(); ++it)
+            if (it->name.contains(query,Qt::CaseInsensitive))
+                surfaceTile(it.key(),it->name,tr("Material"),"box");
+        for (auto it = project->behaviors.cbegin(); it != project->behaviors.cend(); ++it)
+            if (it->name.contains(query,Qt::CaseInsensitive))
+                surfaceTile(it.key(),it->name,tr("Behavior"),"code");
+    }
     if (!previous.isEmpty()) {
         const auto matches = assetModel_->match(assetModel_->index(0, 0), IdRole, previous);
         if (!matches.isEmpty())
@@ -1205,7 +1288,8 @@ void ContentBrowser::syncSelection()
 {
     const QSignalBlocker block(tiles_->selectionModel());
     const auto *asset = store_.selectedMesh();
-    if (asset) {
+    if (asset && (tiles_->currentIndex().data(IdRole).toString().isEmpty()
+        || store_.meshAsset(tiles_->currentIndex().data(IdRole).toString()))) {
         const auto matches = assetModel_->match(assetModel_->index(0, 0), IdRole, asset->id, 1, Qt::MatchExactly);
         if (matches.isEmpty())
             tiles_->selectionModel()->clear();
@@ -1213,7 +1297,7 @@ void ContentBrowser::syncSelection()
             tiles_->setCurrentIndex(matches.first());
     }
     const int count = assetModel_->rowCount();
-    count_->setText(tr("%n mesh asset(s)", nullptr, count));
+    count_->setText(tr("%n asset(s)", nullptr, count));
 }
 void ContentBrowser::appendLog(const QString &message)
 {

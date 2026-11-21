@@ -3,6 +3,7 @@
 #include "App/SystemMetrics.h"
 
 #include <QMainWindow>
+#include <functional>
 
 class ContentBrowser;
 class Outliner;
@@ -12,6 +13,7 @@ class EmbeddedStudio;
 class ForgeAiPanel;
 class ProjectLauncher;
 class QLabel;
+class QDialog;
 class QListView;
 class QMenu;
 class QMenuBar;
@@ -21,6 +23,7 @@ class QTabBar;
 class QToolBar;
 class QToolButton;
 class QProgressBar;
+class QPushButton;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -46,8 +49,11 @@ private:
     void switchWorkspace(int index);
     void showStudioWorkspace(int index);
     void openEmbeddedStudio(bool editSelected = false, const QString &assetId = {}, bool newAsset = false,
-                            int workspace = 2);
+                            int workspace = 2, QString newAssetName = {});
     void publishStudioMesh();
+    void showStudioAssets(int workspace);
+    void openAssetDetails(const QString &assetId,int workspace = 2);
+    void refreshAssetDetails();
     StudioWorkspace *studio(int index);
     void refreshProjects();
     void refreshStatus();
@@ -59,6 +65,13 @@ private:
     ProjectStore store_;
     QStackedWidget *pages_ = nullptr;
     EmbeddedStudio *embeddedStudio_ = nullptr;
+    QDialog *assetDetails_ = nullptr;
+    LiveViewport *assetPreview_ = nullptr;
+    QLabel *assetSummary_ = nullptr;
+    QPushButton *editInspectedAsset_ = nullptr;
+    QString inspectedAsset_;
+    QString inspectedProject_;
+    int assetWorkspace_ = 2;
     QString studioProjectId_;
     QString studioAssetId_;
     QString studioSourceRevision_;
@@ -72,6 +85,7 @@ private:
     QToolBar *commands_ = nullptr;
     QAction *save_ = nullptr;
     QAction *applyStudioUpdate_ = nullptr;
+    QAction *searchStudioAssets_ = nullptr;
     QAction *forgeAi_ = nullptr;
     ForgeAiPanel *forgeAiPanel_ = nullptr;
     QAction *renameProject_ = nullptr;
@@ -110,7 +124,9 @@ private:
     QList<QStackedWidget *> dockPages_;
     QList<QAction *> workspaceActions_;
     QHash<int, StudioWorkspace *> studios_;
+    QHash<int, QWidget *> gameplayWorkspaces_;
     QHash<int, QByteArray> workspaceLayouts_;
     int activeWorkspace_ = -1;
     int pendingStudioWorkspace_ = -1;
+    std::function<void()> nextStudioSession_;
 };

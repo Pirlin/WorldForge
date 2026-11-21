@@ -34,6 +34,7 @@ private:
     void refreshCommands();
     void runPreview();
     void showPreview(const ForgeAiJob::Result &result);
+    void reviewPlacement();
     void applyStage();
     void checkStage();
     void setReport(const QString &text);
@@ -58,7 +59,7 @@ private:
     QSpinBox *fade_;
     QComboBox *color_;
     QLabel *commands_;
-    QLabel *thumbnail_;
+    QPushButton *viewPlacement_;
     QPlainTextEdit *report_;
     QPushButton *planButton_;
     QPushButton *preview_;

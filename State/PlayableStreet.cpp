@@ -154,6 +154,11 @@ QString Report::summary() const
                           : tr("✗ The player could not reach the counter inside the repair shop."));
     lines << (trafficLooped ? tr("✓ Every traffic vehicle completed its route.")
                             : tr("✗ Traffic did not complete its route. Check for obstacles in the lanes."));
+    if (trace.beaconActive) lines << (trace.beaconEnded ? tr("✓ The beacon activated and expired.") : tr("✗ The beacon did not expire."));
+    if (trace.shotActive) lines << (trace.shotEnded ? tr("✓ The camera shot played and returned control.") : tr("✗ The camera shot did not end."));
+    if (trace.patrolWaited) lines << (trace.patrolReturned ? tr("✓ The NPC waited and returned.") : tr("✗ The NPC did not return."));
+    if (!gameplayVerified) lines << tr("✗ Some authored gameplay did not complete.");
+    lines.append(gameplayErrors);
     return lines.join('\n');
 }
 
@@ -163,6 +168,11 @@ Report verify(const ProjectStore &store, float maxSeconds)
     WorldRuntime runtime;
     if (!runtime.start(store, true) || !runtime.playerBody())
         return report;
+    if (!runtime.gameplayErrors().isEmpty()) {
+        report.gameplayErrors = runtime.gameplayErrors();
+        report.gameplayVerified = false;
+        return report;
+    }
     const auto player = *runtime.playerBody();
     wf::Autopilot pilot;
     const int steps = int(maxSeconds / wf::WorldSimulation::stepSeconds);
@@ -179,6 +189,8 @@ Report verify(const ProjectStore &store, float maxSeconds)
         if (!objective.isEmpty() && (report.objectives.isEmpty() || report.objectives.back() != objective))
             report.objectives << objective;
         const auto &gameplay = runtime.gameplay();
+        report.trace.observe(gameplay);
+        report.gameplayVerified = report.trace.complete(gameplay);
         const auto &position = runtime.simulation().bodies[player].position;
         for (const auto &mission : gameplay.missions)
             if (std::hypot(position[0] - mission.target[0], position[1] - mission.target[1]) <= mission.targetRadius
@@ -189,7 +201,7 @@ Report verify(const ProjectStore &store, float maxSeconds)
             report.missionSeconds = report.seconds;
         }
         report.trafficLooped = gameplay.trafficLooped();
-        if (report.missionComplete && report.trafficLooped)
+        if (report.ok())
             break;
     }
     return report;

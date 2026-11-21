@@ -2,13 +2,19 @@
 #include "App/EditorLog.h"
 
 #include "Components/EditorPanels.h"
+#include "Components/AssetHub.h"
+#include "Components/BehaviorEditor.h"
+#include "Components/NativeGameplayEditor.h"
+#include "Components/GameplayAuthoring.h"
 #include "Components/LiveViewport.h"
 #include "Components/ProjectLauncher.h"
+#include "Components/ProjectSurfaceDetails.h"
 #include "Components/WindowCaption.h"
 #include "State/WorldScene.h"
 #include "State/WorldRuntime.h"
 #include "State/GlbImport.h"
 #include "State/StudioPublishReview.h"
+#include "Engine/Geometry/MeshClip.h"
 #include "Components/ForgeAiPanel.h"
 #include "DesignSystem/Icons.h"
 #include "Workspaces/StudioWorkspace.h"
@@ -19,6 +25,7 @@
 #include <QCloseEvent>
 #include <QCheckBox>
 #include <QColorDialog>
+#include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
@@ -38,6 +45,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListView>
+#include <QListWidget>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
@@ -45,6 +53,7 @@
 #include <QPainterPath>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStackedWidget>
@@ -61,6 +70,7 @@
 #include <algorithm>
 #include <array>
 #include <sstream>
+#include <utility>
 
 #ifdef Q_OS_WIN
 #define NOMINMAX
@@ -352,8 +362,10 @@ void MainWindow::createActions()
         if (fileName.isEmpty())
             return;
         std::ostringstream data;
-        if (!WorldRuntime::exportScene(store_,data)) {
-            QMessageBox::warning(this,tr("Export Playable Scene"),tr("The scene exceeds the Player export limits."));
+        QString error;
+        if (!WorldRuntime::exportScene(store_,data,&error)) {
+            QMessageBox::warning(this,tr("Export Playable Scene"),
+                error.isEmpty() ? tr("The scene exceeds the Player export limits.") : error);
             return;
         }
         const auto bytes = std::move(data).str();
@@ -389,6 +401,7 @@ void MainWindow::createActions()
 
     windowMenu_ = mainMenu_->addMenu(tr("&Window"));
     auto *tools = mainMenu_->addMenu(tr("&Tools"));
+    tools->addAction(tr("C++ Gameplay Module…"),this,[this] { showNativeGameplay(store_,this); });
     workspaceMenu_ = tools->addMenu(tr("Workspaces"));
     auto *build = mainMenu_->addMenu(tr("&Build"));
     build->addAction(tr("Open build workspace"), this, [this] { switchWorkspace(20); });
@@ -417,6 +430,10 @@ void MainWindow::createActions()
     applyStudioUpdate_->setObjectName("applyStudioUpdate");
     applyStudioUpdate_->setVisible(false);
     connect(applyStudioUpdate_,&QAction::triggered,this,&MainWindow::publishStudioMesh);
+    searchStudioAssets_ = commands_->addAction(editorIcon("search"),tr("Search Assets"));
+    searchStudioAssets_->setObjectName("searchStudioAssets");
+    searchStudioAssets_->setVisible(false);
+    connect(searchStudioAssets_,&QAction::triggered,this,[this] { showStudioAssets(activeWorkspace_); });
     commands_->addAction(save_);
     for (auto *action : {undo, redo}) {
         commands_->addAction(action);
@@ -793,17 +810,27 @@ QWidget *MainWindow::createEditor()
     // Show mission objectives from Play in the status bar and the output log as they change.
     auto *objectives = new QTimer(this);
     objectives->setInterval(250);
+    auto *missionHud = new QLabel(editor);
+    missionHud->setObjectName("missionObjectiveHud");
+    missionHud->setTextFormat(Qt::PlainText);
+    missionHud->setWordWrap(true);
+    missionHud->setMargin(8);
+    missionHud->hide();
+    layout->insertWidget(1,missionHud);
     auto lastObjective = std::make_shared<QString>();
-    connect(objectives,&QTimer::timeout,this,[this,lastObjective] {
+    connect(objectives,&QTimer::timeout,this,[this,lastObjective,missionHud] {
         const auto objective = liveWorld_->runtimeObjective();
+        missionHud->setVisible(!objective.isEmpty() && liveWorld_->runtimeShowsHud());
         if (objective.isEmpty() || objective == *lastObjective)
             return;
         *lastObjective = objective;
+        missionHud->setText(objective);
         statusBar()->showMessage(objective);
         browser_->appendLog(tr("Objective: %1").arg(objective));
     });
-    connect(liveWorld_,&LiveViewport::runtimeChanged,this,[this,objectives,lastObjective] {
+    connect(liveWorld_,&LiveViewport::runtimeChanged,this,[this,objectives,lastObjective,missionHud] {
         lastObjective->clear();
+        missionHud->hide();
         if (liveWorld_->runMode() == LiveViewport::RunMode::Play)
             objectives->start();
         else
@@ -907,6 +934,50 @@ void MainWindow::editAtmosphere()
     localRadius->setToolTip(tr("Set the radius above zero to enable the fog volume."));
     auto *localDensity = scalar(tr("Local fog density"),0,1,initial.localFogDensity);
     localDensity->setSingleStep(0.01);
+    namespace color = worldforge::color;
+    auto *exposureMode = new QComboBox(&dialog);
+    exposureMode->setAccessibleName(tr("Camera exposure"));
+    exposureMode->addItem(tr("Manual (EV100)"),QStringLiteral("Manual"));
+    exposureMode->addItem(tr("Auto (meters the view)"),QStringLiteral("Auto"));
+    exposureMode->setCurrentIndex(initial.autoExposure ? 1 : 0);
+    form->addRow(tr("Camera exposure"),exposureMode);
+    auto *exposure = scalar(tr("Exposure value"),color::ev100FromStops(color::maximumExposure),
+                            color::ev100FromStops(color::minimumExposure),color::ev100FromStops(initial.exposure));
+    exposure->setSingleStep(0.5);
+    exposure->setSuffix(tr(" EV100"));
+    exposure->setToolTip(tr("Camera exposure at ISO 100: about 15 for a sunny day, 12 overcast, 7 indoors and 4 for a lit "
+                            "street at night. Each step of 1 halves the light the camera takes in."));
+    auto *compensation = scalar(tr("Exposure compensation"),-color::maximumCompensation,color::maximumCompensation,
+                                initial.exposureCompensation);
+    compensation->setSingleStep(0.5);
+    compensation->setSuffix(tr(" stops"));
+    compensation->setToolTip(tr("Brightens (positive) or darkens (negative) what auto exposure chooses."));
+    const auto exposureFields = [exposureMode,exposure,compensation] {
+        const bool automatic = exposureMode->currentIndex() == 1;
+        exposure->setEnabled(!automatic);
+        compensation->setEnabled(automatic);
+    };
+    exposureFields();
+    connect(exposureMode,&QComboBox::currentIndexChanged,&dialog,exposureFields);
+    auto *viewTransform = new QComboBox(&dialog);
+    viewTransform->setAccessibleName(tr("View transform"));
+    viewTransform->addItem(tr("AgX (matches Studio)"),QStringLiteral("AgX"));
+    viewTransform->addItem(tr("Standard (clips highlights)"),QStringLiteral("Standard"));
+    viewTransform->setCurrentIndex(initial.viewTransform == worldforge::color::ViewTransform::Standard ? 1 : 0);
+    form->addRow(tr("View transform"),viewTransform);
+    auto *antiAliasing = new QComboBox(&dialog);
+    antiAliasing->setAccessibleName(tr("Anti-aliasing"));
+    antiAliasing->addItem(tr("TAA (smooth edges)"),QStringLiteral("TAA"));
+    antiAliasing->addItem(tr("Off"),QStringLiteral("Off"));
+    antiAliasing->setCurrentIndex(initial.temporalAntiAliasing ? 0 : 1);
+    antiAliasing->setToolTip(tr("Temporal anti-aliasing renders each frame with a slightly shifted camera and blends the "
+                                "frames, which smooths jagged edges like supersampling."));
+    form->addRow(tr("Anti-aliasing"),antiAliasing);
+    auto *ambientOcclusion = new QCheckBox(tr("Ambient occlusion"),&dialog);
+    ambientOcclusion->setAccessibleName(tr("Ambient occlusion"));
+    ambientOcclusion->setChecked(initial.ambientOcclusion);
+    ambientOcclusion->setToolTip(tr("Darkens sky light in corners, creases and openings that the sky cannot reach."));
+    form->addRow(ambientOcclusion);
     auto *gravity = new QDoubleSpinBox(&dialog);
     gravity->setRange(0,50);
     gravity->setSuffix(tr(" m/s²"));
@@ -923,6 +994,8 @@ void MainWindow::editAtmosphere()
                               {"sunAzimuth",sunAzimuth->value()},{"sunElevation",sunElevation->value()},
                               {"shadows",shadows->isChecked()},{"localFogRadius",localRadius->value()},
                               {"localFogDensity",localDensity->value()},
+                              {"ev100",exposure->value()},{"exposureMode",exposureMode->currentData().toString()},
+                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},
                               {"localFogCenter",QJsonArray{localCenter[0]->value(),localCenter[1]->value(),localCenter[2]->value()}}});
 }
 
@@ -999,6 +1072,9 @@ void MainWindow::createDocks()
     });
     connect(browser_, &ContentBrowser::editStudioAssetRequested, this, [this](const QString &id) {
         openEmbeddedStudio(true,id);
+    });
+    connect(browser_, &ContentBrowser::openAssetRequested, this, [this](const QString &id) {
+        openAssetDetails(id);
     });
     connect(browser_, &ContentBrowser::meshImported, this, [this] {
         liveWorld_->frame();
@@ -1161,7 +1237,289 @@ StudioWorkspace *MainWindow::studio(int index)
     return created;
 }
 
-void MainWindow::openEmbeddedStudio(bool editSelected,const QString &assetId,bool newAsset,int workspace)
+void MainWindow::openAssetDetails(const QString &assetId,int workspace)
+{
+    const auto *project = store_.project();
+    if (!project)
+        return;
+    if (project->behaviors.contains(assetId)) {
+        editBehaviorAsset(store_,assetId,this);
+        return;
+    }
+    if (project->surfaces.textures.contains(assetId)) {
+        projectSurfaces::showTexture(store_,assetId,this);
+        return;
+    }
+    if (project->surfaces.materials.contains(assetId)) {
+        const auto *mesh = store_.selectedMesh();
+        projectSurfaces::editMaterial(store_,assetId,
+            usesLocalPanels(activeWorkspace_) && !studioAssetId_.isEmpty() ? studioAssetId_ : mesh ? mesh->id : QString{},this);
+        return;
+    }
+    if (!store_.meshAsset(assetId))
+        return;
+    inspectedAsset_ = assetId;
+    inspectedProject_ = project->id;
+    assetWorkspace_ = workspace;
+    if (!assetDetails_) {
+        assetDetails_ = new QDialog(this);
+        assetDetails_->setObjectName("meshAssetDetails");
+        assetDetails_->resize(850,500);
+        auto *layout = new QVBoxLayout(assetDetails_);
+        auto *content = new QHBoxLayout;
+        layout->addLayout(content,1);
+        assetPreview_ = new LiveViewport(store_,true,assetDetails_);
+        assetPreview_->setObjectName("meshAssetPreview");
+        assetPreview_->setModelShading(ModelShading::Material);
+        content->addWidget(assetPreview_,3);
+        assetSummary_ = new QLabel(assetDetails_);
+        assetSummary_->setObjectName("meshAssetSummary");
+        assetSummary_->setTextFormat(Qt::PlainText);
+        assetSummary_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        assetSummary_->setAlignment(Qt::AlignTop);
+        assetSummary_->setWordWrap(true);
+        auto *scroll = new QScrollArea(assetDetails_);
+        scroll->setWidgetResizable(true);
+        scroll->setWidget(assetSummary_);
+        content->addWidget(scroll,2);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close,assetDetails_);
+        editInspectedAsset_ = buttons->addButton(tr("Edit in Studio"),QDialogButtonBox::ActionRole);
+        auto *place = buttons->addButton(tr("Add to Level"),QDialogButtonBox::ActionRole);
+        place->setObjectName("placeInspectedAsset");
+        layout->addWidget(buttons);
+        connect(buttons,&QDialogButtonBox::rejected,assetDetails_,&QDialog::reject);
+        connect(editInspectedAsset_,&QPushButton::clicked,assetDetails_,[this] {
+            assetDetails_->hide();
+            openEmbeddedStudio(true,inspectedAsset_,false,assetWorkspace_);
+        });
+        connect(place,&QPushButton::clicked,assetDetails_,[this] { store_.placeMesh(inspectedAsset_); });
+        connect(&store_,&ProjectStore::sceneChanged,this,&MainWindow::refreshAssetDetails);
+        connect(&store_,&ProjectStore::projectsChanged,this,&MainWindow::refreshAssetDetails);
+        connect(assetDetails_,&QDialog::finished,assetDetails_,[this](int) {
+            inspectedProject_.clear();
+            inspectedAsset_.clear();
+        });
+    }
+    refreshAssetDetails();
+    assetDetails_->show();
+    assetDetails_->raise();
+    assetDetails_->activateWindow();
+}
+
+void MainWindow::refreshAssetDetails()
+{
+    if (!assetDetails_)
+        return;
+    const auto *project = store_.project();
+    const auto *asset = project && project->id == inspectedProject_ ? store_.meshAsset(inspectedAsset_) : nullptr;
+    if (!asset) {
+        assetDetails_->hide();
+        return;
+    }
+    const auto &mesh = asset->evaluated();
+    QStringList materials;
+    for (const auto &material : mesh.materials)
+        materials << QString::fromStdString(material.name);
+    const auto placements = std::ranges::count(project->objects,asset->id,&SceneObject::meshAsset);
+    const auto source = !asset->studioSourceHash.isEmpty() ? tr("Editable Studio asset")
+        : asset->sourcePath.isEmpty() ? tr("WorldForge project mesh") : asset->sourcePath;
+    assetDetails_->setWindowTitle(tr("%1 — Asset Details").arg(asset->name));
+    auto summary = tr("%1\n\n%2 vertices · %3 faces\n%4 level placement(s)\n\nMaterial slots\n%5\n\nSource\n%6")
+        .arg(asset->clip ? tr("Animated Mesh") : tr("Static Mesh")).arg(mesh.vertices.size()).arg(mesh.faces.size())
+        .arg(placements).arg(materials.join('\n'),source);
+    if (asset->clip)
+        summary += tr("\n\nAnimation\n%1 · %2 seconds").arg(QString::fromStdString(asset->clip->name))
+            .arg(asset->clip->duration(),0,'f',2);
+    auto layouts = QStringList{tr("%1 (render)").arg(asset->activeUvSet)};
+    for (auto it = asset->otherUvSets.cbegin(); it != asset->otherUvSets.cend(); ++it)
+        layouts << (it->needsUnwrap ? tr("%1 (rebuild required)").arg(it.key()) : it.key());
+    assetSummary_->setText(summary + tr("\n\nUV layers\n%1").arg(layouts.join('\n')));
+    assetPreview_->setAssetPreview(asset->evaluatedMesh ? asset->evaluatedMesh : asset->mesh);
+    const bool editable = asset->modifiers.empty();
+    editInspectedAsset_->setEnabled(editable);
+    editInspectedAsset_->setToolTip(editable ? QString{} : tr("Apply WorldForge modifiers before opening this mesh in Studio."));
+}
+
+void MainWindow::showStudioAssets(int workspace)
+{
+    const auto *project = store_.project();
+    if (!project || (workspace != World && !usesLocalPanels(workspace)) || nextStudioSession_)
+        return;
+    if (workspace == World)
+        workspace = Modeling;
+    const auto projectId = project->id;
+    QDialog dialog(this);
+    dialog.setObjectName("studioAssetSearch");
+    dialog.setWindowTitle(tr("Search Project Assets"));
+    dialog.resize(620,420);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *search = new QLineEdit(&dialog);
+    search->setObjectName("studioAssetQuery");
+    search->setPlaceholderText(tr("Search by mesh, material, or file name…"));
+    search->setAccessibleName(tr("Search project assets"));
+    search->setClearButtonEnabled(true);
+    search->addAction(editorIcon("search"),QLineEdit::LeadingPosition);
+    layout->addWidget(search);
+    auto *kind = new QComboBox(&dialog);
+    kind->setObjectName("projectAssetKind");
+    enum Kind { All, Meshes, Textures, Materials };
+    kind->addItem(tr("All assets"),All);
+    kind->addItem(tr("Meshes"),Meshes);
+    kind->addItem(tr("Textures"),Textures);
+    kind->addItem(tr("Materials"),Materials);
+    layout->addWidget(kind);
+    auto *list = new QListWidget(&dialog);
+    list->setObjectName("studioAssetResults");
+    list->setAccessibleName(tr("Matching project assets"));
+    list->setSortingEnabled(true);
+    layout->addWidget(list,1);
+    auto *summary = new QLabel(&dialog);
+    layout->addWidget(summary);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close,&dialog);
+    auto *details = buttons->addButton(tr("Open Details"),QDialogButtonBox::ActionRole);
+    auto *edit = buttons->addButton(tr("Edit in %1").arg(workspaces().at(workspace).name),QDialogButtonBox::AcceptRole);
+    edit->setObjectName("studioAssetEdit");
+    auto *place = buttons->addButton(tr("Add to Level"),QDialogButtonBox::ActionRole);
+    place->setObjectName("studioAssetPlace");
+    auto *import = buttons->addButton(tr("Import GLB…"),QDialogButtonBox::ActionRole);
+    import->setObjectName("studioAssetImport");
+    auto *create = buttons->addButton(tr("New Studio Asset…"),QDialogButtonBox::ActionRole);
+    create->setObjectName("studioAssetNew");
+    layout->addWidget(buttons);
+    auto *addSurface = new QDialogButtonBox(&dialog);
+    auto *imageImport = addSurface->addButton(tr("Import Texture…"),QDialogButtonBox::ActionRole);
+    imageImport->setObjectName("importProjectTexture");
+    auto *createMaterial = addSurface->addButton(tr("New Material…"),QDialogButtonBox::ActionRole);
+    createMaterial->setObjectName("newProjectMaterial");
+    layout->insertWidget(layout->count()-1,addSurface);
+
+    const auto selectedId = [list] {
+        const auto *row = list->currentItem();
+        return row ? row->data(Qt::UserRole).toString() : QString{};
+    };
+    const auto syncButtons = [&] {
+        const auto id = selectedId();
+        const auto *asset = store_.meshAsset(id);
+        const auto *active = store_.project();
+        const bool surface = active && (active->surfaces.textures.contains(id) || active->surfaces.materials.contains(id));
+        const bool supported = asset && asset->modifiers.empty();
+        edit->setEnabled(supported);
+        details->setEnabled(asset || surface);
+        edit->setToolTip(asset && !supported ? tr("Apply WorldForge modifiers before opening this mesh in Studio.") : QString{});
+        place->setEnabled(asset != nullptr);
+    };
+    const auto refresh = [&](const QString &preferred) {
+        const QSignalBlocker block(list);
+        list->clear();
+        const auto *active = store_.project();
+        if (!active || active->id != projectId) {
+            dialog.reject();
+            return;
+        }
+        const auto query = search->text().trimmed();
+        const int category = kind->currentData().toInt();
+        QListWidgetItem *preferredRow = nullptr;
+        const auto addRow = [&](const QString &id,const QString &title,const QString &icon,const QString &tooltip) {
+            auto *row = new QListWidgetItem(editorIcon(icon),title,list);
+            row->setData(Qt::UserRole,id);
+            row->setToolTip(tooltip);
+            if (id == preferred)
+                preferredRow = row;
+        };
+        if (category == All || category == Meshes) {
+            for (const auto &asset : active->assets) {
+                QStringList materials;
+                for (const auto &material : asset.evaluated().materials)
+                    materials << QString::fromStdString(material.name);
+                const auto file = QFileInfo(asset.sourcePath).fileName();
+                if (!asset.name.contains(query,Qt::CaseInsensitive) && !file.contains(query,Qt::CaseInsensitive)
+                    && !materials.join(' ').contains(query,Qt::CaseInsensitive))
+                    continue;
+                addRow(asset.id,asset.name,"box",tr("%1 vertices · %2 faces\nMaterials: %3").arg(asset.evaluated().vertices.size())
+                    .arg(asset.evaluated().faces.size()).arg(materials.join(", ")));
+            }
+        }
+        if (category == All || category == Textures)
+            for (auto it = active->surfaces.textures.cbegin(); it != active->surfaces.textures.cend(); ++it)
+                if (it->name.contains(query,Qt::CaseInsensitive) || it->fileName.contains(query,Qt::CaseInsensitive))
+                    addRow(it.key(),it->name,"layers",tr("Texture · %1 × %2").arg(it->width).arg(it->height));
+        if (category == All || category == Materials)
+            for (auto it = active->surfaces.materials.cbegin(); it != active->surfaces.materials.cend(); ++it)
+                if (it->name.contains(query,Qt::CaseInsensitive))
+                    addRow(it.key(),it->name,"box",tr("Project material"));
+        list->setCurrentItem(preferredRow ? preferredRow : list->item(0));
+        summary->setText(list->count() ? tr("%n matching asset(s)",nullptr,list->count())
+            : tr("No matching project assets."));
+        syncButtons();
+    };
+    connect(search,&QLineEdit::textChanged,&dialog,[&] { refresh(selectedId()); });
+    connect(kind,&QComboBox::currentIndexChanged,&dialog,[&] { refresh(selectedId()); });
+    connect(list,&QListWidget::currentItemChanged,&dialog,syncButtons);
+    bool inspecting = false;
+    const auto inspect = [&] {
+        if (details->isEnabled()) {
+            inspecting = true;
+            dialog.accept();
+        }
+    };
+    connect(list,&QListWidget::itemActivated,&dialog,inspect);
+    connect(details,&QPushButton::clicked,&dialog,inspect);
+    connect(edit,&QPushButton::clicked,&dialog,&QDialog::accept);
+    connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+    connect(place,&QPushButton::clicked,&dialog,[&] {
+        if (!store_.project() || store_.project()->id != projectId)
+            return;
+        store_.placeMesh(selectedId());
+        statusBar()->showMessage(tr("Added mesh to the level."),5000);
+        dialog.reject();
+    });
+    connect(import,&QPushButton::clicked,&dialog,[&] {
+        const auto file = QFileDialog::getOpenFileName(&dialog,tr("Import GLB"),{},tr("Binary glTF (*.glb)"));
+        if (file.isEmpty() || !store_.project() || store_.project()->id != projectId)
+            return;
+        QString error;
+        if (!store_.importMesh(file,error)) {
+            QMessageBox::warning(&dialog,tr("Import GLB"),error);
+            return;
+        }
+        search->clear();
+        kind->setCurrentIndex(Meshes);
+        if (const auto *asset = store_.selectedMesh())
+            refresh(asset->id);
+        statusBar()->showMessage(tr("Imported %1 into the project and level.").arg(QFileInfo(file).fileName()),5000);
+    });
+    connect(imageImport,&QPushButton::clicked,&dialog,[&] {
+        const auto id = projectSurfaces::importTexture(store_,&dialog);
+        if (!id.isEmpty()) {
+            kind->setCurrentIndex(Textures);
+            search->clear();
+            refresh(id);
+        }
+    });
+    connect(createMaterial,&QPushButton::clicked,&dialog,[&] {
+        const auto id = projectSurfaces::editMaterial(store_,{},studioAssetId_,&dialog);
+        if (!id.isEmpty()) {
+            kind->setCurrentIndex(Materials);
+            search->clear();
+            refresh(id);
+        }
+    });
+    bool creating = false;
+    connect(create,&QPushButton::clicked,&dialog,[&] { creating = true; dialog.accept(); });
+    refresh(studioAssetId_);
+    edit->setDefault(true);
+    search->setFocus();
+    if (dialog.exec() != QDialog::Accepted || !store_.project() || store_.project()->id != projectId)
+        return;
+    if (creating)
+        openEmbeddedStudio(false,{},true,workspace);
+    else if (inspecting)
+        openAssetDetails(selectedId(),workspace);
+    else if (edit->isEnabled() && !selectedId().isEmpty())
+        openEmbeddedStudio(true,selectedId(),false,workspace);
+}
+
+void MainWindow::openEmbeddedStudio(bool editSelected,const QString &assetId,bool newAsset,int workspace,QString newAssetName)
 {
     const auto *project = store_.project();
     const auto *asset = assetId.isEmpty() ? store_.selectedMesh() : store_.meshAsset(assetId);
@@ -1171,15 +1529,45 @@ void MainWindow::openEmbeddedStudio(bool editSelected,const QString &assetId,boo
         QMessageBox::information(this,tr("Edit Selected Mesh in Studio"),tr("Select a mesh in the level first."));
         return;
     }
+    if (editSelected && !asset->modifiers.empty()) {
+        QMessageBox::information(this,tr("Edit Selected Mesh in Studio"),
+            tr("Apply WorldForge modifiers before opening this mesh in Studio."));
+        return;
+    }
+    if (nextStudioSession_)
+        return;
+    if (newAsset && newAssetName.isEmpty()) {
+        const auto projectId = project->id;
+        bool accepted = false;
+        newAssetName = QInputDialog::getText(this,tr("New Studio Asset"),tr("Asset name"),
+            QLineEdit::Normal,tr("Studio Mesh"),&accepted).trimmed();
+        if (!accepted || newAssetName.isEmpty() || !store_.project() || store_.project()->id != projectId)
+            return;
+        project = store_.project();
+    }
     if (embeddedStudio_ && embeddedStudio_->isRunning() && (newAsset || (editSelected
         && (studioProjectId_ != project->id || studioAssetId_ != asset->id ||
             studioAssetRevision_ != asset->mesh || studioSourceRevision_ != asset->studioSourceHash)))) {
-        const auto choice = QMessageBox::question(this,tr("Studio Session Already Open"),
-            tr("Save and close the current session in Studio before opening another asset or revision. "
-               "Return to the current session?"),
-            QMessageBox::Yes | QMessageBox::Cancel,QMessageBox::Yes);
-        if (choice == QMessageBox::Yes)
-            openEmbeddedStudio(false,{},false,workspace);
+        const auto projectId = project->id;
+        const auto targetId = editSelected ? asset->id : QString{};
+        QMessageBox confirm(QMessageBox::Question,tr("Switch Studio Asset"),
+            tr("Switching closes the current Studio session. To keep unpublished edits, cancel and publish them or save a Studio asset copy first."),
+            QMessageBox::Cancel,this);
+        auto *discard = confirm.addButton(tr("Discard Draft and Switch"),QMessageBox::DestructiveRole);
+        confirm.setDefaultButton(QMessageBox::Cancel);
+        confirm.exec();
+        if (confirm.clickedButton() != discard || !store_.project() || store_.project()->id != projectId)
+            return;
+        if (!embeddedStudio_->closeForAssetSwitch()) {
+            statusBar()->showMessage(tr("Studio could not close the current session. Try again when the workspace is ready."),6000);
+            return;
+        }
+        nextStudioSession_ = [this,projectId,targetId,editSelected,newAsset,workspace,newAssetName] {
+            if (store_.project() && store_.project()->id == projectId)
+                openEmbeddedStudio(editSelected,targetId,newAsset,workspace,newAssetName);
+        };
+        statusBar()->showMessage(tr("Switching Studio asset…"),5000);
+        refreshStatus();
         return;
     }
     if (!embeddedStudio_) {
@@ -1193,38 +1581,34 @@ void MainWindow::openEmbeddedStudio(bool editSelected,const QString &assetId,boo
             }
         });
         connect(embeddedStudio_,&EmbeddedStudio::sessionClosed,this,[this](const QString &message) {
+            auto next = std::exchange(nextStudioSession_,{});
             pendingStudioWorkspace_ = -1;
             if (pages_->currentWidget() == embeddedStudio_)
                 switchWorkspace(World);
             if (!message.isEmpty())
                 statusBar()->showMessage(message,8000);
+            else if (next)
+                QTimer::singleShot(0,this,std::move(next));
         });
     }
     if (newAsset) {
-        const auto projectId = project->id;
-        bool accepted = false;
-        const auto name = QInputDialog::getText(this,tr("New Studio Asset"),tr("Asset name"),
-            QLineEdit::Normal,tr("Studio Mesh"),&accepted).trimmed();
-        if (!accepted || name.isEmpty() || !store_.project() || store_.project()->id != projectId)
-            return;
         if (!embeddedStudio_->prepareAsset({},{})) {
             QMessageBox::warning(this,tr("New Studio Asset"),tr("Could not prepare a Studio session."));
             return;
         }
-        studioProjectId_ = projectId;
+        studioProjectId_ = project->id;
         studioAssetId_.clear();
         studioAssetRevision_.clear();
         studioSourceRevision_.clear();
-        studioNewAssetName_ = name;
+        studioNewAssetName_ = newAssetName;
         studioAppliedRevision_.clear();
     } else if (editSelected && !embeddedStudio_->isRunning()) {
         QString error;
-        if (!asset->modifiers.empty() || !asset->otherUvSets.isEmpty()) {
-            QMessageBox::information(this,tr("Edit Selected Mesh in Studio"),
-                tr("This preview supports meshes with one UV set and no WorldForge modifiers."));
+        if (asset->clip && !QFileInfo::exists(store_.studioSourcePath(*asset))) {
+            QMessageBox::warning(this,tr("Edit Selected Mesh in Studio"),tr("The editable Studio character source is missing."));
             return;
         }
-        const auto glb = exportGlb(*asset->mesh,asset->name,error,true);
+        const auto glb = store_.exportStudioInput(*asset,error);
         if (glb.isEmpty() || !embeddedStudio_->prepareAsset(glb,store_.studioSourcePath(*asset))) {
             QMessageBox::warning(this,tr("Edit Selected Mesh in Studio"),
                 error.isEmpty() ? tr("Could not prepare the mesh for Studio.") : error);
@@ -1313,18 +1697,70 @@ void MainWindow::publishStudioMesh()
     source.close();
     file.close();
     QString error;
-    auto preview = importGlb(glb,error);
+    QFile uvFile(QDir(revision).filePath("uv-sets.json"));
+    QByteArray uvManifest;
+    if (uvFile.exists()) {
+        if (!uvFile.open(QIODevice::ReadOnly) || uvFile.size() <= 0 || uvFile.size() > 8192) {
+            QMessageBox::warning(this,tr("Publish Studio Mesh"),tr("The staged UV manifest is unreadable or invalid."));
+            return;
+        }
+        uvManifest = uvFile.read(8193);
+    }
+    QFile clipFile(QDir(revision).filePath("clip.wfmotion"));
+    QByteArray clipBytes;
+    if (clipFile.exists()) {
+        constexpr qsizetype limit = worldforge::MeshClip::maxSamples*24+148;
+        if (!clipFile.open(QIODevice::ReadOnly) || clipFile.size() <= 0 || clipFile.size() > limit) {
+            QMessageBox::warning(this,tr("Publish Studio Mesh"),tr("The staged animation clip is unreadable or invalid."));
+            return;
+        }
+        clipBytes = clipFile.read(limit+1);
+    }
+    StudioMeshData studio;
+    auto preview = importStudioGlb(glb,uvManifest,clipBytes,studio,error);
     if (!preview) {
         QMessageBox::warning(this,tr("Publish Studio Mesh"),error);
         return;
     }
-    const auto check = reviewStudioPublish(*project,creating ? nullptr : asset,name,*preview);
+    QStringList replacedNormalMaps;
+    if (!creating) {
+        const auto importedMaterials = preview->materials;
+        if (!store_.preserveProjectMaterials(studioAssetId_,*preview,error)) {
+            QMessageBox::warning(this,tr("Publish Studio Mesh"),error);
+            return;
+        }
+        for (std::size_t i = 0; i < importedMaterials.size(); ++i)
+            if (!preview->materials[i].sharedMaterialId.empty() && !importedMaterials[i].normalTexture.empty()
+                && preview->materials[i].normalTexture != importedMaterials[i].normalTexture)
+                replacedNormalMaps << QString::fromStdString(importedMaterials[i].name);
+    }
+    auto check = reviewStudioPublish(*project,creating ? nullptr : asset,name,*preview);
+    if (studio.uvs) {
+        const auto &uvLayers = *studio.uvs;
+        const auto renderUv = uvLayers.active.isEmpty() ? QStringLiteral("UV Map") : uvLayers.active;
+        if (asset) {
+            auto previous = asset->otherUvSets.keys();
+            previous << asset->activeUvSet;
+            previous.removeAll(renderUv);
+            for (const auto &layer : uvLayers.other.keys())
+                previous.removeAll(layer);
+            if (!previous.isEmpty())
+                check.warnings << tr("Rebuild UV layouts missing from the published mesh: %1.").arg(previous.join(", "));
+        }
+    }
+    if (!replacedNormalMaps.isEmpty())
+        check.warnings << tr("Project materials retain their own normals for %1. Make the slots independent before publishing to use the Studio normal maps.")
+            .arg(replacedNormalMaps.join(", "));
     if (!check.blocker.isEmpty()) {
         QMessageBox::warning(this,tr("Publish Studio Mesh"),check.blocker);
         return;
     }
+    auto summary = check.summary();
+    if (studio.clip)
+        summary += tr("\n\nAnimation · %1 · %2 seconds · %3 frames")
+            .arg(QString::fromStdString(studio.clip->name)).arg(studio.clip->duration(),0,'f',2).arg(studio.clip->frameCount());
     QMessageBox review(check.warnings.isEmpty() ? QMessageBox::Question : QMessageBox::Warning,
-        tr("Publish Studio Mesh"),check.summary(),QMessageBox::Apply | QMessageBox::Cancel,this);
+        tr("Publish Studio Mesh"),summary,QMessageBox::Apply | QMessageBox::Cancel,this);
     review.setObjectName("studioPublishReview");
     review.setTextFormat(Qt::PlainText);
     review.setDefaultButton(QMessageBox::Cancel);
@@ -1340,14 +1776,14 @@ void MainWindow::publishStudioMesh()
         return;
     }
     if (creating) {
-        if (!store_.createStudioMesh(name,std::move(*preview),sourceBytes,error)) {
+        if (!store_.createStudioMesh(name,std::move(*preview),sourceBytes,error,&studio)) {
             QMessageBox::warning(this,tr("Publish Studio Mesh"),error);
             return;
         }
         studioAssetId_ = store_.selectedMesh()->id;
         studioNewAssetName_.clear();
     } else if (!current || current->studioSourceHash != studioSourceRevision_
-        || !store_.publishStudioMesh(studioAssetId_,glb,studioAssetRevision_.data(),error,sourceBytes)) {
+        || !store_.publishStudioMesh(studioAssetId_,glb,studioAssetRevision_.data(),error,sourceBytes,uvManifest,clipBytes)) {
         QMessageBox::warning(this,tr("Publish Studio Mesh"),error.isEmpty() ? tr("The project changed.") : error);
         return;
     }
@@ -1365,7 +1801,8 @@ void MainWindow::switchWorkspace(int index)
     const bool leavingStudio = embeddedStudio_ && pages_->currentWidget() == embeddedStudio_;
     if (usesLocalPanels(index)) {
         const bool editSelection = activeWorkspace_ == World && store_.selectedMesh()
-            && (index == Modeling || index == Sculpting || index == Texture);
+            && (index == Modeling || index == Sculpting || index == Texture
+                || (store_.selectedMesh()->clip && (index == Rigging || index == Animation)));
         openEmbeddedStudio(editSelection,{},false,index);
         return;
     }
@@ -1400,6 +1837,21 @@ void MainWindow::switchWorkspace(int index)
         QStringList titles{tr("Scene Outliner"), tr("Details"), tr("Content Browser")};
         if (index == World) {
             pages_->setCurrentIndex(1);
+            for (auto *stack : dockPages_)
+                stack->setCurrentIndex(0);
+        } else if (workspace.name == "Asset Hub" || hasGameplayAuthoring(workspace.name)) {
+            auto *panel = gameplayWorkspaces_.value(index);
+            if (!panel) {
+                if (workspace.name == "Asset Hub")
+                    panel = createAssetHub(store_,[this](const QString &id) { openAssetDetails(id); },pages_);
+                else {
+                    panel = createGameplayAuthoring(workspace.name,store_,pages_);
+                    panel->setObjectName("gameplayWorkspace"+workspace.name);
+                }
+                gameplayWorkspaces_.insert(index,panel);
+                pages_->addWidget(panel);
+            }
+            pages_->setCurrentWidget(panel);
             for (auto *stack : dockPages_)
                 stack->setCurrentIndex(0);
         } else {
@@ -1480,6 +1932,7 @@ void MainWindow::refreshStatus()
         : activeWorkspace_ == Sculpting ? tr("Sculpt authoring")
         : activeWorkspace_ == Texture || activeWorkspace_ == Material ? tr("Material preview")
         : activeWorkspace_ == Rigging || activeWorkspace_ == Animation ? tr("Studio authoring")
+        : workspace.name == "Programming" ? tr("Behavior authoring")
         : tr("Reference preview"));
     statusRenderer_->setToolTip(liveWorld_->rendererName());
     setWindowTitle(tr("WorldForge — %1%2 — %3").arg(projectName, store_.isDirty() ? "*" : "", workspace.name));
@@ -1502,6 +1955,8 @@ void MainWindow::refreshStatus()
         && embeddedStudio_ && pages_->currentWidget() == embeddedStudio_
         && (studioAsset || !studioNewAssetName_.isEmpty());
     applyStudioUpdate_->setVisible(studioAssetOpen);
+    searchStudioAssets_->setVisible(activeWorkspace_ == World || usesLocalPanels(activeWorkspace_));
+    searchStudioAssets_->setEnabled(project && !nextStudioSession_);
     if (studioAssetOpen)
         applyStudioUpdate_->setToolTip(tr("Apply Studio Update to %1").arg(studioAsset ? studioAsset->name : studioNewAssetName_));
     deleteObject_->setEnabled(!running && activeWorkspace_ == World && store_.selectedObject() != nullptr);

@@ -1,7 +1,12 @@
 #include "Components/LiveViewport.h"
 #include "State/ProjectStore.h"
 #include "State/WorldRuntime.h"
+#include "Engine/Geometry/MeshClip.h"
+#include <QDebug>
+#include <QFileInfo>
 #include "State/WorldScene.h"
+#include "Engine/Render/SkyLight.h"
+#include <optional>
 
 #include <QLabel>
 #include <QImage>
@@ -23,6 +28,7 @@
 #include <QWheelEvent>
 #include <QTimer>
 #include "Components/WorldLightingVulkan.h"
+#include "Components/ViewportFrameVulkan.h"
 
 #include <algorithm>
 #include <cmath>
@@ -42,6 +48,19 @@ namespace {
 namespace wf = worldforge;
 
 QVector3D point(wf::Point3 p) { return {p[0], p[1], p[2]}; }
+// Authored colors are sRGB-encoded; the scene pass shades in linear light. Geometry rebuilds convert
+// every corner (each frame during Play), so a 12-bit table replaces pow; its error is under 0.0003.
+QVector3D linearColor(QVector3D encoded)
+{
+    static const auto table = [] {
+        std::array<float,4096> values{};
+        for (std::size_t i = 0; i < values.size(); ++i)
+            values[i] = wf::color::srgbToLinear(float(i)/4095.0f);
+        return values;
+    }();
+    const auto decode = [](float value) { return table[std::size_t(std::clamp(value,0.0f,1.0f)*4095.0f+0.5f)]; };
+    return {decode(encoded.x()),decode(encoded.y()),decode(encoded.z())};
+}
 
 struct Vertex {
     float position[3];
@@ -77,6 +96,7 @@ struct Light {
 };
 
 using ImageRange = std::array<uint32_t,3>;
+constexpr std::size_t materialWords = 18;
 
 ImageRange appendMaterialImage(std::vector<uint32_t> &pixels,const QImage &source)
 {
@@ -112,6 +132,13 @@ ImageRange loadMaterialImage(std::vector<uint32_t> &pixels,const std::vector<uin
     return appendMaterialImage(pixels,reader.read());
 }
 
+// The primary sun first, then the other visible lights, as the renderers light the scene.
+float skyAmbient(const WorldAtmosphere &environment)
+{
+    const auto rgb = [](const QColor &color) { return wf::color::Rgb{float(color.redF()),float(color.greenF()),float(color.blueF())}; };
+    return wf::color::skyAmbientScale(rgb(environment.horizon),rgb(environment.zenith));
+}
+
 Light primarySun(const QList<SceneObject> &objects,const WorldAtmosphere &environment)
 {
     Light result{sunDirection(environment),1,true};
@@ -119,13 +146,51 @@ Light primarySun(const QList<SceneObject> &objects,const WorldAtmosphere &enviro
         if (object.visible && object.type == "Directional Light") {
             if (!(object.id == "sun" && object.rotation.isNull()))
                 result.vector = QQuaternion::fromEulerAngles(object.rotation).rotatedVector({0,0,1});
-            result.intensity = float(std::clamp(object.details.value("lightIntensity").toDouble(1),0.0,4.0));
+            result.intensity = lightUnits(object);
             break;
         }
     return result;
 }
 
+// The primary sun first, then the other visible lights, as the renderers light the scene.
+std::vector<Light> sceneLights(const QList<SceneObject> &objects,const WorldAtmosphere &environment)
+{
+    std::vector<Light> lights{primarySun(objects,environment)};
+    bool usedPrimary = false;
+    for (const auto &object : objects) {
+        const bool directional = object.type == "Directional Light";
+        if (!object.visible || (!directional && object.type != "Point Light"))
+            continue;
+        if (directional && !usedPrimary) {
+            usedPrimary = true;
+            continue;
+        }
+        const auto vector = directional ? QQuaternion::fromEulerAngles(object.rotation).rotatedVector({0,0,1}) : object.position;
+        lights.push_back({vector,lightUnits(object),directional});
+    }
+    return lights;
+}
+
+// Sky light for the shading model, cached because it changes only with the sky colors and the sun.
+const wf::color::SkyLight &cachedSkyLight(const WorldAtmosphere &environment,const Light &sun)
+{
+    static std::optional<wf::color::SkyLight> cached;
+    static std::array<float,10> key{};
+    const auto rgb = [](const QColor &color) { return wf::color::Rgb{float(color.redF()),float(color.greenF()),float(color.blueF())}; };
+    const std::array<float,10> next{float(environment.horizon.redF()),float(environment.horizon.greenF()),
+        float(environment.horizon.blueF()),float(environment.zenith.redF()),float(environment.zenith.greenF()),
+        float(environment.zenith.blueF()),sun.vector.x(),sun.vector.y(),sun.vector.z(),sun.intensity};
+    if (!cached || next != key) {
+        cached = wf::color::skyLight(rgb(environment.horizon),rgb(environment.zenith),
+                                     {sun.vector.x(),sun.vector.y(),sun.vector.z()},sun.intensity);
+        key = next;
+    }
+    return *cached;
+}
+
 struct Geometry {
+    // Scales the ambient term by the sky's brightness (color::skyAmbientScale); 1 for the default sky.
+    float ambient = 1;
     struct FaceRange { std::size_t triangles,triangleEnd,lines,lineEnd; };
     std::vector<Vertex> triangles, lines, overlays, selectionOutline;
     std::vector<PickTriangle> picks;
@@ -184,9 +249,9 @@ struct Geometry {
                  const std::vector<Light> &lights, bool pickable = true,const wf::Heightfield *field = nullptr,
                  float windStrength = 0,bool trackFaces = false,bool wire = true,bool clay = false,bool textured = false,
                  const QMatrix4x4 *worldTransform = nullptr,int paintSlot = -1,const QImage &paint = {},
-                 std::span<const ImageRange> worldImages = {}, const QVector3D *outlineEye = nullptr)
+                 std::span<const ImageRange> worldImages = {}, const QVector3D *outlineEye = nullptr,
+                 const wf::MeshClip *clip = nullptr,double clipSeconds = 0)
     {
-        constexpr std::size_t materialWords = 18;
         std::vector<uint32_t> tiles;
         if (textured) {
             tiles.resize(mesh.materials.size());
@@ -236,8 +301,18 @@ struct Geometry {
             transform.scale(object.scale);
         }
         std::vector<QVector3D> positions;
+        std::vector<wf::Point3> poseNormals;
         positions.reserve(mesh.vertices.size());
-        for (const auto &vertex : mesh.vertices) {
+        const auto frame = clip ? clip->phase(clipSeconds) : wf::MeshClip::Sample{};
+        if (clip)
+            poseNormals.reserve(mesh.vertices.size());
+        for (std::size_t index = 0; index < mesh.vertices.size(); ++index) {
+            auto vertex = mesh.vertices[index];
+            if (clip) {
+                const auto pose = clip->vertex(frame,index);
+                vertex = pose.position;
+                poseNormals.push_back(pose.normal);
+            }
             const auto p = transform.map(point(vertex));
             positions.push_back(p);
             extendBounds(p);
@@ -267,10 +342,10 @@ struct Geometry {
                 : QVector3D(material.color[0],material.color[1],material.color[2]);
             const auto defaultNormal = wf::faceNormal(mesh, face);
             const auto addCorner = [&](const wf::MeshCorner &corner) {
-                const auto n = corner.normal == wf::Point3{} ? defaultNormal : corner.normal;
+                const auto n = clip ? poseNormals[corner.vertex] : corner.normal == wf::Point3{} ? defaultNormal : corner.normal;
                 const auto worldNormal = transformNormal(n).normalized();
                 const auto p = positions[corner.vertex];
-                float strength = modelOnly ? 0.28f : 0.34f + 0.16f*std::max(0.0f,worldNormal.z());
+                float strength = modelOnly ? 0.28f : ambient*(0.34f + 0.16f*std::max(0.0f,worldNormal.z()));
                 float key = 0;
                 if (lights.empty())
                     strength += 0.72f*std::max(0.0f, QVector3D::dotProduct(worldNormal, light));
@@ -283,13 +358,25 @@ struct Geometry {
                     if (&source == &lights.front() && source.directional)
                         key = contribution;
                 }
-                const auto surface = field ? point(field->surfaceColor(mesh.vertices[corner.vertex],n)) : base;
+                const auto surface = linearColor(field ? point(field->surfaceColor(mesh.vertices[corner.vertex],n)) : base);
                 const float wind = windStrength > 0
                     ? wf::Heightfield::foliageSway(mesh,corner.vertex)*windStrength : 0;
                 animated |= wind > 0;
                 const float clamped = std::min(strength,1.0f);
                 const float weight = (clamped-std::min(strength-key,1.0f))/std::max(clamped,0.001f);
                 append(triangles,p,surface*clamped,wind,weight);
+                if (!modelOnly) {
+                    // World views light every surface per pixel (Shading.glsl): pass albedo, normal and material.
+                    auto &vertex = triangles.back();
+                    vertex.color[0] = surface.x();
+                    vertex.color[1] = surface.y();
+                    vertex.color[2] = surface.z();
+                    vertex.materialNormal[0] = worldNormal.x();
+                    vertex.materialNormal[1] = worldNormal.y();
+                    vertex.materialNormal[2] = worldNormal.z();
+                    vertex.surfaceFactors[0] = std::clamp(material.metallic,0.0f,1.0f);
+                    vertex.surfaceFactors[1] = std::clamp(material.roughness,0.045f,1.0f);
+                }
                 if (textured) {
                     auto &vertex = triangles.back();
                     vertex.color[0] = surface.x();
@@ -307,7 +394,18 @@ struct Geometry {
                     auto &vertex = triangles.back();
                     vertex.uv[0] = corner.uv[0];
                     vertex.uv[1] = 1-corner.uv[1];
-                    std::ranges::copy(worldImages[face.material],vertex.texture);
+                    const auto &range = worldImages[face.material];
+                    std::ranges::copy(range,vertex.texture);
+                    if (range[0] && !range[1]) {
+                        vertex.color[0] = surface.x();
+                        vertex.color[1] = surface.y();
+                        vertex.color[2] = surface.z();
+                        vertex.materialNormal[0] = worldNormal.x();
+                        vertex.materialNormal[1] = worldNormal.y();
+                        vertex.materialNormal[2] = worldNormal.z();
+                        vertex.surfaceFactors[0] = material.metallic;
+                        vertex.surfaceFactors[1] = std::max(material.roughness,0.045f);
+                    }
                 }
                 if (trackFaces)
                     faceLighting.push_back(clamped);
@@ -636,6 +734,8 @@ public:
             report(QObject::tr("Open a project with at most 256 box colliders to start the runtime."));
             return false;
         }
+        for (const auto &problem : runtime.gameplayErrors())
+            qWarning().noquote() << problem;
         runtime_ = std::move(runtime);
         worldImagesDirty_ = true;
         mode_ = mode;
@@ -660,6 +760,7 @@ public:
             return;
         timer_.stop();
         mode_ = RunMode::Editing;
+        runtime_->stopNative();
         runtime_.reset();
         worldImagesDirty_ = true;
         target_ = savedTarget_;
@@ -667,6 +768,21 @@ public:
         yaw_ = savedYaw_;
         pitch_ = savedPitch_;
         invalidate();
+    }
+    void nativeGameplayChanged()
+    {
+        if (!runtime_ || mode_ != RunMode::Play)
+            return;
+        const auto path = store_.nativeGameplayPath();
+        if (!QFileInfo::exists(path)) {
+            runtime_->stopNative();
+            return;
+        }
+        QString error;
+        if (runtime_->stageNative(path,error))
+            qInfo().noquote() << QObject::tr("C++ gameplay staged for the next fixed update.");
+        else
+            qWarning().noquote() << error;
     }
     void pause(bool paused)
     {
@@ -691,6 +807,7 @@ public:
         return runtime_ ? runtime_->position(id) : std::nullopt;
     }
     QString runtimeObjective() const { return runtime_ ? runtime_->objective() : QString(); }
+    bool runtimeShowsHud() const { return runtime_ && runtime_->gameplay().showMissionHud; }
     std::optional<QVector3D> playerPosition() const
     {
         return runtime_ ? runtime_->player() : std::nullopt;
@@ -747,6 +864,28 @@ public:
         if (sculpt_)
             modelDrawMesh_.reset();
         gizmo_ = std::move(gizmo);
+        invalidate();
+    }
+    void setAssetPreview(QSharedPointer<const wf::Mesh> mesh,bool reframe)
+    {
+        if (assetPreview_ == mesh)
+            return;
+        assetPreview_ = std::move(mesh);
+        invalidate();
+        if (reframe)
+            frame();
+    }
+    void setPlacementPreview(const SceneObject &placement,QSharedPointer<const wf::Mesh> mesh)
+    {
+        placementPreview_ = placement;
+        placementPreviewMesh_ = std::move(mesh);
+        worldImagesDirty_ = true;
+        frame();
+    }
+    void setCameraPreview(QVector3D eye,QVector3D target)
+    {
+        cameraPreview_ = std::pair{eye,target};
+        framed_ = true;
         invalidate();
     }
     void setObjectPreview(bool enabled,const SceneObject *object)
@@ -929,7 +1068,14 @@ public:
         if (playerPosition())
             return;
         Geometry selectedBounds;
-        if (modelOnly_ && !selection_.empty())
+        if (placementPreviewMesh_) {
+            QMatrix4x4 transform;
+            transform.translate(placementPreview_.position);
+            transform.rotate(QQuaternion::fromEulerAngles(placementPreview_.rotation));
+            transform.scale(placementPreview_.scale);
+            for (const auto &vertex : placementPreviewMesh_->vertices)
+                selectedBounds.extendBounds(transform.map(point(vertex)));
+        } else if (modelOnly_ && !selection_.empty())
             if (const auto *asset = store_.selectedMesh())
                 for (const auto index : modelVertices(*asset->mesh,domain_,selection_))
                     selectedBounds.extendBounds(point(asset->mesh->vertices[index]));
@@ -940,6 +1086,7 @@ public:
         cameraChanged();
     }
     bool rendered() const { return rendered_; }
+    bool temporalSettled() const { return temporalSettled_; }
     void previewTerrain()
     {
         const auto *object = store_.selectedObject();
@@ -1070,7 +1217,7 @@ protected:
     }
     void mouseReleaseEvent(QMouseEvent *event) override
     {
-        if (event->button() != Qt::LeftButton || !rendered_ || runtime_)
+        if (event->button() != Qt::LeftButton || !rendered_ || runtime_ || placementPreviewMesh_)
             return;
         if (sculpt_) {
             if (std::exchange(sculptDown_,false))
@@ -1220,6 +1367,7 @@ private:
             studio.sky = false;
             studio.fogDensity = 0;
             studio.shadows = false;
+            studio.viewTransform = wf::color::ViewTransform::Standard;
             return studio;
         }
         if (runtime_) {
@@ -1250,6 +1398,13 @@ private:
     {
         return {std::cos(yaw_)*std::cos(pitch_), std::sin(yaw_)*std::cos(pitch_), std::sin(pitch_)};
     }
+    std::pair<QVector3D,QVector3D> viewPose() const
+    {
+        if (runtime_)
+            if (const auto *shot = runtime_->gameplay().activeShot())
+                return {point(wf::shotPosition(*shot,1-shot->remaining/shot->seconds)),point(shot->target)};
+        return cameraPreview_.value_or(std::pair{target_+viewDirection()*distance_,target_});
+    }
     QMatrix4x4 camera(QSize size)
     {
         QMatrix4x4 projection, view;
@@ -1260,9 +1415,10 @@ private:
             projection.ortho(-extent*aspect,extent*aspect,-extent,extent,nearPlane,farPlane);
         else
             projection.perspective(45.0f, aspect, nearPlane, farPlane);
-        const QVector3D up = std::abs(pitch_) >= 1.56f
+        const auto [eye,target] = viewPose();
+        const QVector3D up = std::abs((eye-target).normalized().z()) > 0.99995f
             ? QVector3D(-std::cos(yaw_),-std::sin(yaw_),0) : QVector3D(0,0,1);
-        view.lookAt(target_ + viewDirection()*distance_, target_, up);
+        view.lookAt(eye,target,up);
         return clipCorrectionMatrix()*projection*view;
     }
 
@@ -1674,27 +1830,50 @@ private:
         ++textureRevision_;
         worldImages_.clear();
         worldTexturePixels_.clear();
-        std::size_t imageCount = 0;
+        std::size_t imageCount = 0, materialCount = 0;
+        const auto collect = [&](const wf::Mesh *mesh) {
+            if (!mesh || worldImages_.contains(mesh))
+                return;
+            worldImages_.insert(mesh,{});
+            for (const auto &material : mesh->materials) {
+                const auto maps = material.previewTextures();
+                imageCount += std::ranges::count_if(maps,[](const auto *image) { return !image->empty(); });
+                materialCount += material.hasAdvancedSurface();
+            }
+        };
+        collect(placementPreviewMesh_.data());
         for (const auto &object : objects) {
             const auto asset = assets.constFind(object.meshAsset);
             if (!object.visible || asset == assets.cend())
                 continue;
-            for (const auto *mesh : {&asset->evaluated(),asset->lodMesh.data()}) {
-                if (!mesh || worldImages_.contains(mesh))
-                    continue;
-                worldImages_.insert(mesh,{});
-                imageCount += std::ranges::count_if(mesh->materials,[](const auto &material) {
-                    return !material.baseColorTexture.empty();
-                });
-            }
+            collect(&asset->evaluated());
+            collect(asset->lodMesh.data());
         }
-        if (imageCount == 0)
+        if (imageCount == 0 && materialCount == 0)
             return;
-        const auto side = int(std::sqrt(WorldLightingVulkan::worldTextureCapacity / imageCount));
+        const auto capacity = std::size_t(WorldLightingVulkan::worldTextureCapacity);
+        const auto headers = 1+materialWords*materialCount;
+        if (headers >= capacity || capacity-headers < imageCount)
+            return;
+        const auto side = int(std::sqrt((capacity-headers)/std::max<std::size_t>(imageCount,1)));
+        worldTexturePixels_.resize(headers);
+        std::size_t header = 1;
         for (auto it = worldImages_.begin(); it != worldImages_.end(); ++it) {
             auto &ranges = it.value();
-            for (const auto &material : it.key()->materials)
-                ranges.push_back(loadMaterialImage(worldTexturePixels_,material.baseColorTexture,side));
+            for (const auto &material : it.key()->materials) {
+                if (!material.hasAdvancedSurface()) {
+                    ranges.push_back(loadMaterialImage(worldTexturePixels_,material.baseColorTexture,side));
+                    continue;
+                }
+                ranges.push_back({uint32_t(header),0,1});
+                for (const auto *image : material.previewTextures()) {
+                    const auto range = loadMaterialImage(worldTexturePixels_,*image,side);
+                    std::ranges::copy(range,worldTexturePixels_.begin()+header);
+                    header += range.size();
+                }
+                for (float value : material.emissive)
+                    worldTexturePixels_[header++] = std::bit_cast<uint32_t>(value);
+            }
         }
     }
 
@@ -1704,6 +1883,12 @@ private:
             return geometry_;
         dirty_ = false;
         ++geometryRevision_;
+        if (assetPreview_) {
+            geometry_ = {};
+            ++textureRevision_;
+            geometry_.addMesh(SceneObject{},*assetPreview_,true,false,{},false,nullptr,0,false,false,false,true);
+            return geometry_;
+        }
         if (modelOnly_) {
             const auto *asset = store_.selectedMesh();
             const auto *object = store_.selectedObject();
@@ -1765,34 +1950,18 @@ private:
         }
         geometry_ = {};
         bool hasTerrain = false;
+        geometry_.ambient = skyAmbient(atmosphere());
         hasLod_ = false;
-        const auto eye = target_+viewDirection()*distance_;
+        const auto eye = viewPose().first;
         if (const auto *project = store_.project()) {
             const auto &objects = runtime_ ? runtime_->objects() : project->objects;
             const auto matrices = runtime_ ? runtime_->renderMatrices() : store_.worldMatrices();
             const auto &assets = runtime_ ? runtime_->assets() : project->assets;
             if (worldImagesDirty_)
                 rebuildWorldImages(objects,assets);
-            std::vector<Light> lights;
-            {
-                lights.push_back(primarySun(objects,atmosphere()));
-                bool usedPrimary = false;
-                for (const auto &object : objects) {
-                    const bool directional = object.type == "Directional Light";
-                    if (!object.visible || (!directional && object.type != "Point Light"))
-                        continue;
-                    if (directional && !usedPrimary) {
-                        usedPrimary = true;
-                        continue;
-                    }
-                    const auto vector = directional
-                        ? QQuaternion::fromEulerAngles(object.rotation).rotatedVector({0, 0, 1}) : object.position;
-                    lights.push_back({vector, float(std::clamp(object.details.value("lightIntensity").toDouble(1), 0.0, 4.0)),
-                                      directional});
-                }
-            }
+            const auto lights = sceneLights(objects,atmosphere());
             for (auto object : objects) {
-                const bool selected = !runtime_ && object.id == store_.selection();
+                const bool selected = !runtime_ && !placementPreviewMesh_ && object.id == store_.selection();
                 if (!object.visible)
                     continue;
                 if (const auto moved = runtimePosition(object.id))
@@ -1833,14 +2002,29 @@ private:
                     const auto matrix = matrices.value(object.id);
                     object.position = matrix.map(QVector3D{});
                     hasLod_ |= bool(asset->lodMesh);
-                    const auto &mesh = asset->lodMesh && (object.position-eye).lengthSquared() >= asset->lodDistance*asset->lodDistance
-                        ? *asset->lodMesh : asset->evaluated();
+                    const auto &mesh = placementPreviewMesh_ && object.meshAsset == placementPreview_.meshAsset
+                        ? *placementPreviewMesh_
+                        : asset->lodMesh && (object.position-eye).lengthSquared() >= asset->lodDistance*asset->lodDistance
+                            ? *asset->lodMesh : asset->evaluated();
                     const auto images = worldImages_.constFind(&mesh);
                     geometry_.addMesh(object,mesh,false,selected,lights,true,nullptr,0,false,false,false,false,&matrix,
                         -1,{},images == worldImages_.cend() ? std::span<const ImageRange>{} : std::span<const ImageRange>{*images},
-                        selected ? &eye : nullptr);
+                        selected ? &eye : nullptr,runtime_ ? asset->clip.data() : nullptr,runtime_ ? runtime_->clipTime() : 0);
                 }
             }
+            if (placementPreviewMesh_) {
+                const auto &ranges = worldImages_[placementPreviewMesh_.data()];
+                geometry_.addMesh(placementPreview_,*placementPreviewMesh_,false,true,lights,false,nullptr,0,
+                    false,false,false,false,nullptr,-1,{},ranges,&eye);
+            }
+            if (runtime_)
+                for (const auto *beacons : {&runtime_->gameplay().beacons,&runtime_->gameplay().behaviorBeacons})
+                    for (const auto &beacon : *beacons)
+                        if (beacon.remaining > 0)
+                            geometry_.addMesh(SceneObject{},wf::makeBeaconMesh(beacon),false,false,lights,false);
+            if (runtime_)
+                for (const auto &patrol : runtime_->gameplay().patrols)
+                    geometry_.addMesh(SceneObject{},wf::makePatrolMesh(patrol),false,false,lights,false);
             if (const auto player = playerPosition()) {
                 SceneObject avatar;
                 avatar.position = *player;
@@ -1875,14 +2059,20 @@ private:
     quint64 geometryRevision_ = 0;
     bool framed_ = false;
     bool rendered_ = false;
+    // False while a still view is still averaging its TAA samples; captureFrame waits for it.
+    bool temporalSettled_ = true;
     ModelDomain domain_ = ModelDomain::Object;
     std::set<ModelComponent> selection_;
     bool xray_ = false, ortho_ = false;
     QSharedPointer<const wf::Mesh> preview_;
+    QSharedPointer<const wf::Mesh> assetPreview_;
+    std::optional<std::pair<QVector3D,QVector3D>> cameraPreview_;
     std::optional<ModelGizmo> gizmo_;
     ModelShading modelShading_ = ModelShading::ShadedWire;
     uint64_t textureRevision_ = 0;
     bool worldImagesDirty_ = true;
+    SceneObject placementPreview_;
+    QSharedPointer<const wf::Mesh> placementPreviewMesh_;
     QHash<const wf::Mesh *,std::vector<ImageRange>> worldImages_;
     std::vector<uint32_t> worldTexturePixels_;
     bool handleDrag_ = false;
@@ -2016,11 +2206,19 @@ public:
         layout.pSetLayouts = &descriptors;
         if (vk_->vkCreatePipelineLayout(device_, &layout, nullptr, &layout_) != VK_SUCCESS)
             window_.report(QObject::tr("Vulkan pipeline layout creation failed."));
+        if (!frame_.create(window_))
+            window_.report(QObject::tr("Vulkan could not create the HDR scene pass."));
     }
     void initSwapChainResources() override
     {
         window_.dirty_ = true;
-        if (layout_) {
+        if (layout_ && frame_.scenePass() && frame_.createTargets()) {
+            const auto spirv = [](const QString &path) {
+                QFile file(path);
+                return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+            };
+            frame_.createDisplayPipeline(spirv(":/shaders/Display.vert.spv"),spirv(":/shaders/Display.frag.spv"),
+                                         spirv(":/shaders/Temporal.frag.spv"),spirv(":/shaders/Ambient.frag.spv"));
             triangles_ = pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true);
             lines_ = pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false);
             if (window_.modelOnly_)
@@ -2030,7 +2228,7 @@ public:
             sky_ = pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,false,Pass::Sky);
             shadow_ = pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,true,Pass::Shadow);
         }
-        if (!triangles_ || !lines_ || !sky_ || !shadow_ || !(window_.modelOnly_ ? overlays_ : outline_))
+        if (!triangles_ || !lines_ || !sky_ || !shadow_ || !(window_.modelOnly_ ? overlays_ : outline_) || !frame_.displayReady())
             window_.report(QObject::tr("Vulkan shader or pipeline creation failed."));
     }
     void releaseSwapChainResources() override
@@ -2048,6 +2246,8 @@ public:
         if (shadow_)
             vk_->vkDestroyPipeline(device_,shadow_,nullptr);
         triangles_ = lines_ = overlays_ = outline_ = sky_ = shadow_ = VK_NULL_HANDLE;
+        frame_.destroyDisplayPipeline();
+        frame_.releaseTargets();
     }
     void releaseResources() override
     {
@@ -2057,9 +2257,59 @@ public:
         if (layout_)
             vk_->vkDestroyPipelineLayout(device_, layout_, nullptr);
         lighting_.destroy();
+        frame_.destroy();
         layout_ = VK_NULL_HANDLE;
         window_.rendered_ = false;
     }
+    // TAA for this frame. While editing, any change to the camera, scene or textures restarts the average, so a
+    // still view converges to an exact supersampled image. In Play and Simulate, the camera and objects keep
+    // moving, so the history is reprojected with the camera and clamped instead.
+    ViewportFrameVulkan::Temporal temporalFor(const WorldAtmosphere &environment,const Geometry &geometry,const QMatrix4x4 &camera,
+                                              QSize size)
+    {
+        ViewportFrameVulkan::Temporal temporal;
+        temporal.enabled = environment.temporalAntiAliasing;
+        const bool playing = window_.runtime_.has_value();
+        const bool changed = !previousValid_ || camera != previousCamera_ || size != previousSize_
+            || window_.geometryRevision_ != previousGeometry_ || window_.textureRevision_ != previousTextures_;
+        if (temporal.enabled && !playing && changed)
+            frame_.resetHistory();
+        temporal.still = !playing && !geometry.animated;
+        const auto reprojection = (previousValid_ ? previousCamera_ : camera)*camera.inverted();
+        std::copy_n(reprojection.constData(),16,temporal.reprojection.begin());
+        previousCamera_ = camera;
+        previousSize_ = size;
+        previousGeometry_ = window_.geometryRevision_;
+        previousTextures_ = window_.textureRevision_;
+        previousValid_ = true;
+        return temporal;
+    }
+
+    // The exposure in stops for this frame. With auto exposure, reads the histogram this frame slot metered last
+    // time and moves toward its target, asking for more frames until the exposure settles.
+    float exposureFor(const WorldAtmosphere &environment,uint32_t frameIndex)
+    {
+        namespace color = worldforge::color;
+        if (!environment.autoExposure) {
+            adaptedStops_ = std::numeric_limits<float>::quiet_NaN();
+            adaptClock_.invalidate();
+            return environment.exposure;
+        }
+        const float seconds = adaptClock_.isValid() ? float(adaptClock_.restart())*0.001f : 0.0f;
+        if (!adaptClock_.isValid())
+            adaptClock_.start();
+        float average = 0;
+        if (frame_.takeMeter(frameIndex,average)) {
+            const float target = color::autoExposureStops(average,environment.exposureCompensation);
+            adaptedStops_ = std::isnan(adaptedStops_) ? target : color::adaptExposure(adaptedStops_,target,std::min(seconds,0.25f));
+            if (std::abs(target-adaptedStops_) > 0.01f)
+                window_.requestUpdate();
+        } else if (std::isnan(adaptedStops_)) {
+            window_.requestUpdate();
+        }
+        return std::isnan(adaptedStops_) ? environment.exposure : adaptedStops_;
+    }
+
     void startNextFrame() override
     {
         auto &geometry = window_.geometry();
@@ -2069,23 +2319,34 @@ public:
         const auto command = window_.currentCommandBuffer();
         const VkExtent2D extent{uint32_t(size.width()), uint32_t(size.height())};
         const VkRect2D area{{0,0}, extent};
-        VkClearValue clear[2]{};
-        clear[0].color = {{0.045f,0.059f,0.080f,1.0f}};
-        clear[1].depthStencil = {1.0f, 0};
+        // Attachment 0 is the swap chain image, 1 the linear HDR scene, 2 the scene depth.
+        VkClearValue clear[3]{};
+        const auto background = wf::color::srgbToLinear({0.045f,0.059f,0.080f});
+        clear[1].color = {{background[0],background[1],background[2],1.0f}};
+        clear[2].depthStencil = {1.0f, 0};
         VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-        pass.renderPass = window_.defaultRenderPass();
-        pass.framebuffer = window_.currentFramebuffer();
         pass.renderArea = area;
-        pass.clearValueCount = 2;
-        pass.pClearValues = clear;
-
+        if (!frame_.displayReady()) {
+            // Without the HDR pass, clear the window so the swap chain image is still presentable.
+            pass.renderPass = window_.defaultRenderPass();
+            pass.framebuffer = window_.currentFramebuffer();
+            clear[0].color = {{0.045f,0.059f,0.080f,1.0f}};
+            clear[1].depthStencil = {1.0f, 0};
+            pass.clearValueCount = 2;
+            pass.pClearValues = clear;
+            vk_->vkCmdBeginRenderPass(command,&pass,VK_SUBPASS_CONTENTS_INLINE);
+            vk_->vkCmdEndRenderPass(command);
+            window_.frameReady();
+            return;
+        }
         auto &frame = frames_.at(window_.currentFrame());
         const bool hasGeometry = !geometry.triangles.empty() || !geometry.lines.empty()
             || !geometry.overlays.empty() || !geometry.selectionOutline.empty();
         const auto environment = window_.atmosphere();
-        Light sunlight{sunDirection(environment),1,true};
+        std::vector<Light> lights{Light{sunDirection(environment),1,true}};
         if (const auto *project = window_.store_.project())
-            sunlight = primarySun(window_.runtime_ ? window_.runtime_->objects() : project->objects,environment);
+            lights = sceneLights(window_.runtime_ ? window_.runtime_->objects() : project->objects,environment);
+        const Light sunlight = lights.front();
         const auto sun = sunlight.vector;
         const float sunStrength = sunlight.intensity;
         const float windTime = float(window_.windClock_.elapsed()%1000000)*0.001f;
@@ -2097,25 +2358,55 @@ public:
         lighting.fogCenterRadius[3] = environment.localFogRadius;
         lighting.settings[0] = environment.localFogDensity;
         lighting.settings[1] = shadows ? 1.0f : 0.0f;
-        lighting.settings[2] = 0.00045f;
-        const auto shadowMatrix = lightCamera(sun);
-        std::copy_n(shadowMatrix.constData(),16,lighting.lightMatrix);
+        lighting.settings[2] = float(frame_.sampleIndex()); // turns the shadow filter pattern each TAA frame
+        lighting.settings[3] = window_.modelOnly_ ? 1.0f : skyAmbient(environment);
+        // The shading model (Shading.glsl): the sun, the sky light and up to 16 other lights.
+        const auto towardSun = sunlight.vector.normalized();
+        const float sunValues[4]{towardSun.x(),towardSun.y(),towardSun.z(),sunlight.intensity};
+        std::copy_n(sunValues,4,lighting.sun);
+        const auto &skyLight = cachedSkyLight(environment,sunlight);
+        for (std::size_t i = 0; i < 9; ++i)
+            std::copy_n(skyLight.irradiance[i].data(),4,lighting.skyIrradiance[i]);
+        std::copy_n(skyLight.horizon.data(),3,lighting.skyHorizon);
+        std::copy_n(skyLight.zenith.data(),3,lighting.skyZenith);
+        std::copy_n(skyLight.ground.data(),3,lighting.skyGround);
+        int lightCount = 0;
+        for (std::size_t i = 1; i < lights.size() && lightCount < 16; ++i)
+            if (lights[i].intensity > 0) {
+                const auto &light = lights[i];
+                const float values[4]{light.vector.x(),light.vector.y(),light.vector.z(),
+                    light.directional ? -light.intensity : light.intensity};
+                std::copy_n(values,4,lighting.lights[lightCount++]);
+            }
+        lighting.skyHorizon[3] = float(lightCount);
+        const auto cascades = shadowCascades(geometry,sun,window_.camera(size));
+        for (int i = 0; i < wf::shadow::cascadeCount; ++i) {
+            std::copy_n(cascades.matrices[i].data(),16,lighting.cascadeMatrices[i]);
+            std::copy_n(cascades.scales[i].data(),4,lighting.cascadeScales[i]);
+        }
         const auto frameIndex = window_.currentFrame();
+        const auto exposure = exposureFor(environment,frameIndex);
         const bool ready = triangles_ && lines_ && sky_ && shadow_
             && (!hasGeometry || upload(frame,geometry,window_.geometryRevision_)) && lighting_.upload(frameIndex,lighting)
             && lighting_.uploadTextures(frameIndex,window_.modelOnly_ ? geometry.texturePixels : window_.worldTexturePixels_,
                 window_.textureRevision_);
         if (ready)
-            recordShadow(command,frame,frameIndex,shadows,geometry.triangles.size(),shadowMatrix,windTime);
-        vk_->vkCmdBeginRenderPass(command, &pass, VK_SUBPASS_CONTENTS_INLINE);
+            recordShadow(command,frame,frameIndex,shadows,geometry.triangles.size(),cascades,windTime);
+        frame_.begin(command,window_.currentSwapChainImageIndex(),background.data());
         if (ready) {
             const VkViewport viewport{0, 0, float(size.width()), float(size.height()), 0, 1};
             vk_->vkCmdSetViewport(command, 0, 1, &viewport);
             vk_->vkCmdSetScissor(command, 0, 1, &area);
             const auto camera = window_.camera(size);
+            const auto temporal = temporalFor(environment,geometry,camera,size);
+            // The scene renders with this frame's TAA jitter; editor overlays use the steady camera.
+            const auto subpixel = temporal.enabled ? frame_.jitter() : std::array<float,2>{};
+            QMatrix4x4 jitter;
+            jitter.translate(2*subpixel[0]/float(size.width()),2*subpixel[1]/float(size.height()),0);
+            const auto sceneCamera = jitter*camera;
             const auto descriptors = lighting_.descriptor(frameIndex);
             vk_->vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&descriptors,0,nullptr);
-            const auto eye = window_.target_ + window_.viewDirection()*window_.distance_;
+            const auto eye = window_.viewPose().first;
             ViewUniform uniforms{};
             const auto writeColor = [](float (&dest)[4], const QColor &source, float alpha) {
                 dest[0] = source.redF();
@@ -2133,7 +2424,7 @@ public:
                 uniforms.eye[3] = sun.x()*sunStrength;
                 uniforms.horizon[3] = sun.y()*sunStrength;
                 uniforms.zenith[3] = sun.z()*sunStrength;
-                const auto inverse = camera.inverted();
+                const auto inverse = sceneCamera.inverted();
                 std::copy_n(inverse.constData(),16,uniforms.matrix);
                 vk_->vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_);
                 vk_->vkCmdPushConstants(command, layout_, shaderStages, 0, sizeof(uniforms), &uniforms);
@@ -2146,8 +2437,10 @@ public:
             uniforms.horizon[1] = sun.y();
             uniforms.horizon[2] = sun.z();
             uniforms.zenith[0] = sunStrength;
+            // World views shade every surface with the shared physically based model; modeling views keep their studio light.
+            uniforms.zenith[1] = window_.modelOnly_ ? 0.0f : 1.0f;
             uniforms.eye[3] = windTime;
-            std::copy_n(camera.constData(),16,uniforms.matrix);
+            std::copy_n(sceneCamera.constData(),16,uniforms.matrix);
             vk_->vkCmdPushConstants(command, layout_, shaderStages, 0, sizeof(uniforms), &uniforms);
             const VkDeviceSize offset = 0;
             if (hasGeometry)
@@ -2156,6 +2449,19 @@ public:
                 vk_->vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, triangles_);
                 vk_->vkCmdDraw(command, uint32_t(geometry.triangles.size()), 1, 0, 0);
             }
+            // Display subpass: tone map the HDR scene, then draw editor lines in display colors.
+            ViewportFrameVulkan::Occlusion occlusion;
+            occlusion.enabled = environment.ambientOcclusion;
+            const auto toWorld = sceneCamera.inverted();
+            std::copy_n(toWorld.constData(),16,occlusion.inverseViewProjection.begin());
+            frame_.display(command,exposure,environment.viewTransform,environment.autoExposure ? int(frameIndex) : -1,temporal,
+                           occlusion);
+            window_.temporalSettled_ = !temporal.enabled || !temporal.still || frame_.accumulated() >= wf::vk::HdrFrame::temporalSamples;
+            if (!window_.temporalSettled_)
+                window_.requestUpdate();
+            std::copy_n(camera.constData(),16,uniforms.matrix);
+            vk_->vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&descriptors,0,nullptr);
+            vk_->vkCmdPushConstants(command, layout_, shaderStages, 0, sizeof(uniforms), &uniforms);
             if (!geometry.lines.empty()) {
                 vk_->vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, lines_);
                 vk_->vkCmdDraw(command, uint32_t(geometry.lines.size()), 1, uint32_t(geometry.triangles.size()), 0);
@@ -2175,8 +2481,15 @@ public:
                 vk_->vkCmdDraw(command,uint32_t(geometry.selectionOutline.size()),1,
                     uint32_t(geometry.triangles.size()+geometry.lines.size()+geometry.overlays.size()),0);
             }
+        } else {
+            const VkViewport viewport{0, 0, float(size.width()), float(size.height()), 0, 1};
+            vk_->vkCmdSetViewport(command, 0, 1, &viewport);
+            vk_->vkCmdSetScissor(command, 0, 1, &area);
+            frame_.display(command,exposure,environment.viewTransform);
         }
         vk_->vkCmdEndRenderPass(command);
+        if (ready && environment.autoExposure)
+            frame_.finishMeter(command);
         if (ready && !window_.rendered_) {
             window_.rendered_ = true;
             window_.report(QObject::tr("Vulkan · %1 · RMB orbit · MMB pan · Wheel zoom · F frame")
@@ -2199,18 +2512,30 @@ private:
         quint64 revision = 0;
         std::set<ModelComponent> highlights;
     };
-    QMatrix4x4 lightCamera(QVector3D sun)
+    // Sun shadow cascades fitted to the steady camera (no TAA jitter) and to the scene's bounds.
+    wf::shadow::Cascades shadowCascades(const Geometry &geometry,QVector3D sun,const QMatrix4x4 &camera)
     {
-        const float radius = std::clamp(window_.distance_*1.55f,24.0f,180.0f);
-        const auto focus = window_.target_;
-        QMatrix4x4 projection,view;
-        projection.ortho(-radius,radius,-radius,radius,0.05f,radius*4);
-        view.lookAt(focus+sun*(radius*2),focus,std::abs(sun.z()) > 0.98f ? QVector3D(0,1,0) : QVector3D(0,0,1));
-        return window_.clipCorrectionMatrix()*projection*view;
+        if (shadowBoundsRevision_ != window_.geometryRevision_) {
+            shadowBoundsRevision_ = window_.geometryRevision_;
+            shadowBounds_.reset();
+            for (const auto &vertex : geometry.triangles) {
+                const wf::shadow::Vector point{vertex.position[0],vertex.position[1],vertex.position[2]};
+                if (!shadowBounds_)
+                    shadowBounds_ = wf::shadow::Bounds{point,point};
+                for (int axis = 0; axis < 3; ++axis) {
+                    shadowBounds_->minimum[axis] = std::min(shadowBounds_->minimum[axis],point[axis]);
+                    shadowBounds_->maximum[axis] = std::max(shadowBounds_->maximum[axis],point[axis]);
+                }
+            }
+        }
+        wf::shadow::Matrix toWorld;
+        const auto inverse = camera.inverted();
+        std::copy_n(inverse.constData(),16,toWorld.begin());
+        return wf::shadow::fit(toWorld,{sun.x(),sun.y(),sun.z()},shadowBounds_);
     }
 
     void recordShadow(VkCommandBuffer command,const Buffer &frame,int frameIndex,bool draw,std::size_t count,
-                      const QMatrix4x4 &matrix,float wind)
+                      const wf::shadow::Cascades &cascades,float wind)
     {
         constexpr auto size = WorldLightingVulkan::shadowSize;
         const VkRect2D area{{0,0},{size,size}};
@@ -2220,17 +2545,23 @@ private:
             lighting_.framebuffer(frameIndex),area,1,&clear};
         vk_->vkCmdBeginRenderPass(command,&pass,VK_SUBPASS_CONTENTS_INLINE);
         if (draw) {
-            const VkViewport viewport{0,0,float(size),float(size),0,1};
-            vk_->vkCmdSetViewport(command,0,1,&viewport);
-            vk_->vkCmdSetScissor(command,0,1,&area);
             vk_->vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadow_);
             const VkDeviceSize offset = 0;
             vk_->vkCmdBindVertexBuffers(command,0,1,&frame.buffer,&offset);
-            ViewUniform uniforms{};
-            std::copy_n(matrix.constData(),16,uniforms.matrix);
-            uniforms.eye[3] = wind;
-            vk_->vkCmdPushConstants(command,layout_,shaderStages,0,sizeof(uniforms),&uniforms);
-            vk_->vkCmdDraw(command,uint32_t(count),1,0,0);
+            // One tile of the atlas per cascade.
+            for (int cascade = 0; cascade < wf::shadow::cascadeCount; ++cascade) {
+                const auto origin = wf::shadow::tileOrigin(cascade);
+                constexpr auto tileSize = wf::shadow::tileSize;
+                const VkViewport viewport{float(origin[0]),float(origin[1]),float(tileSize),float(tileSize),0,1};
+                const VkRect2D tile{{int32_t(origin[0]),int32_t(origin[1])},{tileSize,tileSize}};
+                vk_->vkCmdSetViewport(command,0,1,&viewport);
+                vk_->vkCmdSetScissor(command,0,1,&tile);
+                ViewUniform uniforms{};
+                std::copy_n(cascades.matrices[cascade].data(),16,uniforms.matrix);
+                uniforms.eye[3] = wind;
+                vk_->vkCmdPushConstants(command,layout_,shaderStages,0,sizeof(uniforms),&uniforms);
+                vk_->vkCmdDraw(command,uint32_t(count),1,0,0);
+            }
         }
         vk_->vkCmdEndRenderPass(command);
     }
@@ -2302,9 +2633,10 @@ private:
                     auto vertex = geometry.triangles[i];
                     if (selected) {
                         const auto strength = geometry.faceLighting[i];
-                        vertex.color[0] = 0.65f*strength;
-                        vertex.color[1] = 0.27f*strength;
-                        vertex.color[2] = 0.95f*strength;
+                        static const auto highlight = linearColor({0.65f,0.27f,0.95f});
+                        vertex.color[0] = highlight.x()*strength;
+                        vertex.color[1] = highlight.y()*strength;
+                        vertex.color[2] = highlight.z()*strength;
                         vertex.surfaceFactors[1] = 0;
                         vertex.texture[0] = 0;
                     }
@@ -2359,9 +2691,16 @@ private:
             : outline ? ":/shaders/SelectionOutline.frag.spv" : ":/shaders/Scene.frag.spv");
         VkPipeline result{};
         if (vertex && (fragment || shadow)) {
+            // Sky and lit triangles render into the HDR scene; lines, overlays and outlines draw after
+            // the display transform, and the scene shader keeps their sRGB colors (displayPass).
+            const uint32_t subpass = sky || (pass == Pass::Scene && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+                ? ViewportFrameVulkan::sceneSubpass : ViewportFrameVulkan::displaySubpass;
+            const VkBool32 displayPass = subpass == ViewportFrameVulkan::displaySubpass;
+            const VkSpecializationMapEntry constant{0,0,sizeof(VkBool32)};
+            const VkSpecializationInfo specialization{1,&constant,sizeof(displayPass),&displayPass};
             const VkPipelineShaderStageCreateInfo stages[]{
                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertex, "main", nullptr},
-                {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragment, "main", nullptr}};
+                {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragment, "main", &specialization}};
             const VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
             const VkVertexInputAttributeDescription attributes[]{
                 {0,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(Vertex, position)}, {1,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(Vertex, color)},
@@ -2387,16 +2726,20 @@ private:
             raster.depthBiasConstantFactor = 1.25f;
             raster.depthBiasSlopeFactor = 1.3f;
             VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-            samples.rasterizationSamples = shadow ? VK_SAMPLE_COUNT_1_BIT : window_.sampleCountFlagBits();
+            samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
             VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
             depth.depthTestEnable = sky || pass == Pass::Overlay ? VK_FALSE : VK_TRUE;
             depth.depthWriteEnable = depthWrite ? VK_TRUE : VK_FALSE;
             depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
             VkPipelineColorBlendAttachmentState blend{};
             blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            // The scene pass has a second target for the sky-light part, which only Scene.frag writes.
+            VkPipelineColorBlendAttachmentState blends[wf::vk::HdrFrame::sceneColorAttachments]{blend,blend};
+            if (sky)
+                blends[1].colorWriteMask = 0;
             VkPipelineColorBlendStateCreateInfo colors{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-            colors.attachmentCount = 1;
-            colors.pAttachments = &blend;
+            colors.attachmentCount = subpass == ViewportFrameVulkan::sceneSubpass ? wf::vk::HdrFrame::sceneColorAttachments : 1;
+            colors.pAttachments = blends;
             const VkDynamicState states[]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
             const VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, 2, states};
             VkGraphicsPipelineCreateInfo desc{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
@@ -2411,7 +2754,9 @@ private:
             desc.pColorBlendState = shadow ? nullptr : &colors;
             desc.pDynamicState = &dynamic;
             desc.layout = layout_;
-            desc.renderPass = shadow ? lighting_.pass() : window_.defaultRenderPass();
+            desc.renderPass = shadow ? lighting_.pass() : subpass == ViewportFrameVulkan::displaySubpass ? frame_.displayPass()
+                                                                                           : frame_.scenePass();
+            desc.subpass = shadow ? 0 : subpass;
             if (vk_->vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &desc, nullptr, &result) != VK_SUCCESS)
                 result = VK_NULL_HANDLE;
         }
@@ -2432,7 +2777,19 @@ private:
     VkPipeline sky_{};
     VkPipeline shadow_{};
     WorldLightingVulkan lighting_;
+    ViewportFrameVulkan frame_;
     std::vector<Buffer> frames_;
+    // Auto exposure: the adapted exposure in stops (NaN until the first metered frame) and the time between frames.
+    float adaptedStops_ = std::numeric_limits<float>::quiet_NaN();
+    QElapsedTimer adaptClock_;
+    // TAA: what the previous frame showed, to restart or reproject the history.
+    QMatrix4x4 previousCamera_;
+    QSize previousSize_;
+    quint64 previousGeometry_ = 0, previousTextures_ = 0;
+    // The scene's bounds for fitting shadow cascades, for geometry revision shadowBoundsRevision_.
+    std::optional<wf::shadow::Bounds> shadowBounds_;
+    quint64 shadowBoundsRevision_ = ~quint64(0);
+    bool previousValid_ = false;
 };
 
 QVulkanWindowRenderer *VulkanSceneWindow::createRenderer() { return new VulkanSceneRenderer(*this); }
@@ -2472,6 +2829,8 @@ LiveViewport::LiveViewport(ProjectStore &store, bool modelOnly, QWidget *parent)
         layout->addWidget(container_, 1);
         status_->setText(tr("Starting Vulkan viewport…"));
         connect(&store, &ProjectStore::sceneChanged, this, [this] { window_->sceneEdited(); });
+        if (!modelOnly)
+            connect(&store,&ProjectStore::nativeGameplayChanged,this,[this] { window_->nativeGameplayChanged(); });
         connect(&store, &ProjectStore::selectionChanged, this, [this, &store, modelOnly, selection = store.selection()]() mutable {
             window_->invalidate();
             if (modelOnly && selection != store.selection())
@@ -2493,6 +2852,10 @@ LiveViewport::LiveViewport(ProjectStore &store, bool modelOnly, QWidget *parent)
 
 LiveViewport::~LiveViewport()
 {
+#ifdef WORLDFORGE_VULKAN
+    if (window_)
+        window_->stop();
+#endif
     delete container_;
 }
 
@@ -2644,6 +3007,48 @@ void LiveViewport::setModelPreview(QSharedPointer<const worldforge::Mesh> mesh,s
 #else
     Q_UNUSED(mesh);
     Q_UNUSED(gizmo);
+#endif
+}
+
+void LiveViewport::setAssetPreview(QSharedPointer<const worldforge::Mesh> mesh,bool reframe)
+{
+#ifdef WORLDFORGE_VULKAN
+    if (window_)
+        window_->setAssetPreview(std::move(mesh),reframe);
+#else
+    Q_UNUSED(mesh);
+    Q_UNUSED(reframe);
+#endif
+}
+
+void LiveViewport::setPlacementPreview(const SceneObject &placement,QSharedPointer<const worldforge::Mesh> mesh)
+{
+#ifdef WORLDFORGE_VULKAN
+    if (window_)
+        window_->setPlacementPreview(placement,std::move(mesh));
+#else
+    Q_UNUSED(placement);
+    Q_UNUSED(mesh);
+#endif
+}
+
+void LiveViewport::setCameraPreview(QVector3D eye,QVector3D target)
+{
+#ifdef WORLDFORGE_VULKAN
+    if (window_)
+        window_->setCameraPreview(eye,target);
+#else
+    Q_UNUSED(eye);
+    Q_UNUSED(target);
+#endif
+}
+
+bool LiveViewport::runtimeShowsHud() const
+{
+#ifdef WORLDFORGE_VULKAN
+    return window_ && window_->runtimeShowsHud();
+#else
+    return false;
 #endif
 }
 
@@ -2816,8 +3221,13 @@ bool LiveViewport::hasRenderedFrame() const
 QImage LiveViewport::captureFrame()
 {
 #ifdef WORLDFORGE_VULKAN
-    if (hasRenderedFrame() && window_->supportsGrab())
-        return window_->grab();
+    if (hasRenderedFrame() && window_->supportsGrab()) {
+        // Each grab renders one frame; a still view needs all its TAA samples for a converged image.
+        auto image = window_->grab();
+        for (int frame = 0; frame < 40 && !window_->temporalSettled(); ++frame)
+            image = window_->grab();
+        return image;
+    }
 #endif
     return {};
 }

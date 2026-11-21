@@ -150,6 +150,13 @@ void EmbeddedStudio::clearAsset()
         assetSession_ = false;
 }
 
+bool EmbeddedStudio::closeForAssetSwitch()
+{
+    QSaveFile request(exchange_.filePath("close-session"));
+    return isRunning() && studioWindow_ && request.open(QIODevice::WriteOnly)
+        && request.write("switch",6) == 6 && request.commit();
+}
+
 bool EmbeddedStudio::showWorkspace(const QString &workspace)
 {
     QSaveFile request(exchange_.filePath("workspace"));
@@ -173,6 +180,11 @@ void EmbeddedStudio::start()
 #ifdef Q_OS_WIN
     if (isRunning())
         return;
+    const auto closeRequest = exchange_.filePath("close-session");
+    if (QFile::exists(closeRequest) && !QFile::remove(closeRequest)) {
+        returnToEditor(tr("Could not reset the Studio session."));
+        return;
+    }
     for (const QString name : {QStringLiteral("StudioPublish.py"),QStringLiteral("StudioNavigation.py")}) {
         QFile script(":/Workspaces/"+name);
         QSaveFile output(exchange_.filePath(name));

@@ -131,6 +131,30 @@ std::vector<Point3> findPath(const WorldSimulation &world, Point3 from, Point3 t
     return path;
 }
 
+bool BehaviorRule::valid(std::size_t missions,std::size_t bodies,std::size_t beacons) const
+{
+    return !label.empty() && label.size() <= 150 && int(event) >= 0 && int(event) <= 2
+        && int(action) >= 0 && action <= Action::LaunchUpward && (!mission || *mission < missions)
+        && (event == Event::MissionCompleted) == mission.has_value() && (!requiredMission || *requiredMission < missions)
+        && target < (action == Action::PulseBeacon ? beacons : bodies)
+        && amount >= 0.1f && amount <= 15 && std::ranges::all_of(position,[](float v) {
+            return std::isfinite(v) && std::abs(v) <= 5'000'000;
+        });
+}
+
+bool BehaviorRule::validBody(const WorldSimulation &world) const
+{
+    return action == Action::PulseBeacon
+        || (target < world.bodies.size() && world.bodies[target].dynamic == (action == Action::LaunchUpward));
+}
+
+bool Gameplay::movesBody(std::size_t body) const
+{
+    return std::ranges::any_of(behaviors,[body](const BehaviorRule &rule) {
+        return rule.action == BehaviorRule::Action::RaiseObject && rule.target == body;
+    });
+}
+
 void Gameplay::start(WorldSimulation &world)
 {
     for (auto &vehicle : vehicles) {
@@ -151,10 +175,56 @@ void Gameplay::start(WorldSimulation &world)
     }
     for (auto &mission : missions)
         mission.state = Mission::State::Waiting;
+    for (auto &rule : behaviors)
+        rule.result = BehaviorRule::Result::Waiting;
+    for (auto &beacon : behaviorBeacons)
+        beacon.remaining = 0;
+    for (auto &beacon : beacons) {
+        beacon.triggered = false;
+        beacon.remaining = 0;
+    }
+    for (auto &shot : shots) {
+        shot.triggered = false;
+        shot.remaining = 0;
+    }
+    for (auto &patrol : patrols) {
+        patrol.position = patrol.start;
+        patrol.remaining = 0;
+        patrol.state = NpcPatrol::State::Walking;
+        patrol.resumed = false;
+    }
 }
 
 void Gameplay::update(WorldSimulation &world, std::optional<std::size_t> player, bool interact)
 {
+    for (auto &beacon : behaviorBeacons)
+        beacon.remaining = std::max(0.0f,beacon.remaining-WorldSimulation::stepSeconds);
+    for (auto &beacon : beacons)
+        beacon.remaining = std::max(0.0f,beacon.remaining-WorldSimulation::stepSeconds);
+    for (auto &shot : shots)
+        shot.remaining = std::max(0.0f,shot.remaining-WorldSimulation::stepSeconds);
+    for (auto &patrol : patrols) {
+        using State = NpcPatrol::State;
+        if (patrol.state == State::Waiting) {
+            patrol.remaining -= WorldSimulation::stepSeconds;
+            if (patrol.remaining <= 0) {
+                patrol.state = State::Returning;
+                patrol.resumed = true;
+            }
+            continue;
+        }
+        const auto &target = patrol.state == State::Walking ? patrol.destination : patrol.start;
+        const auto delta = std::hypot(target[0]-patrol.position[0],target[1]-patrol.position[1],target[2]-patrol.position[2]);
+        const auto distance = patrol.speed*WorldSimulation::stepSeconds;
+        if (delta <= distance) {
+            patrol.position = target;
+            patrol.remaining = patrol.wait;
+            patrol.state = patrol.state == State::Walking ? State::Waiting : State::Walking;
+        } else {
+            for (std::size_t axis = 0; axis < target.size(); ++axis)
+                patrol.position[axis] = std::lerp(patrol.position[axis],target[axis],distance/delta);
+        }
+    }
     constexpr float dt = WorldSimulation::stepSeconds;
     for (auto &vehicle : vehicles) {
         if (vehicle.route >= routes.size() || vehicle.body >= world.bodies.size())
@@ -198,6 +268,109 @@ void Gameplay::update(WorldSimulation &world, std::optional<std::size_t> player,
         if (mission.state == State::Interact && interact && planar(position, mission.target) <= mission.targetRadius)
             mission.state = State::Complete;
     }
+    for (auto &beacon : beacons) {
+        if (!beacon.triggered && beacon.mission < missions.size()
+            && missions[beacon.mission].state == Mission::State::Complete) {
+            beacon.triggered = true;
+            beacon.remaining = beacon.seconds;
+        }
+    }
+    for (auto &shot : shots) {
+        if (!shot.triggered && shot.mission < missions.size() && missions[shot.mission].state == Mission::State::Complete) {
+            shot.triggered = true;
+            shot.remaining = shot.seconds;
+        }
+    }
+    const auto complete = [&](std::size_t mission) {
+        return mission < missions.size() && missions[mission].state == Mission::State::Complete;
+    };
+    using Rule = BehaviorRule;
+    for (auto &rule : behaviors) {
+        if (rule.result == Rule::Result::Fired
+            || (rule.result == Rule::Result::ConditionFailed && rule.event != Rule::Event::InteractNearby))
+            continue;
+        const Point3 &targetPosition = rule.followLaunchTarget && rule.action == Rule::Action::LaunchUpward && rule.target < world.bodies.size()
+            ? world.bodies[rule.target].position : rule.position;
+        const bool triggered = rule.event == Rule::Event::PlayStarted
+            || (rule.event == Rule::Event::MissionCompleted && rule.mission && complete(*rule.mission))
+            || (rule.event == Rule::Event::InteractNearby && interact
+                && std::hypot(position[0]-targetPosition[0],position[1]-targetPosition[1],position[2]-targetPosition[2]) <= 3);
+        if (!triggered)
+            continue;
+        if (rule.requiredMission && !complete(*rule.requiredMission)) {
+            // An interaction is retryable. One-shot events report the failed condition.
+            rule.result = Rule::Result::ConditionFailed;
+            continue;
+        }
+        if (rule.action == Rule::Action::PulseBeacon && rule.target < behaviorBeacons.size())
+            behaviorBeacons[rule.target].remaining = rule.amount;
+        else if (rule.action == Rule::Action::RaiseObject && rule.target < world.bodies.size())
+            world.bodies[rule.target].position[2] += rule.amount;
+        else if (rule.action != Rule::Action::LaunchUpward || !world.launchUpward(rule.target,rule.amount))
+            continue;
+        rule.result = Rule::Result::Fired;
+    }
+}
+
+const MissionShot *Gameplay::activeShot() const
+{
+    const auto shot = std::ranges::find_if(shots,[](const auto &item) { return item.remaining > 0; });
+    return shot == shots.end() ? nullptr : &*shot;
+}
+
+Point3 shotPosition(const MissionShot &shot,float progress)
+{
+    Point3 result{};
+    for (std::size_t axis = 0; axis < result.size(); ++axis)
+        result[axis] = std::lerp(shot.first[axis],shot.last[axis],std::clamp(progress,0.0f,1.0f));
+    return result;
+}
+
+void GameplayTrace::observe(const Gameplay &gameplay)
+{
+    for (const auto &beacon : gameplay.beacons) {
+        beaconActive |= beacon.remaining > 0;
+        beaconEnded |= beacon.triggered && beacon.remaining <= 0;
+    }
+    for (const auto &shot : gameplay.shots) {
+        shotActive |= shot.remaining > 0;
+        shotEnded |= shot.triggered && shot.remaining <= 0;
+    }
+    for (const auto &patrol : gameplay.patrols) {
+        patrolWaited |= patrol.state == NpcPatrol::State::Waiting;
+        patrolReturned |= patrol.state == NpcPatrol::State::Returning;
+    }
+}
+
+bool GameplayTrace::complete(const Gameplay &gameplay) const
+{
+    return std::ranges::all_of(gameplay.beacons,[](const auto &beacon) { return beacon.triggered && beacon.remaining <= 0; })
+        && std::ranges::all_of(gameplay.shots,[](const auto &shot) { return shot.triggered && shot.remaining <= 0; })
+        && std::ranges::all_of(gameplay.patrols,[](const auto &patrol) { return patrol.resumed; });
+}
+
+Mesh makePatrolMesh(const NpcPatrol &patrol)
+{
+    auto mesh = makeCube();
+    mesh.materials.front().color = {0.2f,0.72f,0.9f,1};
+    for (auto &vertex : mesh.vertices) {
+        vertex[0] = vertex[0]*0.45f+patrol.position[0];
+        vertex[1] = vertex[1]*0.45f+patrol.position[1];
+        vertex[2] = vertex[2]*1.6f+patrol.position[2]+0.8f;
+    }
+    return mesh;
+}
+
+Mesh makeBeaconMesh(const MissionBeacon &beacon)
+{
+    auto mesh = makeCube();
+    mesh.materials.front().color = {beacon.color[0],beacon.color[1],beacon.color[2],1};
+    const float phase = (beacon.seconds-beacon.remaining)*6.0f;
+    const float scale = 0.3f + 0.1f*std::sin(phase);
+    for (auto &vertex : mesh.vertices)
+        for (std::size_t axis = 0; axis < vertex.size(); ++axis)
+            vertex[axis] = vertex[axis]*scale+beacon.position[axis];
+    return mesh;
 }
 
 std::string Gameplay::objective() const
@@ -205,8 +378,11 @@ std::string Gameplay::objective() const
     const auto active = std::ranges::find_if(missions, [](const Mission &mission) {
         return mission.state != Mission::State::Complete;
     });
-    if (active == missions.end())
-        return missions.empty() ? std::string() : missions.back().name + " complete";
+    if (active == missions.end()) {
+        if (missions.empty())
+            return {};
+        return missions.back().completionText.empty() ? missions.back().name + " complete" : missions.back().completionText;
+    }
     switch (active->state) {
     case Mission::State::Waiting:
         return "Go to the " + active->name + " marker to start";

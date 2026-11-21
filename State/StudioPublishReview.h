@@ -16,6 +16,7 @@ struct StudioPublishReview {
     QString blocker;
     std::size_t vertices = 0;
     std::size_t faces = 0;
+    std::size_t triangles = 0;
     std::size_t materials = 0;
     bool hasLod = false;
 

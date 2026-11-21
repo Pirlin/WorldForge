@@ -387,11 +387,15 @@ struct WorldSimulation::Backend final : JPH::ContactListener {
         std::fill(grounded.begin(),grounded.end(),false);
         for (std::size_t i = 0; i < bodies.size(); ++i) {
             const auto &input = world.bodies[i], &last = previous[i];
+            const auto id = bodies[i]->GetID();
+            if (input.position != last.position || input.rotation != last.rotation) {
+                api.SetPositionAndRotation(id,vec(input.position),quat(input.rotation),
+                    input.dynamic ? JPH::EActivation::Activate : JPH::EActivation::DontActivate);
+                if (!input.dynamic)
+                    previous[i] = input;
+            }
             if (!input.dynamic)
                 continue;
-            const auto id = bodies[i]->GetID();
-            if (input.position != last.position || input.rotation != last.rotation)
-                api.SetPositionAndRotation(id,vec(input.position),quat(input.rotation),JPH::EActivation::Activate);
             if (input.velocity != last.velocity || input.angularVelocity != last.angularVelocity)
                 api.SetLinearAndAngularVelocity(id,vec(input.velocity),vec(input.angularVelocity));
         }
@@ -416,6 +420,15 @@ WorldSimulation::WorldSimulation() = default;
 WorldSimulation::~WorldSimulation() = default;
 WorldSimulation::WorldSimulation(WorldSimulation &&) noexcept = default;
 WorldSimulation &WorldSimulation::operator=(WorldSimulation &&) noexcept = default;
+
+bool WorldSimulation::launchUpward(std::size_t body,float speed)
+{
+    if (body >= bodies.size() || !bodies[body].dynamic || !std::isfinite(speed) || speed <= 0)
+        return false;
+    bodies[body].velocity[2] = speed;
+    bodies[body].grounded = false;
+    return true;
+}
 
 void WorldSimulation::step()
 {

@@ -24,6 +24,9 @@ public:
     void previewTerrain();
     void setModelSelection(ModelDomain domain, const std::set<ModelComponent> &selection, bool xray);
     void setModelPreview(QSharedPointer<const worldforge::Mesh> mesh, std::optional<ModelGizmo> gizmo = {});
+    void setAssetPreview(QSharedPointer<const worldforge::Mesh> mesh,bool frame = true);
+    void setPlacementPreview(const SceneObject &placement,QSharedPointer<const worldforge::Mesh> mesh);
+    void setCameraPreview(QVector3D eye,QVector3D target);
     void setBaseColorPreview(int slot,QImage image);
     void setObjectPreview(bool enabled,const SceneObject *object = nullptr);
     void setModelOrthographic(bool enabled);
@@ -51,6 +54,7 @@ public:
     std::optional<QVector3D> runtimePosition(const QString &id) const;
     std::optional<QVector3D> playerPosition() const;
     QString runtimeObjective() const;
+    bool runtimeShowsHud() const;
     QString rendererName() const { return rendererName_; }
     QString adapterCounterId() const { return adapterCounterId_; }
     quint64 dedicatedMemory() const { return dedicatedMemory_; }

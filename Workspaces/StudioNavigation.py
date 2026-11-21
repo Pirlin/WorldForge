@@ -70,6 +70,11 @@ def rigging_workspace():
 def switch_workspace():
     global last_request
     try:
+        close_request = EXCHANGE / "close-session"
+        if close_request.is_file():
+            close_request.unlink()
+            bpy.ops.wm.quit_blender("EXEC_DEFAULT")
+            return None
         request = (EXCHANGE / "workspace").read_bytes()
         selection = request.split(b"\n", 1)[-1].decode("utf-8")
         window = next(iter(bpy.context.window_manager.windows), None)

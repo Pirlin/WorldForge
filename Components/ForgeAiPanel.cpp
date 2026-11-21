@@ -1,5 +1,6 @@
 #include "Components/ForgeAiPanel.h"
 
+#include "Components/LiveViewport.h"
 #include "State/GlbImport.h"
 #include "State/StudioPublishReview.h"
 #include "Workspaces/EmbeddedStudio.h"
@@ -10,9 +11,7 @@
 #include <QFile>
 #include <QFormLayout>
 #include <QHBoxLayout>
-#include <QImage>
 #include <QLabel>
-#include <QPixmap>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSpinBox>
@@ -117,17 +116,14 @@ ForgeAiPanel::ForgeAiPanel(ProjectStore &store, QWidget *parent)
         actions->addWidget(button);
     layout->addLayout(actions);
 
-    auto *result = new QHBoxLayout;
-    thumbnail_ = new QLabel;
-    thumbnail_->setObjectName("forgeThumbnail");
-    thumbnail_->setFixedSize(128, 128);
-    thumbnail_->setAlignment(Qt::AlignCenter);
+    viewPlacement_ = new QPushButton(tr("Preview in Level"));
+    viewPlacement_->setObjectName("forgePlacementPreview");
+    connect(viewPlacement_,&QPushButton::clicked,this,&ForgeAiPanel::reviewPlacement);
+    layout->addWidget(viewPlacement_,0,Qt::AlignLeft);
     report_ = new QPlainTextEdit;
     report_->setObjectName("forgeReport");
     report_->setReadOnly(true);
-    result->addWidget(thumbnail_, 0, Qt::AlignTop);
-    result->addWidget(report_, 1);
-    layout->addLayout(result, 1);
+    layout->addWidget(report_,1);
     auto *close = new QDialogButtonBox(QDialogButtonBox::Close);
     layout->addWidget(close);
 
@@ -164,7 +160,6 @@ void ForgeAiPanel::makePlan()
     street_.reset();
     streetReviewed_ = false;
     applied_ = false;
-    thumbnail_->clear();
     if (auto streetPlan = street::plan(store_, text); streetPlan.error.isEmpty()
         || streetPlan.moveEntrance || streetPlan.rerouteTraffic) {
         plan_ = {};
@@ -282,7 +277,6 @@ void ForgeAiPanel::runPreview()
     }
     stage_.reset();
     applied_ = false;
-    thumbnail_->clear();
     setReport(tr("Running the plan in Studio on a working copy of %1…").arg(asset->name));
     updateButtons();
 }
@@ -318,19 +312,45 @@ void ForgeAiPanel::showPreview(const ForgeAiJob::Result &result)
     lines.prepend(review.blocker.isEmpty() ? review.summary() : review.blocker);
     if (!review.placements.isEmpty())
         lines << tr("Existing placements that also change:") << review.placements;
-    lines << tr("Apply the change, adjust the settings and preview again, or close to cancel. After applying, "
+    lines << tr("Use Preview in Level to inspect the result in context. Apply the change, adjust the settings and preview again, or close to cancel. After applying, "
                 "Edit Selected Mesh in Studio opens the result for manual edits.");
     if (!review.blocker.isEmpty())
         stage_.reset();
-    for (const auto &slot : stage_ ? stage_->mesh.materials : std::vector<worldforge::MeshMaterial>{})
-        if (!slot.baseColorTexture.empty()) {
-            const auto image = QImage::fromData(slot.baseColorTexture.data(), int(slot.baseColorTexture.size()));
-            thumbnail_->setPixmap(QPixmap::fromImage(image.scaled(thumbnail_->size(), Qt::KeepAspectRatio,
-                                                                  Qt::SmoothTransformation)));
-            break;
-        }
     setReport(lines.join('\n'));
     updateButtons();
+}
+
+void ForgeAiPanel::reviewPlacement()
+{
+    if (!stage_ || applied_)
+        return;
+    auto mesh = stage_->mesh;
+    QString error;
+    const auto *asset = store_.meshAsset(stage_->assetId);
+    const auto *entrance = store_.object(stage_->plan.entranceId);
+    if (!asset || !entrance || forge::revision(*asset->mesh) != stage_->meshRevision
+        || forge::revision(*entrance) != stage_->entranceRevision) {
+        stage_.reset();
+        setReport(tr("The barrier or entrance changed after preview. Generate a new preview."));
+        updateButtons();
+        return;
+    }
+    if (!store_.preserveProjectMaterials(stage_->assetId,mesh,error)) {
+        setReport(error);
+        return;
+    }
+    QDialog dialog(this);
+    dialog.setObjectName("forgePlacementReview");
+    dialog.setWindowTitle(tr("Preview in Level — %1").arg(stage_->placement.name));
+    dialog.resize(900,600);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *viewport = new LiveViewport(store_,false,&dialog);
+    viewport->setPlacementPreview(stage_->placement,QSharedPointer<worldforge::Mesh>::create(std::move(mesh)));
+    layout->addWidget(viewport,1);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close,&dialog);
+    connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
+    layout->addWidget(buttons);
+    dialog.exec();
 }
 
 void ForgeAiPanel::applyStage()
@@ -399,6 +419,7 @@ void ForgeAiPanel::updateButtons()
     preview_->setEnabled(!running && ready && !applied_);
     cancel_->setEnabled(running);
     apply_->setEnabled(!running && !applied_ && (street_ ? streetReviewed_ : stage_.has_value()));
+    viewPlacement_->setVisible(!running && stage_.has_value() && !applied_);
     const bool placed = applied_ && (street_ || (stage_ && store_.object(stage_->placement.id)));
     check_->setEnabled(!running && placed);
     for (QWidget *control : std::initializer_list<QWidget *>{prompt_, barrier_, entrance_, bevel_, segments_,
