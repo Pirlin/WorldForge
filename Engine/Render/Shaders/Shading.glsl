@@ -78,9 +78,12 @@ vec2 environmentBrdf(float roughness,float nv)
     return vec2(-1.04,1.04)*a+r.zw;
 }
 
-// Light arriving from direction l with intensity in scene units: GGX specular with Smith visibility and
-// Schlick Fresnel, plus Lambert diffuse for what the surface does not reflect.
-vec3 directLight(Surface surface,vec3 v,vec3 l,float intensity)
+// Light arriving from direction l with intensity in scene units: GGX specular with the height-correlated Smith
+// visibility and Schlick Fresnel, plus Lambert diffuse for what the surface does not reflect. This is the model
+// Cycles' Principled BSDF uses (alpha = roughness^2, no roughness remapping), so grazing sunlight on rough
+// ground reflects as brightly as in the reference. energy scales the specular lobe for the light that bounces
+// between microfacets (multiple scattering), which a single GGX bounce loses at high roughness.
+vec3 directLight(Surface surface,vec3 v,vec3 l,float intensity,vec3 energy)
 {
     vec3 n = surface.normal;
     float nl = max(dot(n,l),0.0);
@@ -94,12 +97,11 @@ vec3 directLight(Surface surface,vec3 v,vec3 l,float intensity)
     float a2 = a*a;
     float denominator = nh*nh*(a2-1.0)+1.0;
     float distribution = a2/(shadingPi*denominator*denominator);
-    float k = (surface.roughness+1.0)*(surface.roughness+1.0)/8.0;
-    float visibility = 1.0/((nl*(1.0-k)+k)*(nv*(1.0-k)+k)*4.0);
+    float visibility = 0.5/(nl*sqrt(nv*nv*(1.0-a2)+a2)+nv*sqrt(nl*nl*(1.0-a2)+a2));
     vec3 f0 = mix(vec3(0.04),surface.albedo,surface.metallic);
     vec3 fresnel = f0+(1.0-f0)*pow(1.0-vh,5.0);
     vec3 diffuse = (1.0-fresnel)*(1.0-surface.metallic)*surface.albedo/shadingPi;
-    vec3 specular = distribution*visibility*fresnel;
+    vec3 specular = distribution*visibility*fresnel*energy;
     return (diffuse+specular)*nl*shadingPi*intensity;
 }
 
@@ -111,22 +113,25 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
     // Thin, two-sided geometry (leaves, planes) shows its back: light it as seen.
     if (dot(surface.normal,v) < 0.0)
         surface.normal = -surface.normal;
-    vec3 result = directLight(surface,v,normalize(lighting.sun.xyz),lighting.sun.w*sunVisibility);
+    float nv = max(dot(surface.normal,v),1e-4);
+    vec3 f0 = mix(vec3(0.04),surface.albedo,surface.metallic);
+    vec2 brdf = environmentBrdf(surface.roughness,nv);
+    // Multiple-scattering compensation (Turquin 2019): a single GGX bounce reflects brdf.x+brdf.y of the light for a
+    // perfect mirror material; the rest bounces again and leaves tinted by f0.
+    vec3 energy = 1.0+f0*(1.0/max(brdf.x+brdf.y,1e-3)-1.0);
+    vec3 result = directLight(surface,v,normalize(lighting.sun.xyz),lighting.sun.w*sunVisibility,energy);
     int count = int(lighting.skyHorizon.w);
     for (int i = 0; i < count && i < 16; ++i) {
         vec4 light = lighting.lights[i];
         if (light.w < 0.0) {
-            result += directLight(surface,v,normalize(light.xyz),-light.w);
+            result += directLight(surface,v,normalize(light.xyz),-light.w,energy);
         } else {
             vec3 offset = light.xyz-position;
             float distanceSquared = max(dot(offset,offset),0.01);
-            result += directLight(surface,v,offset*inversesqrt(distanceSquared),light.w/distanceSquared);
+            result += directLight(surface,v,offset*inversesqrt(distanceSquared),light.w/distanceSquared,energy);
         }
     }
-    float nv = max(dot(surface.normal,v),1e-4);
-    vec3 f0 = mix(vec3(0.04),surface.albedo,surface.metallic);
-    vec2 brdf = environmentBrdf(surface.roughness,nv);
-    vec3 specularColor = f0*brdf.x+brdf.y;
+    vec3 specularColor = (f0*brdf.x+brdf.y)*energy;
     vec3 r = reflect(-v,surface.normal);
     // Rough surfaces see a blurrier sky; at full roughness the reflection is the irradiance.
     vec3 reflected = mix(skyRadianceToward(r),skyIrradiance(r),smoothstep(0.0,1.0,surface.roughness));
