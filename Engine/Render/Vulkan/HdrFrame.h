@@ -31,6 +31,8 @@ public:
     // display pass (one frame late, which motion hides), and mixed into the scene by the display step.
     static constexpr int bloomLevels = 6;
     static constexpr float bloomStrength = color::bloomStrength;
+    // Screen-space reflections (Shading.glsl) march rays up to this many meters through the previous frame.
+    static constexpr float reflectionRange = 100.0f;
 
     struct Temporal {
         bool enabled = false;
@@ -95,6 +97,13 @@ public:
     uint32_t accumulated() const { return accumulated_; }
     // The next frame's place in the jitter sequence, 0 to temporalSamples - 1; noise in other passes follows it.
     uint32_t sampleIndex() const { return sample_%temporalSamples; }
+    // The previous frame's TAA result, for the scene pass to read (screen-space reflections, Shading.glsl): linear
+    // light in RGB and the depth along the camera's forward axis in alpha (0 for sky), in SHADER_READ_ONLY_OPTIMAL
+    // layout. Which image this is changes every frame, so bind it each frame before begin(). It holds a frame only
+    // when previousFrameReady().
+    VkImageView previousFrame() const { return history_[1-parity_].view; }
+    bool previousFrameReady() const { return framesShown_ > 0; }
+    VkSampler nearestSampler() const { return nearest_; }
 
     // Begins the scene pass for output image `output`.
     void begin(VkCommandBuffer command,std::size_t output,const float background[3]);
@@ -115,6 +124,8 @@ private:
                         uint32_t subpass,VkPipeline &pipeline,bool additive = false);
     // Builds the bloom chain from the previous frame's TAA result.
     void bloomChain(VkCommandBuffer command);
+    // Gives images that start undefined the layout their descriptors name, before anything reads them.
+    void initializeLayouts(VkCommandBuffer command);
 
     const Device *device_ = nullptr;
     VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;

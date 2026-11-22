@@ -15,7 +15,9 @@ layout(location = 5) in vec3 materialNormal;
 layout(location = 6) flat in vec2 surfaceFactors;
 layout(set = 0, binding = 2, std430) readonly buffer MaterialImages { uint pixels[]; } images;
 layout(location = 0) out vec4 color;
-layout(location = 1) out vec4 indirectLight; // the sky-light part of color, which ambient occlusion scales
+// The sky-light part of color, which ambient occlusion scales, and in alpha the depth along the camera's forward axis,
+// which TAA keeps with its result for screen-space reflections (0 where only sky shows).
+layout(location = 1) out vec4 indirectLight;
 layout(location = 2) out vec4 surfaceAlbedo; // diffuse albedo and fog transmission, for bounce light
 layout(push_constant) uniform View {
     mat4 matrix;
@@ -153,6 +155,6 @@ void main()
     vec4 local = localMist(camera.eye.xyz,direction,rayLength,tint,camera.zenith.x);
     color = vec4((surface*fog.a+fog.rgb)*(1.0-local.a)+local.rgb,1.0);
     float transmission = fog.a*(1.0-local.a);
-    indirectLight = vec4(indirect*transmission,1.0);
+    indirectLight = vec4(indirect*transmission,max(dot(ray,lighting.clusterForward.xyz),1e-3));
     surfaceAlbedo = vec4(diffuseAlbedo,transmission);
 }

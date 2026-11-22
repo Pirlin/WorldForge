@@ -27,8 +27,12 @@ struct LightingUniform {
     float skyDirections[worldforge::sky::directionCount][4];
     float skySettings[4];       // sky visibility maps on, meters per texel, physical sky on
     float sunTint[4];           // sunlight color at the ground, luminance 1
+    // Screen-space reflections (Shading.glsl): the previous frame's clip space without jitter; on with a previous frame
+    // to trace, the longest ray in meters.
+    float previousViewProjection[16];
+    float reflectionSettings[4];
 };
-static_assert(sizeof(LightingUniform) == 1904);
+static_assert(sizeof(LightingUniform) == 1984);
 
 class WorldLightingVulkan {
 public:
@@ -47,6 +51,8 @@ public:
     bool uploadClusters(int frame,const worldforge::lights::Clusters &clusters);
     VkDescriptorSet descriptor(int frame) const { return frames_[frame].set; }
     VkFramebuffer framebuffer(int frame) const { return frames_[frame].shadow.framebuffer; }
+    // Binding 8: the previous frame's TAA result (HdrFrame::previousFrame), which changes every frame.
+    void bindPreviousFrame(int frame,VkSampler sampler,VkImageView view);
     // The sky visibility maps (Engine/Render/SkyVisibility.h), rendered with pass() like the shadow atlas.
     // One set shared by all frames: the viewport re-renders it only when the scene changes.
     VkFramebuffer skyFramebuffer() const { return sky_.framebuffer; }

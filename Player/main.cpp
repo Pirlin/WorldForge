@@ -661,7 +661,7 @@ public:
         view.authoredSun = view.sun.w;
         view.bloom = playable_.bloom ? wf::color::bloomStrength : 0.0f;
         view.lens = {playable_.depthOfField ? 1.0f : 0.0f,playable_.focusDistance,playable_.fNumber,XM_PIDIV4};
-        view.shutter = {playable_.motionBlur ? 1.0f : 0.0f,playable_.shutter,0,0};
+        view.shutter = {playable_.motionBlur ? 1.0f : 0.0f,playable_.shutter,playable_.reflections ? 1.0f : 0.0f,0};
         // The physical sky's sun reaches the ground dimmer and warmer than overhead.
         const auto &sunLight = skyLight_->sunLight;
         const float sunLuminance = 0.2126f*sunLight[0]+0.7152f*sunLight[1]+0.0722f*sunLight[2];

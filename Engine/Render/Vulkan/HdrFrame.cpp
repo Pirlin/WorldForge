@@ -562,9 +562,34 @@ void HdrFrame::resetHistory()
     sample_ = 0;
 }
 
+void HdrFrame::initializeLayouts(VkCommandBuffer command)
+{
+    const auto &vk = *device_->api;
+    const auto ready = [&](VkImage image) {
+        const VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,nullptr,0,VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_QUEUE_FAMILY_IGNORED,
+            VK_QUEUE_FAMILY_IGNORED,image,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+        vk.vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,
+                                0,nullptr,0,nullptr,1,&barrier);
+    };
+    // The history images: the scene pass reads the previous one (previousFrame) from the first frame on.
+    for (std::size_t i = 0; i < history_.size(); ++i)
+        if (!historyReady_[i]) {
+            ready(history_[i].image);
+            historyReady_[i] = true;
+        }
+    // The bloom levels, which the display step's descriptors name even when bloom is off.
+    if (!bloomInitialized_) {
+        for (const auto &image : bloom_)
+            ready(image.image);
+        bloomInitialized_ = true;
+    }
+}
+
 void HdrFrame::begin(VkCommandBuffer command,std::size_t output,const float background[3])
 {
     const auto &vk = *device_->api;
+    initializeLayouts(command);
     output_ = output;
     VkClearValue clear[4]{};
     clear[0].color = {{background[0],background[1],background[2],1.0f}};
@@ -612,27 +637,6 @@ void HdrFrame::display(VkCommandBuffer command,float exposureStops,color::ViewTr
 {
     const auto &vk = *device_->api;
     vk.vkCmdEndRenderPass(command);
-    // History images start undefined; give them the layout their descriptors name before the first read.
-    for (std::size_t i = 0; i < history_.size(); ++i)
-        if (!historyReady_[i]) {
-            const VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,nullptr,0,VK_ACCESS_SHADER_READ_BIT,
-                VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_QUEUE_FAMILY_IGNORED,
-                VK_QUEUE_FAMILY_IGNORED,history_[i].image,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
-            vk.vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,
-                                    0,nullptr,0,nullptr,1,&barrier);
-            historyReady_[i] = true;
-        }
-    // So are the bloom levels, which the display step's descriptors name even when bloom is off.
-    if (!bloomInitialized_) {
-        for (const auto &image : bloom_) {
-            const VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,nullptr,0,VK_ACCESS_SHADER_READ_BIT,
-                VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_QUEUE_FAMILY_IGNORED,
-                VK_QUEUE_FAMILY_IGNORED,image.image,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
-            vk.vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,
-                                    0,nullptr,0,nullptr,1,&barrier);
-        }
-        bloomInitialized_ = true;
-    }
     const std::size_t framebuffer = output_;
     if (framebuffer >= displayFramebuffers_.size() || !display_ || !temporal_ || !ambient_ || !bloomDown_ || !bloomUp_)
         return;

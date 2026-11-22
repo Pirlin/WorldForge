@@ -26,6 +26,10 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     vec4 skyDirections[16];
     vec4 skySettings;      // sky visibility maps on, their meters per texel, physical sky on, unused
     vec4 sunTint;          // the color of sunlight at the ground, luminance 1 (white for the gradient sky)
+    // Screen-space reflections (Shading.glsl): the previous frame's clip space without jitter, and settings (on with a
+    // previous frame to trace, the longest ray in meters, unused, unused).
+    mat4 previousViewProjection;
+    vec4 reflectionSettings;
 } lighting;
 layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles, one per sky direction, nearest
 // The sky's environment (Engine/Render/SkyLight.h): a 128 x 64 radiance map with rows closer near the horizon, then
@@ -44,6 +48,9 @@ layout(std430, set = 0, binding = 6) readonly buffer Clusters {
 };
 // The point light shadow atlas: 8 cubes of six 256 x 256 depth faces, eight faces to a row (LightClusters.h).
 layout(set = 0, binding = 7) uniform sampler2D pointShadowMap;
+// The previous frame's TAA result (Engine/Render/Vulkan/HdrFrame.h): linear HDR light, with each pixel's depth along the
+// camera's forward axis in alpha (0 for sky). Screen-space reflections trace it.
+layout(set = 0, binding = 8) uniform sampler2D previousFrame;
 
 // How much of a shadowed point light at lightPosition reaches position (on a surface facing normal): the cube face
 // the point lies in, looked up with four samples around it.

@@ -36,6 +36,8 @@ struct WorldAtmosphere {
     bool physicalSky = false;
     // Bloom: light scattered around bright areas, as a camera lens does.
     bool bloom = true;
+    // Screen-space reflections: glossy surfaces reflect what the previous frame shows, where it shows it.
+    bool reflections = true;
     // Camera effects: depth of field (a lens focused at focusDistance meters with aperture f-number fNumber) and
     // motion blur from the camera's movement, with the shutter open for that share of a frame. Both off by default.
     bool depthOfField = false;

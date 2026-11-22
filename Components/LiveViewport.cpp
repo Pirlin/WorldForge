@@ -2391,6 +2391,13 @@ public:
         for (int c = 0; c < 3; ++c)
             lighting.sunTint[c] = sunStrength > 0 ? sunLight[std::size_t(c)]/sunStrength : 1.0f;
         lighting.skySettings[2] = environment.physicalSky ? 1.0f : 0.0f;
+        // Screen-space reflections trace the previous frame, seen through the previous steady camera.
+        // Orthographic views have no perspective depth to trace with.
+        const bool reflections = environment.reflections && !window_.modelOnly_ && !window_.ortho_ && previousValid_
+            && frame_.previousFrameReady();
+        std::copy_n((reflections ? previousCamera_ : QMatrix4x4()).constData(),16,lighting.previousViewProjection);
+        lighting.reflectionSettings[0] = reflections ? 1.0f : 0.0f;
+        lighting.reflectionSettings[1] = wf::vk::HdrFrame::reflectionRange;
         for (std::size_t i = 0; i < 9; ++i)
             std::copy_n(skyLight.irradiance[i].data(),4,lighting.skyIrradiance[i]);
         std::copy_n(skyLight.horizon.data(),3,lighting.skyHorizon);
@@ -2463,6 +2470,8 @@ public:
             && lighting_.uploadEnvironment(frameIndex,skyLight.environment,skyRevision)
             && lighting_.uploadClusters(frameIndex,lightClusters);
         if (ready) {
+            // Before anything binds this frame's set: the previous frame's TAA result alternates between two images.
+            lighting_.bindPreviousFrame(frameIndex,frame_.nearestSampler(),frame_.previousFrame());
             recordDepthTiles(command,frame,lighting_.framebuffer(frameIndex),WorldLightingVulkan::shadowSize,WorldLightingVulkan::shadowSize,
                              wf::shadow::tileSize,
                              shadows,geometry.triangles.size(),cascades.matrices,windTime);

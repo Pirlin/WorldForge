@@ -7,7 +7,9 @@ Read this first if you are continuing the work. The strategy is in `WorldForge-S
 - If a large HTTPS push drops with "remote end hung up", push one commit at a time: `git push origin <sha>:refs/heads/master`.
 - Verify every rendering change with the audits below. After an intended visual change, re-record the goldens with `WORLDFORGE_UPDATE_GOLDEN=1`.
 - Update the R1 table in the roadmap and the user-facing settings in `README.md` as features land.
-- Check every scripted edit with `git diff`. Multi-line perl substitutions often fail without any error. Before committing, read `git diff --cached`.
+- Check every scripted edit with `git diff`. Multi-line perl substitutions often fail without any error, and a `|` delimiter clashes with `||` in C++ patterns (it once pasted text at the top of a file). Prefer exact edits. Before committing, read `git diff --cached`.
+- PowerShell variable names ignore case: a `$a` assigned inside a script overwrites a `[string]$A` parameter. `powershell.exe` launched from Bash cannot run `.ps1` files here (execution policy); run them through the PowerShell tool.
+- To debug a shader, temporarily color pixels by category (for example screen-space reflection hits by how far they are from the start) behind an environment variable, read both the editor and the Player captures from the rendering audit, then remove it.
 
 ## Build (Windows, GTX 1650 dev machine)
 1. In PowerShell, run VS 2022's `Launch-VsDevShell.ps1 -Arch amd64 -HostArch amd64 -SkipAutomaticLocation`. The "vswhere.exe not recognized" message it prints is harmless.
@@ -36,10 +38,10 @@ Put Qt on PATH first (`%LOCALAPPDATA%/WorldForge/Qt/6.8.3/msvc2022_64/bin`), the
 - Timings depend on the Windows power plan. Before blaming a change, measure the previous commit in the same session.
 
 ## Frame architecture (`Engine/Render/Vulkan/HdrFrame.*`, shared by the editor and the Player)
-1. **Scene pass.** Writes three color targets (scene, indirect sky light, albedo plus fog transmission) and depth. Shading is in `Shaders/Shading.glsl` and `Lighting.glsl`.
+1. **Scene pass.** Writes three color targets (scene; indirect sky light with the depth along the camera's forward axis in alpha; albedo plus fog transmission) and depth. Shading is in `Shaders/Shading.glsl` and `Lighting.glsl`. Screen-space reflections trace the previous frame's TAA result here (binding 8, `HdrFrame::previousFrame`), which the renderers rebind every frame.
 2. **Occlusion pass.** GTAO plus screen-space bounce light (`Ambient.frag`).
 3. **Bloom.** Built from the previous frame's history (`BloomDown`/`BloomUp.frag`).
-4. **TAA.** Runs in its own pass (`Temporal.frag`) and writes `history_[parity]`.
+4. **TAA.** Runs in its own pass (`Temporal.frag`) and writes `history_[parity]`: light in RGB, this frame's depth in alpha.
 5. **Optional post passes.** Depth of field and motion blur (`DepthOfField.frag`, `MotionBlur.frag`) ping-pong between `post_[0/1]`.
 6. **Display pass.** Exposure and AgX (`Display.frag`). Editor overlays draw in the same subpass.
 
@@ -63,7 +65,7 @@ Settings flow through these files:
 ## Status (2026-11-22)
 **Realism** is 94.9 over 4 views (mean FLIP 0.0508). The Cycles comparison runs with fog disabled.
 
-**Street frame time** (`--street`, GTX 1650 laptop on the Windows "Power saver" plan) is 12.7–13.0 ms on average with fog (14.7–15.9 ms at p95; the budget is 16.7 ms). The same machine and plan measured 10.0 ms before fog, so the fog costs about 2.8 ms. The plan matters: before fog the street measured about 7 ms on a faster plan. Compare timings only within one run of measurements.
+**Street frame time** (`--street`, GTX 1650 laptop on the Windows "Power saver" plan) is 13.2–13.5 ms on average with fog and screen-space reflections (about 14.6 ms at p95; the budget is 16.7 ms; 12.7–13.0 ms with fog alone). The same machine and plan measured 10.0 ms before fog, so the fog costs about 2.8 ms. The plan matters: before fog the street measured about 7 ms on a faster plan. Compare timings only within one run of measurements.
 
 **R1 done:**
 - HDR, EV100 exposure and AgX tonemapping
@@ -77,15 +79,15 @@ Settings flow through these files:
 - TAA split into its own pass
 - Depth of field and motion blur
 - Volumetric height fog
+- Screen-space reflections
 
 ## Next, in order
-1. **Screen-space reflections.**
-2. **Contact shadows.**
-3. **Per-object motion vectors.**
-4. **R2 materials:**
+1. **Contact shadows.** Plan: in `Shading.glsl`, march a short ray (about 0.5 m, 8–12 steps) from each sunlit pixel toward the sun through the previous frame's depth, the way `screenReflection` does, and scale the sun's visibility where it passes behind something. Reuse its jitter slack so surfaces do not shadow themselves. Add a rendering audit case and measure the street's frame time.
+2. **Per-object motion vectors.**
+3. **R2 materials:**
    - clear coat, sheen, transmission and glass
    - subsurface and anisotropy
    - glTF material extensions
    - wet and puddle layers
    - decals and parallax occlusion
-5. **R3 GI.** Bounce light from beyond the screen is the largest remaining gap against Cycles.
+4. **R3 GI.** Bounce light from beyond the screen is the largest remaining gap against Cycles.

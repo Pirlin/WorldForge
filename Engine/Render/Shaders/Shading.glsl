@@ -113,6 +113,113 @@ vec3 directLight(Surface surface,vec3 v,vec3 l,float intensity,vec3 energy)
     return (diffuse+specular)*nl*shadingPi*intensity;
 }
 
+// Interleaved gradient noise for this pixel, turned each TAA frame and offset by shift, in [0, 1).
+float pixelNoise(vec2 shift)
+{
+    vec2 pixel = gl_FragCoord.xy+shift+5.588238*lighting.settings.z;
+    return fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
+}
+
+// A reflection direction for a surface of the given roughness: a GGX microfacet normal drawn with this pixel's noise,
+// so the TAA average blurs traced reflections as the lobe does. Mirror-like surfaces reflect about n.
+vec3 glossyDirection(vec3 n,vec3 v,float roughness)
+{
+    float a = roughness*roughness;
+    vec3 mirror = reflect(-v,n);
+    if (a < 0.002)
+        return mirror;
+    float phi = 6.2831853*pixelNoise(vec2(0.0));
+    float u = pixelNoise(vec2(37.0,17.0));
+    float cosTheta = sqrt((1.0-u)/(1.0+(a*a-1.0)*u));
+    float sinTheta = sqrt(max(1.0-cosTheta*cosTheta,0.0));
+    vec3 tangent = normalize(cross(abs(n.z) < 0.999 ? vec3(0.0,0.0,1.0) : vec3(1.0,0.0,0.0),n));
+    vec3 h = normalize(tangent*(sinTheta*cos(phi))+cross(n,tangent)*(sinTheta*sin(phi))+n*cosTheta);
+    vec3 r = reflect(-v,h);
+    return dot(r,n) > 0.0 ? r : mirror;
+}
+
+// Screen-space reflections: marches the reflected ray through the previous frame (its depth in alpha) and returns the
+// light it finds there with a confidence in alpha, 0 where the ray leaves the screen, passes behind everything, or
+// the surface is too rough to show a sharp reflection. The sky reflection fills in the rest. The previous frame has
+// the hit's own fog and reflections in it, which an extra bounce adds.
+vec4 screenReflection(vec3 position,vec3 direction,float roughness)
+{
+    float glossy = 1.0-smoothstep(0.35,0.55,roughness);
+    if (lighting.reflectionSettings.x < 0.5 || glossy <= 0.0)
+        return vec4(0.0);
+    mat4 m = lighting.previousViewProjection;
+    vec4 start = m*vec4(position,1.0);
+    vec4 along = m*vec4(direction,0.0);
+    const float near = 0.05;
+    if (start.w <= near)
+        return vec4(0.0);
+    // Stop the ray before it passes behind the previous camera.
+    float rayLength = lighting.reflectionSettings.y;
+    if (along.w < 0.0)
+        rayLength = min(rayLength,0.99*(start.w-near)/-along.w);
+    vec4 end = start+along*rayLength;
+    vec2 size = vec2(textureSize(previousFrame,0));
+    vec2 a = (start.xy/start.w*0.5+0.5)*size, b = (end.xy/end.w*0.5+0.5)*size;
+    // Clip the segment to the screen, then march it in screen space; 1/w is linear there.
+    vec2 delta = b-a;
+    float last = 1.0;
+    for (int axis = 0; axis < 2; ++axis) {
+        if (delta[axis] > 1e-4)
+            last = min(last,(size[axis]-0.5-a[axis])/delta[axis]);
+        else if (delta[axis] < -1e-4)
+            last = min(last,(0.5-a[axis])/delta[axis]);
+    }
+    float pixels = length(delta)*last;
+    if (last <= 0.0 || pixels < 4.0)
+        return vec4(0.0);
+    float inverseStart = 1.0/start.w, inverseEnd = 1.0/end.w;
+    const int steps = 28;
+    float noise = pixelNoise(vec2(71.0,113.0));
+    // Steps grow along the ray (denser near the surface, where contact matters), starting 3 pixels out: nearer than
+    // that, a ray leaving a surface seen at a grazing angle cannot be told apart from the surface itself.
+    float first = min(3.0/pixels,0.5)*last;
+    float before = first, beforeDepth = 1.0/mix(inverseStart,inverseEnd,first);
+    float hitAt = -1.0;
+    for (int i = 0; i < steps; ++i) {
+        float s = (float(i)+noise)/float(steps);
+        float t = first+(last-first)*s*s;
+        float rayDepth = 1.0/mix(inverseStart,inverseEnd,t);
+        float sceneDepth = texelFetch(previousFrame,ivec2(mix(a,b,t)),0).a;
+        float behind = rayDepth-sceneDepth;
+        // A hit where the ray passes behind a surface by no more than this step moved in depth (plus a margin), so
+        // rays that pass far behind thin objects keep going.
+        float thickness = abs(rayDepth-beforeDepth)+0.02*sceneDepth+0.05;
+        // Each stored depth comes from a jittered sample up to half a pixel off the texel's center, which on a surface
+        // seen at a grazing angle (a floor toward the horizon) is a large step in depth. Count a hit only once the ray
+        // is behind by more than it moves in depth over a few pixels, so it does not hit the surface it left.
+        float slack = 2.5*abs(rayDepth-beforeDepth)/max((t-before)*pixels/last,1e-3);
+        if (sceneDepth > 0.0 && behind > slack && behind < thickness) {
+            // Refine between the last point in front and this one.
+            float low = before, high = t;
+            for (int k = 0; k < 5; ++k) {
+                float middle = 0.5*(low+high);
+                float depth = texelFetch(previousFrame,ivec2(mix(a,b,middle)),0).a;
+                if (depth > 0.0 && 1.0/mix(inverseStart,inverseEnd,middle) > depth)
+                    high = middle;
+                else
+                    low = middle;
+            }
+            hitAt = high;
+            break;
+        }
+        before = t;
+        beforeDepth = rayDepth;
+    }
+    if (hitAt < 0.0)
+        return vec4(0.0);
+    vec2 pixel = mix(a,b,hitAt);
+    vec2 uv = pixel/size;
+    // Fade near the screen's edges and the ray's end, where the trace may miss what lies just beyond.
+    vec2 edge = smoothstep(vec2(0.0),vec2(0.06),min(uv,1.0-uv));
+    float confidence = glossy*edge.x*edge.y*(1.0-smoothstep(0.75,1.0,hitAt));
+    return vec4(max(texelFetch(previousFrame,ivec2(pixel),0).rgb,vec3(0.0)),confidence);
+}
+
 // Light leaving the surface toward the eye. sunVisibility is the sun's shadow term (1 lit, 0 shadowed). indirect
 // receives the sky-light part of the result, which ambient occlusion later scales (Temporal.frag).
 vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out vec3 indirect)
@@ -163,6 +270,11 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
     // surfaces seen head-on (specular occlusion, Lagarde and de Rousiers 2014).
     float ambient = surface.occlusion*skyOpenness(position,surface.normal);
     float specularOcclusion = clamp(pow(nv+ambient,exp2(-16.0*surface.roughness-1.0))-1.0+ambient,0.0,1.0);
-    indirect = diffuse*ambient+reflected*specularColor*specularOcclusion;
-    return result+indirect;
+    // Where a screen-space reflection finds a surface, it replaces the sky reflection. It already shows what blocks the
+    // sky, so it skips specular occlusion, and it stays out of indirect, which ambient occlusion would darken again.
+    vec4 traced = vec4(0.0);
+    if (lighting.reflectionSettings.x > 0.5 && surface.roughness < 0.55)
+        traced = screenReflection(position,glossyDirection(surface.normal,v,surface.roughness),surface.roughness);
+    indirect = diffuse*ambient+reflected*specularColor*specularOcclusion*(1.0-traced.a);
+    return result+indirect+traced.rgb*specularColor*traced.a;
 }

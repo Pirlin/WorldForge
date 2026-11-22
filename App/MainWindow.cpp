@@ -999,6 +999,12 @@ void MainWindow::editAtmosphere()
     bloom->setToolTip(tr("Scatters a little light around bright areas, as a camera lens does: a glow around the sun, "
                          "lamps and bright reflections."));
     form->addRow(bloom);
+    auto *reflections = new QCheckBox(tr("Screen-space reflections"),&dialog);
+    reflections->setAccessibleName(tr("Screen-space reflections"));
+    reflections->setChecked(initial.reflections);
+    reflections->setToolTip(tr("Glossy surfaces reflect the buildings and objects on screen, not only the sky. "
+                               "Surfaces with roughness above 0.55 are unaffected."));
+    form->addRow(reflections);
     // Camera effects, both off by default.
     auto *depthOfField = new QCheckBox(tr("Depth of field"),&dialog);
     depthOfField->setAccessibleName(tr("Depth of field"));
@@ -1058,7 +1064,7 @@ void MainWindow::editAtmosphere()
                               {"shadows",shadows->isChecked()},{"localFogRadius",localRadius->value()},
                               {"localFogDensity",localDensity->value()},
                               {"ev100",exposure->value()},{"exposureMode",exposureMode->currentData().toString()},
-                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},{"bloom",bloom->isChecked()},{"depthOfField",depthOfField->isChecked()},{"focusDistance",focusDistance->value()},{"fNumber",fNumber->value()},{"motionBlur",motionBlur->isChecked()},{"shutter",shutter->value()},
+                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},{"bloom",bloom->isChecked()},{"reflections",reflections->isChecked()},{"depthOfField",depthOfField->isChecked()},{"focusDistance",focusDistance->value()},{"fNumber",fNumber->value()},{"motionBlur",motionBlur->isChecked()},{"shutter",shutter->value()},
                               {"localFogCenter",QJsonArray{localCenter[0]->value(),localCenter[1]->value(),localCenter[2]->value()}}});
 }
 

@@ -48,6 +48,9 @@ struct LightingBlock {      // Lighting.glsl
     XMFLOAT4X4 skyMatrices[sky::directionCount];
     XMFLOAT4 skyDirections[sky::directionCount], skySettings; // settings: enabled, meters per texel
     XMFLOAT4 sunTint; // sunlight color, luminance 1
+    // Screen-space reflections: the previous frame's clip space without jitter; on, the longest ray in meters.
+    XMFLOAT4X4 previousViewProjection;
+    XMFLOAT4 reflectionSettings;
 };
 struct PlayViewBlock {      // PlayView.glsl
     XMFLOAT4X4 viewProjection;
@@ -60,7 +63,7 @@ struct CameraConstants {    // push constants of Sky and Shadow shaders
 struct MaterialConstants {  // push constants of PlayScene.frag
     XMFLOAT4 emissive, factors;
 };
-static_assert(sizeof(LightingBlock) == 1904 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
+static_assert(sizeof(LightingBlock) == 1984 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
 
 constexpr uint32_t shadowSize = shadow::atlasSize;
 constexpr uint32_t framesInFlight = 2;
@@ -272,6 +275,10 @@ private:
     // TAA: the previous frame's unjittered Vulkan view-projection, for reprojecting the history.
     XMFLOAT4X4 previousClip_{};
     bool previousValid_ = false;
+    // Screen-space reflections for the frame being prepared: the previous frame's clip space without jitter, and whether
+    // the target holds a previous frame to trace.
+    XMFLOAT4X4 reflectionClip_{};
+    bool reflectionReady_ = false;
 };
 
 bool VulkanRenderer::start(HWND window,std::wstring &error)
@@ -426,11 +433,12 @@ bool VulkanRenderer::createLayouts()
         {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
+        {7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {8,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
     std::array<VkDescriptorSetLayoutBinding,5> materialBindings{};
     for (uint32_t i = 0; i < materialBindings.size(); ++i)
         materialBindings[i] = {i,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
-    const VkDescriptorSetLayoutCreateInfo frameInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,7,frameBindings};
+    const VkDescriptorSetLayoutCreateInfo frameInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,8,frameBindings};
     const VkDescriptorSetLayoutCreateInfo materialInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,
         uint32_t(materialBindings.size()),materialBindings.data()};
     if (api_.vkCreateDescriptorSetLayout(device,&frameInfo,nullptr,&frameLayout_) != VK_SUCCESS
@@ -566,7 +574,7 @@ bool VulkanRenderer::createPipelines()
 
 bool VulkanRenderer::createFrames()
 {
-    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,3*framesInFlight},
+    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,4*framesInFlight},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2*framesInFlight},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2*framesInFlight}};
     const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,framesInFlight,3,sizes};
     if (api_.vkCreateDescriptorPool(device,&pool,nullptr,&framePool_) != VK_SUCCESS)
@@ -861,6 +869,9 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     lighting.skyZenith = view.skyZenith;
     lighting.skyGround = view.skyGround;
     lighting.sunTint = view.sunTint;
+    const bool reflections = view.shutter.z > 0.5f && reflectionReady_;
+    XMStoreFloat4x4(&lighting.previousViewProjection,reflections ? XMLoadFloat4x4(&reflectionClip_) : XMMatrixIdentity());
+    lighting.reflectionSettings = {reflections ? 1.0f : 0.0f,vk::HdrFrame::reflectionRange,0,0};
     if (view.skyEnvironment && frame.environmentRevision != view.skyRevision
         && view.skyEnvironment->size()*sizeof(std::array<float,4>) <= frame.environment.size) {
         std::memcpy(frame.environment.mapped,view.skyEnvironment->data(),view.skyEnvironment->size()*sizeof(std::array<float,4>));
@@ -942,6 +953,11 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
                             const View &view,bool sky,std::size_t vertexCount,float exposureStops,int meterSlot,
                             const vk::HdrFrame::Temporal &temporal,const vk::HdrFrame::Occlusion &occlusion)
 {
+    // Before anything binds the set: the previous frame's TAA result, which alternates between two images.
+    const VkDescriptorImageInfo previous{target.nearestSampler(),target.previousFrame(),VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const VkWriteDescriptorSet previousWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,8,0,1,
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&previous,nullptr,nullptr};
+    api_.vkUpdateDescriptorSets(device,1,&previousWrite,0,nullptr);
     const auto command = frame.command;
     const VkDeviceSize offset = 0;
     // Shadow map: always cleared so it is ready to sample; filled when sun shadows are on.
@@ -1102,6 +1118,8 @@ bool VulkanRenderer::draw(const std::vector<PlayVertex> &vertices,const std::vec
     temporal.enabled = view.sky.y > 0.5f;
     const auto clip = vulkanClip(view.viewProjection);
     temporal.reprojection = reprojection(clip,previousValid_ ? previousClip_ : clip);
+    reflectionClip_ = previousValid_ ? previousClip_ : clip;
+    reflectionReady_ = previousValid_ && frame_.previousFrameReady();
     previousClip_ = clip;
     previousValid_ = true;
     auto shown = withShadows(temporal.enabled ? jittered(view,frame_.jitter(),width,height) : view,view,vertices,
@@ -1175,14 +1193,20 @@ bool VulkanRenderer::capture(const std::vector<PlayVertex> &vertices,const std::
     vk::HdrFrame::Temporal temporal;
     temporal.enabled = view.sky.y > 0.5f;
     temporal.still = true;
-    // Bloom reads the previous frame, so a capture with bloom renders at least two.
+    // Bloom reads the previous frame, so a capture with bloom renders at least two. Screen-space reflections trace
+    // the previous frame too, which the first frame lacks: a capture with them renders one frame first and then starts
+    // the TAA average over, so every averaged frame reflects, as in the editor.
+    const bool warmUp = view.shutter.z > 0.5f;
     const int passes = std::max({temporal.enabled ? int(vk::HdrFrame::temporalSamples) : 1,automatic ? 2 : 1,
-                                 view.bloom > 0 ? 2 : 1});
+                                 view.bloom > 0 ? 2 : 1})+(warmUp ? 1 : 0);
+    // A still view: the previous frame saw it through the same camera.
+    reflectionClip_ = vulkanClip(view.viewProjection);
     float stops = std::log2(std::max(view.display.x,1e-6f));
     for (int pass = 0; ok && pass < passes; ++pass) {
         auto shown = withShadows(temporal.enabled ? jittered(view,target.jitter(),width,height) : view,view,vertices,
                                  target.sampleIndex());
         updateSky(shown);
+        reflectionReady_ = target.previousFrameReady();
         if (!prepare(frame,vertices,shown,width,height)) {
             ok = false;
             break;
@@ -1202,6 +1226,8 @@ bool VulkanRenderer::capture(const std::vector<PlayVertex> &vertices,const std::
         float average = 0;
         if (ok && automatic && target.takeMeter(0,average))
             stops = color::autoExposureStops(average,view.display.w);
+        if (ok && warmUp && pass == 0)
+            target.resetHistory();
     }
     if (ok) {
         // The output uses the swap chain's format; convert BGRA to RGBA when needed.

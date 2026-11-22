@@ -3126,6 +3126,64 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
     while (store.history().index() > historyStart && store.history().canUndo())
         store.history().undo();
 
+    // Screen-space reflections: a mirror-like metal floor in front of a block. With reflections on, the block shows in
+    // the floor; off, the floor reflects only the sky. The street's own surfaces are rough, so its views stay as they were.
+    const Shot mirrorShot{"reflections",{-90,-62,1.6f},{-90,-50,0.4f}};
+    bool mirrorReady = false;
+    store.addCube();
+    if (const auto *selected = store.selectedObject()) {
+        auto floor = *selected;
+        floor.position = {-90,-52,0.05f};
+        floor.scale = {14,26,0.1f};
+        store.updateObject(floor,"Mirror floor");
+        if (const auto *asset = store.meshAsset(floor.meshAsset); asset && asset->mesh) {
+            auto mesh = *asset->mesh;
+            for (auto &slot : mesh.materials) {
+                slot.metallic = 1;
+                slot.roughness = 0.08f;
+            }
+            QString meshError;
+            mirrorReady = store.updateMesh(floor.meshAsset,mesh,"Mirror floor material",meshError);
+        }
+    }
+    store.addCube();
+    if (const auto *selected = store.selectedObject()) {
+        auto block = *selected;
+        block.position = {-90,-45,1.5f};
+        block.scale = {4,1,3};
+        store.updateObject(block,"Reflected block");
+    }
+    store.select({});
+    setDisplay({{"fogDensity",0},{"localFogRadius",0},{"bloom",false},{"reflections",true}});
+    const auto reflected = settled(mirrorShot);
+    {
+        std::ostringstream mirrorPlayable;
+        QFile mirrorFile(playablePath);
+        const bool mirrorExported = WorldRuntime::exportScene(store,mirrorPlayable) && mirrorFile.open(QIODevice::WriteOnly);
+        const auto bytes = mirrorPlayable.str();
+        const bool written = mirrorExported && mirrorFile.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+        mirrorFile.close();
+        const auto played = written ? playerCapture(mirrorShot,reflected.size()) : QImage();
+        const auto alike = difference(played,reflected,"rendering-reflections-editor-player-diff.png");
+        audit.check(page,"reflections","Editor and Player match with screen-space reflections",
+                    mirrorReady && !played.isNull() && alike.mean <= 1 && alike.share <= 0.005,describe(alike));
+    }
+    setDisplay({{"reflections",false}});
+    const auto skyOnly = settled(mirrorShot);
+    reflected.save(output.filePath("rendering-reflections.png"));
+    skyOnly.save(output.filePath("rendering-reflections-off.png"));
+    // Below the horizon of the view the floor shows the block's reflection; above it nothing glossy is in view.
+    const auto lowerHalf = [](const QImage &image) { return image.copy(0,image.height()/2,image.width(),image.height()/2); };
+    const auto upperHalf = [](const QImage &image) { return image.copy(0,0,image.width(),image.height()/3); };
+    const auto floorChange = difference(lowerHalf(reflected),lowerHalf(skyOnly),"rendering-reflections-floor-diff.png");
+    const auto skyChange = difference(upperHalf(reflected),upperHalf(skyOnly),"rendering-reflections-sky-diff.png");
+    audit.check(page,"reflections","Screen-space reflections show the block in a mirror-like floor",
+                mirrorReady && !reflected.isNull() && !skyOnly.isNull() && floorChange.mean > 3 && skyChange.mean < 0.5,
+                QString("Floor changes by %1 levels on average with reflections on; the view above it by %2.")
+                    .arg(floorChange.mean,0,'f',2).arg(skyChange.mean,0,'f',2));
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+
     setDisplay({{"ev100",22},{"exposureMode","Manual"}});
     const auto tooDark = capture(shots[0].eye,shots[0].target);
     setDisplay({{"exposureMode","Auto"}});

@@ -17,6 +17,8 @@ layout(push_constant) uniform Temporal {
     mat4 reprojection; // this frame's clip space to the previous frame's clip space
     vec4 settings;     // weight of this frame, history valid, clamp history, ambient occlusion on
 } taa;
+// RGB: the resolved light. Alpha: this frame's depth along the camera's forward axis at the pixel (from the scene's
+// sky-light target; 0 for sky), which the next frame's screen-space reflections trace against.
 layout(location = 0) out vec4 color;
 
 vec3 toYCoCg(vec3 c)
@@ -56,8 +58,9 @@ void main()
     ivec2 size = textureSize(scene,0);
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     vec3 current = sceneAt(pixel);
+    float depthAlong = texelFetch(indirect,pixel,0).a;
     if (taa.settings.y < 0.5 || taa.settings.x >= 1.0) {
-        color = vec4(current,1.0);
+        color = vec4(current,depthAlong);
         return;
     }
     vec3 sum = vec3(0.0), squares = vec3(0.0);
@@ -75,7 +78,7 @@ void main()
     vec4 previous = taa.reprojection*vec4(uv*2.0-1.0,nearest,1.0);
     vec2 previousUv = previous.xy/previous.w*0.5+0.5;
     if (previous.w <= 0.0 || any(lessThan(previousUv,vec2(0.0))) || any(greaterThan(previousUv,vec2(1.0)))) {
-        color = vec4(current,1.0);
+        color = vec4(current,depthAlong);
         return;
     }
     vec3 past = max(texture(history,previousUv).rgb,vec3(0.0));
@@ -89,8 +92,8 @@ void main()
     if (taa.settings.z > 0.5) {
         float currentWeight = weight/(1.0+dot(current,vec3(0.2126,0.7152,0.0722)));
         float pastWeight = (1.0-weight)/(1.0+dot(past,vec3(0.2126,0.7152,0.0722)));
-        color = vec4((current*currentWeight+past*pastWeight)/max(currentWeight+pastWeight,1e-6),1.0);
+        color = vec4((current*currentWeight+past*pastWeight)/max(currentWeight+pastWeight,1e-6),depthAlong);
     } else {
-        color = vec4(mix(past,current,weight),1.0);
+        color = vec4(mix(past,current,weight),depthAlong);
     }
 }

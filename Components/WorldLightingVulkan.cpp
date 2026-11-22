@@ -45,13 +45,14 @@ bool WorldLightingVulkan::create(QVulkanWindow &window,QVulkanDeviceFunctions *v
         {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
+        {7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {8,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
     };
-    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,7,bindings};
+    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,8,bindings};
     if (vk_->vkCreateDescriptorSetLayout(device_,&layout,nullptr,&layout_) != VK_SUCCESS)
         return false;
     const auto count = uint32_t(window.concurrentFrameCount());
-    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,3*count},
+    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,4*count},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,3*count}};
     const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,count,3,sizes};
     if (vk_->vkCreateDescriptorPool(device_,&pool,nullptr,&pool_) != VK_SUCCESS)
@@ -167,6 +168,17 @@ bool WorldLightingVulkan::createFrame(Frame &frame,VkFormat format)
     };
     vk_->vkUpdateDescriptorSets(device_,7,writes,0,nullptr);
     return true;
+}
+
+void WorldLightingVulkan::bindPreviousFrame(int index,VkSampler sampler,VkImageView view)
+{
+    // Written every frame: the image alternates, and a recreated view may reuse an old handle.
+    if (!view)
+        return;
+    const VkDescriptorImageInfo image{sampler,view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    const VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frames_[std::size_t(index)].set,8,0,1,
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&image,nullptr,nullptr};
+    vk_->vkUpdateDescriptorSets(device_,1,&write,0,nullptr);
 }
 
 bool WorldLightingVulkan::allocate(VkDeviceMemory &memory,VkMemoryRequirements requirements,VkMemoryPropertyFlags flags)

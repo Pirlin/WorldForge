@@ -31,6 +31,10 @@ public:
     void resetHistory() { frame_.resetHistory(); }
     uint32_t accumulated() const { return frame_.accumulated(); }
     uint32_t sampleIndex() const { return frame_.sampleIndex(); }
+    // The previous frame's TAA result for screen-space reflections (HdrFrame::previousFrame).
+    VkImageView previousFrame() const { return frame_.previousFrame(); }
+    bool previousFrameReady() const { return frame_.previousFrameReady(); }
+    VkSampler nearestSampler() const { return frame_.nearestSampler(); }
     // Begins the scene pass for swap chain image `image`.
     void begin(VkCommandBuffer command,int image,const float background[3]) { frame_.begin(command,std::size_t(image),background); }
     // Ends the scene pass, resolves TAA and draws the exposure and view transform step, metering the scene into
