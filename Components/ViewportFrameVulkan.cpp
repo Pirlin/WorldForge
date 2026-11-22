@@ -44,9 +44,10 @@ bool ViewportFrameVulkan::createTargets()
 
 bool ViewportFrameVulkan::createDisplayPipeline(const QByteArray &vertex,const QByteArray &fragment,const QByteArray &temporal,
                                                 const QByteArray &ambient,const QByteArray &bloomDown,
-                                                const QByteArray &bloomUp)
+                                                const QByteArray &bloomUp,const QByteArray &depthOfField,
+                                                const QByteArray &motionBlur)
 {
     return frame_.createDisplayPipeline(words(vertex),words(fragment),words(temporal),words(ambient),words(bloomDown),
-                                        words(bloomUp));
+                                        words(bloomUp),words(depthOfField),words(motionBlur));
 }
 #endif

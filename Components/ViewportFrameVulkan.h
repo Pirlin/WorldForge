@@ -11,6 +11,7 @@ class ViewportFrameVulkan {
 public:
     using Temporal = worldforge::vk::HdrFrame::Temporal;
     using Occlusion = worldforge::vk::HdrFrame::Occlusion;
+    using Camera = worldforge::vk::HdrFrame::Camera;
     static constexpr uint32_t sceneSubpass = worldforge::vk::HdrFrame::sceneSubpass;
     static constexpr uint32_t displaySubpass = worldforge::vk::HdrFrame::displaySubpass;
 
@@ -19,7 +20,8 @@ public:
     bool createTargets();
     void releaseTargets() { frame_.releaseTargets(); }
     bool createDisplayPipeline(const QByteArray &vertex,const QByteArray &fragment,const QByteArray &temporal,
-                               const QByteArray &ambient,const QByteArray &bloomDown,const QByteArray &bloomUp);
+                               const QByteArray &ambient,const QByteArray &bloomDown,const QByteArray &bloomUp,
+                               const QByteArray &depthOfField,const QByteArray &motionBlur);
     void destroyDisplayPipeline() { frame_.destroyDisplayPipeline(); }
 
     VkRenderPass scenePass() const { return frame_.scenePass(); }
@@ -34,9 +36,9 @@ public:
     // Ends the scene pass, resolves TAA and draws the exposure and view transform step, metering the scene into
     // meterSlot for auto exposure when it is set (see HdrFrame).
     void display(VkCommandBuffer command,float exposureStops,worldforge::color::ViewTransform transform,int meterSlot = -1,
-                 const Temporal &temporal = {},const Occlusion &occlusion = {},float bloom = 0)
+                 const Temporal &temporal = {},const Occlusion &occlusion = {},float bloom = 0,const Camera &camera = {})
     {
-        frame_.display(command,exposureStops,transform,meterSlot,temporal,occlusion,bloom);
+        frame_.display(command,exposureStops,transform,meterSlot,temporal,occlusion,bloom,camera);
     }
     void finishMeter(VkCommandBuffer command) const { frame_.finishMeter(command); }
     bool takeMeter(uint32_t slot,float &log2Average) const { return frame_.takeMeter(slot,log2Average); }

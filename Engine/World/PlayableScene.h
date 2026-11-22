@@ -69,6 +69,12 @@ struct PlayableScene {
     bool physicalSky = false;
     // Bloom: light scattered around bright areas, as a camera lens does (format version 16 when off).
     bool bloom = true;
+    // Camera effects (format version 18 when either is on): depth of field focused at focusDistance meters with the
+    // aperture f-number fNumber, and motion blur with the shutter open for that share of a frame.
+    bool depthOfField = false;
+    float focusDistance = 10, fNumber = 2.8f;
+    bool motionBlur = false;
+    float shutter = 0.5f;
     color::ViewTransform viewTransform = color::ViewTransform::AgX;
     Gameplay gameplay;
     std::vector<NativeBodyBinding> nativeBodies;

@@ -4,7 +4,7 @@
 // Converts the linear HDR scene to the display: exposure, view transform, and dither. For auto
 // exposure it also counts every fourth pixel's luminance into a histogram (see meteredLuminance in
 // Engine/Render/ColorPipeline.h for the bins).
-layout(input_attachment_index = 0, set = 0, binding = 0) uniform subpassInput scene;
+layout(set = 0, binding = 0) uniform sampler2D finalImage; // the final HDR image, nearest
 layout(std430, set = 0, binding = 1) buffer Meter { uint bins[64]; } meter;
 // Bloom (BloomDown.frag, BloomUp.frag): the light every bright area scatters around it, half size, from the previous
 // frame. It holds the sum of the chain's levels.
@@ -16,7 +16,7 @@ layout(push_constant) uniform Display {
 layout(location = 0) out vec4 color;
 void main()
 {
-    vec3 scene = subpassLoad(scene).rgb;
+    vec3 scene = texelFetch(finalImage,ivec2(gl_FragCoord.xy),0).rgb;
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     if (display.settings.w > 0.5 && ((pixel.x | pixel.y) & 1) == 0) {
         const float low = -16.0, high = 8.0;

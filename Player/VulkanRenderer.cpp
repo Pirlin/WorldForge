@@ -26,6 +26,8 @@
 #include "Ambient_frag.h"
 #include "BloomDown_frag.h"
 #include "BloomUp_frag.h"
+#include "DepthOfField_frag.h"
+#include "MotionBlur_frag.h"
 #include "PlayScene_vert.h"
 #include "PlayScene_frag.h"
 
@@ -119,6 +121,31 @@ std::array<float,16> reprojection(const XMFLOAT4X4 &current,const XMFLOAT4X4 &pr
 }
 
 // Ambient occlusion for a view as rendered (with its jitter): clip space back to world space.
+// Depth of field and motion blur for the view (View::lens, View::shutter).
+vk::HdrFrame::Camera cameraEffects(const View &view)
+{
+    vk::HdrFrame::Camera camera;
+    camera.depthOfField = view.lens.x > 0.5f;
+    camera.focusDistance = view.lens.y;
+    camera.fNumber = view.lens.z;
+    camera.verticalFov = view.lens.w;
+    camera.motionBlur = view.shutter.x > 0.5f;
+    camera.shutter = view.shutter.y;
+    const auto clip = vulkanClip(view.viewProjection);
+    XMFLOAT4X4 inverse;
+    XMStoreFloat4x4(&inverse,XMMatrixInverse(nullptr,XMLoadFloat4x4(&clip)));
+    std::memcpy(camera.inverseViewProjection.data(),&inverse,sizeof(inverse));
+    const auto unproject = [&](float z) {
+        const auto p = XMVector4Transform(XMVectorSet(0,0,z,1),XMLoadFloat4x4(&inverse));
+        return XMVectorScale(p,1/XMVectorGetW(p));
+    };
+    XMFLOAT3 forward;
+    XMStoreFloat3(&forward,XMVector3Normalize(XMVectorSubtract(unproject(1),unproject(0))));
+    camera.eye = {view.eye.x,view.eye.y,view.eye.z};
+    camera.forward = {forward.x,forward.y,forward.z};
+    return camera;
+}
+
 vk::HdrFrame::Occlusion occlusionFor(const View &view)
 {
     vk::HdrFrame::Occlusion occlusion;
@@ -279,7 +306,8 @@ bool VulkanRenderer::start(HWND window,std::wstring &error)
     }
     if (format_ == VK_FORMAT_UNDEFINED || !frame_.create(device_,format_,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
         || !frame_.createDisplayPipeline(spirv(spirv_Display_vert),spirv(spirv_Display_frag),spirv(spirv_Temporal_frag),
-                                    spirv(spirv_Ambient_frag),spirv(spirv_BloomDown_frag),spirv(spirv_BloomUp_frag))) {
+                                    spirv(spirv_Ambient_frag),spirv(spirv_BloomDown_frag),spirv(spirv_BloomUp_frag),
+                                    spirv(spirv_DepthOfField_frag),spirv(spirv_MotionBlur_frag))) {
         error = L"Vulkan could not create the HDR frame pass.";
         return false;
     }
@@ -1034,7 +1062,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         }
     }
     target.display(command,exposureStops,view.display.y > 0.5f ? color::ViewTransform::AgX : color::ViewTransform::Standard,
-                   meterSlot,temporal,occlusion,view.bloom);
+                   meterSlot,temporal,occlusion,view.bloom,cameraEffects(view));
     api_.vkCmdEndRenderPass(command);
     if (meterSlot >= 0)
         target.finishMeter(command);
@@ -1137,7 +1165,8 @@ bool VulkanRenderer::capture(const std::vector<PlayVertex> &vertices,const std::
                             VK_IMAGE_ASPECT_COLOR_BIT)
         && target.create(device_,format_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,1)
         && target.createDisplayPipeline(spirv(spirv_Display_vert),spirv(spirv_Display_frag),spirv(spirv_Temporal_frag),
-                                    spirv(spirv_Ambient_frag),spirv(spirv_BloomDown_frag),spirv(spirv_BloomUp_frag))
+                                    spirv(spirv_Ambient_frag),spirv(spirv_BloomDown_frag),spirv(spirv_BloomUp_frag),
+                                    spirv(spirv_DepthOfField_frag),spirv(spirv_MotionBlur_frag))
         && target.createTargets({width,height},std::span(&output.view,1))
         && (readback_.size >= bytes || (readback_.destroy(device_),readback_.create(device_,bytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT)));
     // A capture is a still view, so it converges at once. Auto exposure meters the first frame and the later frames

@@ -513,6 +513,11 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QS
     scene.ambientOcclusion = atmosphere.ambientOcclusion;
     scene.physicalSky = atmosphere.physicalSky;
     scene.bloom = atmosphere.bloom;
+    scene.depthOfField = atmosphere.depthOfField;
+    scene.focusDistance = atmosphere.focusDistance;
+    scene.fNumber = atmosphere.fNumber;
+    scene.motionBlur = atmosphere.motionBlur;
+    scene.shutter = atmosphere.shutter;
     scene.exposureCompensation = atmosphere.exposureCompensation;
     scene.viewTransform = atmosphere.viewTransform;
     std::size_t vertices = 0, animationSamples = 0;

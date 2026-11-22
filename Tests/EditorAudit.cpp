@@ -3175,6 +3175,29 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
                 describe(glow));
     setDisplay({{"bloom",true}});
 
+    // Camera effects. Depth of field focused 4 m away at f/1.4 blurs the street behind, the same in the editor and the
+    // Player; motion blur leaves a still view unchanged, since the camera does not move.
+    const auto sharpView = settled(shots[0]);
+    setDisplay({{"depthOfField",true},{"focusDistance",4},{"fNumber",1.4}});
+    const auto focused = settled(shots[0]);
+    focused.save(output.filePath("rendering-depth-of-field.png"));
+    const auto blurred = difference(focused,sharpView,"rendering-depth-of-field-diff.png");
+    std::ostringstream lensPlayable;
+    QFile lensFile(playablePath);
+    const bool lensExported = WorldRuntime::exportScene(store,lensPlayable) && lensFile.open(QIODevice::WriteOnly)
+        && lensFile.write(lensPlayable.str().data(),qint64(lensPlayable.str().size())) == qint64(lensPlayable.str().size());
+    lensFile.close();
+    const auto playedLens = lensExported ? playerCapture(shots[0],focused.size()) : QImage();
+    const auto lensAlike = difference(playedLens,focused,"rendering-depth-of-field-editor-player-diff.png");
+    audit.check(page,"display","Depth of field blurs the street beyond the focus, alike in the editor and the Player",
+                blurred.mean > 0.5 && !playedLens.isNull() && lensAlike.mean <= 1 && lensAlike.share <= 0.005,
+                QString("changes the view by %1; editor and Player: %2").arg(describe(blurred))
+                    .arg(playedLens.isNull() ? QStringLiteral("no Player capture") : describe(lensAlike)));
+    setDisplay({{"depthOfField",false},{"motionBlur",true}});
+    const auto stillBlur = difference(settled(shots[0]),sharpView,"rendering-motion-blur-still-diff.png");
+    audit.check(page,"display","Motion blur leaves a still view unchanged",stillBlur.mean < 0.05,describe(stillBlur));
+    setDisplay({{"motionBlur",false}});
+
     // The physical atmosphere: a different sky and sunlight from the gradient, the same in the editor and the Player.
     setDisplay({{"antiAliasing","TAA"}});
     const auto gradient = settled(shots[0]);

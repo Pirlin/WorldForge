@@ -45,6 +45,9 @@ struct View {
     // reaches the ground, 0 once the sun has set.
     float authoredSun = 0;
     float bloom = 0; // the share of light scattered around bright areas (color::bloomStrength), 0 for none
+    // Camera effects (HdrFrame::Camera): depth of field on, focus distance in meters, f-number, vertical field of view
+    // in radians; motion blur on, shutter (share of the frame), unused, unused.
+    DirectX::XMFLOAT4 lens{0,10,2.8f,0.785398f}, shutter{0,0.5f,0,0};
     // Sun shadow cascades (Engine/Render/ShadowCascades.h), fitted to the view without TAA jitter. Direct3D 11 uses
     // lightProjection instead.
     shadow::Cascades cascades;

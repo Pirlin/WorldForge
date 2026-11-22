@@ -62,6 +62,11 @@ WorldAtmosphere readAtmosphere(const QJsonObject &details)
     environment.ambientOcclusion = details.value("ambientOcclusion").toBool(true);
     environment.physicalSky = details.value("skyModel").toString() == QStringLiteral("Physical");
     environment.bloom = details.value("bloom").toBool(true);
+    environment.depthOfField = details.value("depthOfField").toBool(false);
+    environment.focusDistance = float(std::clamp(details.value("focusDistance").toDouble(10),0.1,10000.0));
+    environment.fNumber = float(std::clamp(details.value("fNumber").toDouble(2.8),0.5,64.0));
+    environment.motionBlur = details.value("motionBlur").toBool(false);
+    environment.shutter = float(std::clamp(details.value("shutter").toDouble(0.5),0.0,1.0));
     environment.exposureCompensation = float(std::clamp(details.value("exposureCompensation").toDouble(),
         -double(units::maximumCompensation),double(units::maximumCompensation)));
     environment.viewTransform = details.value("viewTransform").toString() == "Standard"

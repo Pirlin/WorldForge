@@ -9,13 +9,15 @@ namespace worldforge::vk {
 
 // The frame passes shared by the editor viewport and the Player:
 //   Scene pass: sky and lit geometry into a linear 16-bit float color target and a depth target.
-//   Display pass, subpass 0: temporal anti-aliasing (TAA) blends the scene into a history target.
-//   Display pass, subpass 1: exposure and view transform into the output image. The editor then draws
-//   its lines and overlays in display colors, depth-tested against the scene.
+//   Occlusion pass: ambient occlusion and bounce light from the scene depth and color.
+//   Bloom passes: a blur chain from the previous frame's result.
+//   TAA pass: temporal anti-aliasing blends the scene into a history target.
+//   Display pass: exposure and view transform into the output image. The editor then draws its lines and
+//   overlays in display colors, depth-tested against the scene.
 class HdrFrame {
 public:
     static constexpr VkFormat sceneFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
-    static constexpr uint32_t sceneSubpass = 0, temporalSubpass = 0, displaySubpass = 1;
+    static constexpr uint32_t sceneSubpass = 0, displaySubpass = 0;
     // Samples in the jitter sequence, and how many frames a still view averages.
     static constexpr uint32_t temporalSamples = 16;
     // The scene pass writes the lit scene and, separately, its sky-light part (which ambient occlusion scales) and
@@ -47,6 +49,21 @@ public:
         float radius = 1.5f; // meters
     };
 
+    // Camera effects applied after TAA (DepthOfField.frag, MotionBlur.frag); both off by default.
+    struct Camera {
+        // Depth of field: a thin lens focused at focusDistance meters with aperture f-number fNumber, its focal length
+        // from verticalFov (radians) on a 24 mm tall sensor. eye, forward and inverseViewProjection (clip space to
+        // world space, column-major, without jitter) locate each pixel's depth.
+        bool depthOfField = false;
+        float focusDistance = 10, fNumber = 2.8f, verticalFov = 0.785398f;
+        std::array<float,3> eye{}, forward{0,1,0};
+        std::array<float,16> inverseViewProjection{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        // Motion blur from the camera's movement (Temporal::reprojection), with the shutter open for this share of
+        // the frame (0.5 is a 180-degree shutter).
+        bool motionBlur = false;
+        float shutter = 0.5f;
+    };
+
     // outputLayout is the output image's layout after the frame: PRESENT_SRC for a swap chain,
     // TRANSFER_SRC for an image that is read back. meterSlots is how many auto exposure histograms to
     // keep, one per frame in flight.
@@ -56,18 +73,19 @@ public:
     void releaseTargets();
     // The display step uses vertex and fragment (Display.vert, Display.frag); TAA uses vertex and temporal
     // (Temporal.frag); ambient occlusion uses vertex and ambient (Ambient.frag); bloom uses vertex with bloomDown and
-    // bloomUp (BloomDown.frag, BloomUp.frag).
+    // bloomUp (BloomDown.frag, BloomUp.frag); camera effects use vertex with depthOfField and motionBlur.
     bool createDisplayPipeline(std::span<const uint32_t> vertex,std::span<const uint32_t> fragment,
                                std::span<const uint32_t> temporal,std::span<const uint32_t> ambient,
-                               std::span<const uint32_t> bloomDown,std::span<const uint32_t> bloomUp);
+                               std::span<const uint32_t> bloomDown,std::span<const uint32_t> bloomUp,
+                               std::span<const uint32_t> depthOfField,std::span<const uint32_t> motionBlur);
     void destroyDisplayPipeline();
 
-    // Scene geometry pipelines use scenePass subpass 0; editor overlays use displayPass subpass 1.
+    // Scene geometry pipelines use scenePass subpass 0; editor overlays use displayPass subpass 0.
     VkRenderPass scenePass() const { return scenePass_; }
     VkRenderPass displayPass() const { return displayPass_; }
     VkFormat depthFormat() const { return depthFormat_; }
     VkExtent2D extent() const { return extent_; }
-    bool displayReady() const { return display_ && temporal_ && ambient_ && bloomDown_ && bloomUp_ && sceneFramebuffer_; }
+    bool displayReady() const { return display_ && temporal_ && ambient_ && bloomDown_ && bloomUp_ && depthOfField_ && motionBlur_ && sceneFramebuffer_; }
 
     // The sub-pixel offset in pixels, each in [-0.5, 0.5), to render the next frame with when TAA is on.
     std::array<float,2> jitter() const;
@@ -85,7 +103,7 @@ public:
     // share of light scattered around bright areas (bloomStrength, or 0 for none). The caller may draw editor
     // overlays, then ends the render pass; call finishMeter after that when metering.
     void display(VkCommandBuffer command,float exposureStops,color::ViewTransform transform,int meterSlot,
-                 const Temporal &temporal,const Occlusion &occlusion,float bloom);
+                 const Temporal &temporal,const Occlusion &occlusion,float bloom,const Camera &camera = {});
     void finishMeter(VkCommandBuffer command) const;
     // After the frame that metered into slot has finished: reads and clears the histogram, and gives the
     // log2 average scene luminance. Returns false when nothing was metered.
@@ -105,7 +123,16 @@ private:
     VkDescriptorSetLayout displaySetLayout_{}, temporalSetLayout_{}, occlusionSetLayout_{}, bloomSetLayout_{};
     VkDescriptorSet occlusionSet_{};
     VkDescriptorPool pool_{};
-    std::array<VkDescriptorSet,2> displaySets_{}, temporalSets_{};
+    // Display sets read history 0, history 1, post 0 or post 1; temporal sets write history 0 or 1.
+    std::array<VkDescriptorSet,4> displaySets_{};
+    std::array<VkDescriptorSet,2> temporalSets_{};
+    // Camera effects: two targets to ping-pong between, sets reading each of the four images above with the depth.
+    std::array<Image,2> post_;
+    std::array<VkFramebuffer,2> postFramebuffers_{};
+    VkDescriptorSetLayout postSetLayout_{};
+    std::array<VkDescriptorSet,4> postSets_{};
+    VkPipelineLayout postLayout_{};
+    VkPipeline depthOfField_{}, motionBlur_{};
     VkPipelineLayout displayLayout_{}, temporalLayout_{}, occlusionLayout_{}, bloomLayout_{};
     VkPipeline display_{}, temporal_{}, ambient_{}, bloomDown_{}, bloomUp_{};
     // Bloom levels, their framebuffers, and descriptor sets reading each level (0 to bloomLevels - 1) and each history
@@ -122,7 +149,8 @@ private:
     std::array<bool,2> historyReady_{};
     VkExtent2D extent_{};
     VkFramebuffer sceneFramebuffer_{}, occlusionFramebuffer_{};
-    std::vector<VkFramebuffer> displayFramebuffers_; // output * 2 + history index
+    std::array<VkFramebuffer,2> temporalFramebuffers_{}; // TAA into each history image
+    std::vector<VkFramebuffer> displayFramebuffers_; // one per output
     std::size_t output_ = 0;
     uint32_t parity_ = 0, sample_ = 0, accumulated_ = 0;
     static constexpr VkDeviceSize meterBytes = 256;

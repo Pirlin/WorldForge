@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <iterator>
 
 namespace worldforge::vk {
@@ -107,45 +108,32 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
         if (vk.vkCreateRenderPass(device.device,&info,nullptr,&occlusionPass_) != VK_SUCCESS)
             return false;
     }
-    // Display pass: TAA into the history target, then the display step into the output.
+    // Display pass: the display step into the output, reading the final HDR image; the editor then draws its overlays,
+    // depth-tested against the scene.
     {
         const VkAttachmentDescription attachments[]{
             {0,outputFormat,VK_SAMPLE_COUNT_1_BIT,VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_STORE_OP_STORE,
              VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_STORE_OP_DONT_CARE,VK_IMAGE_LAYOUT_UNDEFINED,outputLayout},
-            {0,sceneFormat,VK_SAMPLE_COUNT_1_BIT,VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_STORE_OP_STORE,
-             VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_STORE_OP_DONT_CARE,
-             VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
             {0,depthFormat_,VK_SAMPLE_COUNT_1_BIT,VK_ATTACHMENT_LOAD_OP_LOAD,VK_ATTACHMENT_STORE_OP_DONT_CARE,
              VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_STORE_OP_DONT_CARE,
              VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL}
         };
-        const VkAttachmentReference historyOut{1,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-        const VkAttachmentReference historyIn{1,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         const VkAttachmentReference output{0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-        const VkAttachmentReference depth{2,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
-        const uint32_t preserve = 2;
-        const VkSubpassDescription subpasses[]{
-            {0,VK_PIPELINE_BIND_POINT_GRAPHICS,0,nullptr,1,&historyOut,nullptr,nullptr,1,&preserve},
-            {0,VK_PIPELINE_BIND_POINT_GRAPHICS,1,&historyIn,1,&output,nullptr,&depth,0,nullptr}
-        };
+        const VkAttachmentReference depth{1,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+        const VkSubpassDescription subpass{0,VK_PIPELINE_BIND_POINT_GRAPHICS,0,nullptr,1,&output,nullptr,&depth,0,nullptr};
         const VkSubpassDependency dependencies[]{
-            // The scene pass wrote the scene and depth; the previous frame's display subpass read this history.
-            {VK_SUBPASS_EXTERNAL,temporalSubpass,
+            // The output becomes writable once the acquire semaphore signals or a previous copy finishes; the passes
+            // before wrote the image the display step reads and the depth the overlays test against.
+            {VK_SUBPASS_EXTERNAL,0,
+             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | fragmentTests,
              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | fragmentTests,
-             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,0},
-            // The output image becomes writable once the acquire semaphore signals, or a previous copy finishes.
-            {VK_SUBPASS_EXTERNAL,displaySubpass,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | fragmentTests,0,
-             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT,0},
-            {temporalSubpass,displaySubpass,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,VK_DEPENDENCY_BY_REGION_BIT},
-            {displaySubpass,VK_SUBPASS_EXTERNAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT,0},
+            {0,VK_SUBPASS_EXTERNAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
              VK_ACCESS_TRANSFER_READ_BIT,0}
         };
-        const VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,nullptr,0,3,attachments,2,subpasses,
+        const VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,nullptr,0,2,attachments,1,&subpass,
             uint32_t(std::size(dependencies)),dependencies};
         if (vk.vkCreateRenderPass(device.device,&info,nullptr,&displayPass_) != VK_SUCCESS)
             return false;
@@ -174,7 +162,7 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
     }
 
     const VkDescriptorSetLayoutBinding displayBindings[]{
-        {0,VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
     const VkDescriptorSetLayoutBinding bloomBinding{0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -182,6 +170,13 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
     const VkDescriptorSetLayoutCreateInfo bloomLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,1,
         &bloomBinding};
     if (vk.vkCreateDescriptorSetLayout(device.device,&bloomLayout,nullptr,&bloomSetLayout_) != VK_SUCCESS)
+        return false;
+    const VkDescriptorSetLayoutBinding postBindings[]{
+        {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
+    const VkDescriptorSetLayoutCreateInfo postLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,2,
+        postBindings};
+    if (vk.vkCreateDescriptorSetLayout(device.device,&postLayout,nullptr,&postSetLayout_) != VK_SUCCESS)
         return false;
     const VkDescriptorSetLayoutBinding temporalBindings[]{
         {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
@@ -203,14 +198,14 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
         || vk.vkCreateDescriptorSetLayout(device.device,&temporalLayout,nullptr,&temporalSetLayout_) != VK_SUCCESS
         || vk.vkCreateDescriptorSetLayout(device.device,&occlusionLayout,nullptr,&occlusionSetLayout_) != VK_SUCCESS)
         return false;
-    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,2},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,2},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,16+bloomLevels+2}};
-    const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,5+bloomLevels+2,3,sizes};
+    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,4},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,40+bloomLevels+2}};
+    const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,11+bloomLevels+2,2,sizes};
     if (vk.vkCreateDescriptorPool(device.device,&pool,nullptr,&pool_) != VK_SUCCESS)
         return false;
-    const std::array displayLayouts{displaySetLayout_,displaySetLayout_};
+    const std::array displayLayouts{displaySetLayout_,displaySetLayout_,displaySetLayout_,displaySetLayout_};
     const std::array temporalLayouts{temporalSetLayout_,temporalSetLayout_};
-    const VkDescriptorSetAllocateInfo displayAllocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,nullptr,pool_,2,
+    const VkDescriptorSetAllocateInfo displayAllocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,nullptr,pool_,4,
         displayLayouts.data()};
     const VkDescriptorSetAllocateInfo temporalAllocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,nullptr,pool_,2,
         temporalLayouts.data()};
@@ -225,6 +220,11 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
     const VkDescriptorSetAllocateInfo bloomAllocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,nullptr,pool_,
         uint32_t(bloomLayouts.size()),bloomLayouts.data()};
     if (vk.vkAllocateDescriptorSets(device.device,&bloomAllocation,bloomSets_.data()) != VK_SUCCESS)
+        return false;
+    const std::array postLayouts{postSetLayout_,postSetLayout_,postSetLayout_,postSetLayout_};
+    const VkDescriptorSetAllocateInfo postAllocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,nullptr,pool_,
+        uint32_t(postLayouts.size()),postLayouts.data()};
+    if (vk.vkAllocateDescriptorSets(device.device,&postAllocation,postSets_.data()) != VK_SUCCESS)
         return false;
     meterSlots_ = std::max(meterSlots,1u);
     if (!meter_.create(device,VkDeviceSize(meterSlots_)*meterBytes,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT))
@@ -254,10 +254,14 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
         1,&occlusionSetLayout_,1,&temporalSettings};
     const VkPipelineLayoutCreateInfo bloomPipeline{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,nullptr,0,
         1,&bloomSetLayout_,1,&displaySettings};
+    const VkPushConstantRange postSettings{VK_SHADER_STAGE_FRAGMENT_BIT,0,32*sizeof(float)};
+    const VkPipelineLayoutCreateInfo postPipeline{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,nullptr,0,
+        1,&postSetLayout_,1,&postSettings};
     return vk.vkCreatePipelineLayout(device.device,&displayPipeline,nullptr,&displayLayout_) == VK_SUCCESS
         && vk.vkCreatePipelineLayout(device.device,&temporalPipeline,nullptr,&temporalLayout_) == VK_SUCCESS
         && vk.vkCreatePipelineLayout(device.device,&occlusionPipeline,nullptr,&occlusionLayout_) == VK_SUCCESS
-        && vk.vkCreatePipelineLayout(device.device,&bloomPipeline,nullptr,&bloomLayout_) == VK_SUCCESS;
+        && vk.vkCreatePipelineLayout(device.device,&bloomPipeline,nullptr,&bloomLayout_) == VK_SUCCESS
+        && vk.vkCreatePipelineLayout(device.device,&postPipeline,nullptr,&postLayout_) == VK_SUCCESS;
 }
 
 void HdrFrame::destroy()
@@ -268,7 +272,7 @@ void HdrFrame::destroy()
     const auto device = device_->device;
     releaseTargets();
     destroyDisplayPipeline();
-    for (const auto layout : {displayLayout_,temporalLayout_,occlusionLayout_,bloomLayout_})
+    for (const auto layout : {displayLayout_,temporalLayout_,occlusionLayout_,bloomLayout_,postLayout_})
         if (layout)
             vk.vkDestroyPipelineLayout(device,layout,nullptr);
     for (const auto sampler : {nearest_,linear_})
@@ -278,19 +282,20 @@ void HdrFrame::destroy()
     meterSlots_ = 0;
     if (pool_)
         vk.vkDestroyDescriptorPool(device,pool_,nullptr);
-    for (const auto layout : {displaySetLayout_,temporalSetLayout_,occlusionSetLayout_,bloomSetLayout_})
+    for (const auto layout : {displaySetLayout_,temporalSetLayout_,occlusionSetLayout_,bloomSetLayout_,postSetLayout_})
         if (layout)
             vk.vkDestroyDescriptorSetLayout(device,layout,nullptr);
     for (const auto pass : {scenePass_,occlusionPass_,displayPass_,bloomDownPass_,bloomUpPass_})
         if (pass)
             vk.vkDestroyRenderPass(device,pass,nullptr);
-    displayLayout_ = temporalLayout_ = occlusionLayout_ = bloomLayout_ = VK_NULL_HANDLE;
+    displayLayout_ = temporalLayout_ = occlusionLayout_ = bloomLayout_ = postLayout_ = VK_NULL_HANDLE;
     occlusionSet_ = VK_NULL_HANDLE;
     nearest_ = linear_ = VK_NULL_HANDLE;
     pool_ = VK_NULL_HANDLE;
     displaySets_ = {};
     temporalSets_ = {};
-    displaySetLayout_ = temporalSetLayout_ = occlusionSetLayout_ = bloomSetLayout_ = VK_NULL_HANDLE;
+    displaySetLayout_ = temporalSetLayout_ = occlusionSetLayout_ = bloomSetLayout_ = postSetLayout_ = VK_NULL_HANDLE;
+    postSets_ = {};
     scenePass_ = occlusionPass_ = displayPass_ = bloomDownPass_ = bloomUpPass_ = VK_NULL_HANDLE;
     bloomSets_ = {};
     device_ = nullptr;
@@ -329,16 +334,19 @@ bool HdrFrame::createTargets(VkExtent2D extent,std::span<const VkImageView> outp
     if (!framebuffer(scenePass_,sceneViews,sceneFramebuffer_)
         || !framebuffer(occlusionPass_,std::span(&occlusion_.view,1),occlusionFramebuffer_))
         return false;
-    for (const auto output : outputs)
-        for (const auto &history : history_) {
-            const std::array views{output,history.view,depth_.view};
-            VkFramebuffer result{};
-            if (!framebuffer(displayPass_,views,result))
-                return false;
-            displayFramebuffers_.push_back(result);
-        }
+    // TAA writes each history image in turn (with the single-target pass the bloom downsample also uses).
+    for (std::size_t i = 0; i < history_.size(); ++i)
+        if (!framebuffer(bloomDownPass_,std::span(&history_[i].view,1),temporalFramebuffers_[i]))
+            return false;
+    for (const auto output : outputs) {
+        const std::array views{output,depth_.view};
+        VkFramebuffer result{};
+        if (!framebuffer(displayPass_,views,result))
+            return false;
+        displayFramebuffers_.push_back(result);
+    }
     for (std::size_t i = 0; i < 2; ++i) {
-        const VkDescriptorImageInfo input{VK_NULL_HANDLE,history_[i].view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        const VkDescriptorImageInfo input{nearest_,history_[i].view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         const VkDescriptorImageInfo images[]{
             {nearest_,scene_.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
             {nearest_,depth_.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
@@ -347,7 +355,7 @@ bool HdrFrame::createTargets(VkExtent2D extent,std::span<const VkImageView> outp
             {nearest_,occlusion_.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
             {nearest_,albedo_.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
         const VkWriteDescriptorSet writes[]{
-            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,displaySets_[i],0,0,1,VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,displaySets_[i],0,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
              &input,nullptr,nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,temporalSets_[i],0,0,6,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
              images,nullptr,nullptr}};
@@ -386,6 +394,25 @@ bool HdrFrame::createTargets(VkExtent2D extent,std::span<const VkImageView> outp
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&image,nullptr,nullptr};
         vk.vkUpdateDescriptorSets(device_->device,1,&write,0,nullptr);
     }
+    // Camera effects: two full-size targets, and for each of the four images a frame can end in (history 0 and 1,
+    // post 0 and 1), a set the effects read it through and a set the display step reads it through.
+    for (std::size_t i = 0; i < post_.size(); ++i)
+        if (!post_[i].create(*device_,sceneFormat,extent_,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT)
+            || !framebuffer(bloomDownPass_,std::span(&post_[i].view,1),postFramebuffers_[i]))
+            return false;
+    for (std::size_t i = 0; i < 4; ++i) {
+        const auto view = i < 2 ? history_[i].view : post_[i-2].view;
+        const VkDescriptorImageInfo images[]{{linear_,view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                             {nearest_,depth_.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL}};
+        const VkDescriptorImageInfo final{nearest_,view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        const VkWriteDescriptorSet writes[]{
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,postSets_[i],0,0,2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+             images,nullptr,nullptr},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,displaySets_[i],0,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+             &final,nullptr,nullptr}};
+        vk.vkUpdateDescriptorSets(device_->device,2,writes,0,nullptr);
+    }
     bloomInitialized_ = false;
     framesShown_ = 0;
     return true;
@@ -402,6 +429,11 @@ void HdrFrame::releaseTargets()
     for (const auto framebuffer : {sceneFramebuffer_,occlusionFramebuffer_})
         if (framebuffer)
             vk.vkDestroyFramebuffer(device_->device,framebuffer,nullptr);
+    for (auto &framebuffer : temporalFramebuffers_) {
+        if (framebuffer)
+            vk.vkDestroyFramebuffer(device_->device,framebuffer,nullptr);
+        framebuffer = VK_NULL_HANDLE;
+    }
     sceneFramebuffer_ = occlusionFramebuffer_ = VK_NULL_HANDLE;
     scene_.destroy(*device_);
     indirect_.destroy(*device_);
@@ -417,6 +449,13 @@ void HdrFrame::releaseTargets()
         framebuffer = VK_NULL_HANDLE;
     }
     for (auto &image : bloom_)
+        image.destroy(*device_);
+    for (auto &framebuffer : postFramebuffers_) {
+        if (framebuffer)
+            vk.vkDestroyFramebuffer(device_->device,framebuffer,nullptr);
+        framebuffer = VK_NULL_HANDLE;
+    }
+    for (auto &image : post_)
         image.destroy(*device_);
     bloomInitialized_ = false;
     framesShown_ = 0;
@@ -475,22 +514,26 @@ bool HdrFrame::createPipeline(VkShaderModule vertex,VkShaderModule fragment,VkPi
 
 bool HdrFrame::createDisplayPipeline(std::span<const uint32_t> vertexCode,std::span<const uint32_t> fragmentCode,
                                      std::span<const uint32_t> temporalCode,std::span<const uint32_t> ambientCode,
-                                     std::span<const uint32_t> bloomDownCode,std::span<const uint32_t> bloomUpCode)
+                                     std::span<const uint32_t> bloomDownCode,std::span<const uint32_t> bloomUpCode,
+                                     std::span<const uint32_t> depthOfFieldCode,std::span<const uint32_t> motionBlurCode)
 {
     destroyDisplayPipeline();
-    if (!displayLayout_ || !temporalLayout_ || !occlusionLayout_ || !bloomLayout_)
+    if (!displayLayout_ || !temporalLayout_ || !occlusionLayout_ || !bloomLayout_ || !postLayout_)
         return false;
     const auto &vk = *device_->api;
     const auto vertex = device_->shader(vertexCode), fragment = device_->shader(fragmentCode),
         temporal = device_->shader(temporalCode), ambient = device_->shader(ambientCode),
-        bloomDown = device_->shader(bloomDownCode), bloomUp = device_->shader(bloomUpCode);
-    const bool created = vertex && fragment && temporal && ambient && bloomDown && bloomUp
+        bloomDown = device_->shader(bloomDownCode), bloomUp = device_->shader(bloomUpCode),
+        depthOfField = device_->shader(depthOfFieldCode), motionBlur = device_->shader(motionBlurCode);
+    const bool created = vertex && fragment && temporal && ambient && bloomDown && bloomUp && depthOfField && motionBlur
         && createPipeline(vertex,fragment,displayLayout_,displayPass_,displaySubpass,display_)
-        && createPipeline(vertex,temporal,temporalLayout_,displayPass_,temporalSubpass,temporal_)
+        && createPipeline(vertex,temporal,temporalLayout_,bloomDownPass_,0,temporal_)
         && createPipeline(vertex,ambient,occlusionLayout_,occlusionPass_,0,ambient_)
         && createPipeline(vertex,bloomDown,bloomLayout_,bloomDownPass_,0,bloomDown_)
-        && createPipeline(vertex,bloomUp,bloomLayout_,bloomUpPass_,0,bloomUp_,true);
-    for (const auto module : {vertex,fragment,temporal,ambient,bloomDown,bloomUp})
+        && createPipeline(vertex,bloomUp,bloomLayout_,bloomUpPass_,0,bloomUp_,true)
+        && createPipeline(vertex,depthOfField,postLayout_,bloomDownPass_,0,depthOfField_)
+        && createPipeline(vertex,motionBlur,postLayout_,bloomDownPass_,0,motionBlur_);
+    for (const auto module : {vertex,fragment,temporal,ambient,bloomDown,bloomUp,depthOfField,motionBlur})
         if (module)
             vk.vkDestroyShaderModule(device_->device,module,nullptr);
     if (!created)
@@ -500,7 +543,7 @@ bool HdrFrame::createDisplayPipeline(std::span<const uint32_t> vertexCode,std::s
 
 void HdrFrame::destroyDisplayPipeline()
 {
-    for (auto *pipeline : {&display_,&temporal_,&ambient_,&bloomDown_,&bloomUp_}) {
+    for (auto *pipeline : {&display_,&temporal_,&ambient_,&bloomDown_,&bloomUp_,&depthOfField_,&motionBlur_}) {
         if (*pipeline && device_)
             device_->api->vkDestroyPipeline(device_->device,*pipeline,nullptr);
         *pipeline = VK_NULL_HANDLE;
@@ -565,7 +608,7 @@ void HdrFrame::bloomChain(VkCommandBuffer command)
 }
 
 void HdrFrame::display(VkCommandBuffer command,float exposureStops,color::ViewTransform transform,int meterSlot,
-                       const Temporal &temporal,const Occlusion &occlusion,float bloom)
+                       const Temporal &temporal,const Occlusion &occlusion,float bloom,const Camera &camera)
 {
     const auto &vk = *device_->api;
     vk.vkCmdEndRenderPass(command);
@@ -590,7 +633,7 @@ void HdrFrame::display(VkCommandBuffer command,float exposureStops,color::ViewTr
         }
         bloomInitialized_ = true;
     }
-    const std::size_t framebuffer = output_*2+parity_;
+    const std::size_t framebuffer = output_;
     if (framebuffer >= displayFramebuffers_.size() || !display_ || !temporal_ || !ambient_ || !bloomDown_ || !bloomUp_)
         return;
     const VkRect2D area{{0,0},extent_};
@@ -615,32 +658,72 @@ void HdrFrame::display(VkCommandBuffer command,float exposureStops,color::ViewTr
     const bool bloomShown = bloom > 0 && framesShown_ > 0;
     if (bloomShown)
         bloomChain(command);
+    // TAA: the first frame after a reset shows only itself; a still view averages its first frames evenly
+    // and then holds; a moving view keeps blending in a sixteenth of each new frame.
+    {
+        const VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,bloomDownPass_,
+            temporalFramebuffers_[parity_],area,0,nullptr};
+        vk.vkCmdBeginRenderPass(command,&info,VK_SUBPASS_CONTENTS_INLINE);
+        vk.vkCmdSetViewport(command,0,1,&viewport);
+        vk.vkCmdSetScissor(command,0,1,&area);
+        const bool blend = temporal.enabled && accumulated_ > 0;
+        float weight = 1;
+        if (blend)
+            weight = accumulated_ < temporalSamples ? 1.0f/float(accumulated_+1) : temporal.still ? 0.0f : 1.0f/temporalSamples;
+        struct { std::array<float,16> reprojection; float settings[4]; } constants{temporal.reprojection,
+            {weight,blend ? 1.0f : 0.0f,temporal.still ? 0.0f : 1.0f,occlusion.enabled ? 1.0f : 0.0f}};
+        vk.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,temporal_);
+        vk.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,temporalLayout_,0,1,&temporalSets_[parity_],0,nullptr);
+        vk.vkCmdPushConstants(command,temporalLayout_,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(constants),&constants);
+        vk.vkCmdDraw(command,3,1,0,0);
+        vk.vkCmdEndRenderPass(command);
+    }
+
+    // Camera effects, each from the image so far into the next post target. source: 0 or 1 a history image, 2 or 3
+    // a post target.
+    std::size_t source = parity_;
+    const auto effect = [&](VkPipeline pipeline,const void *constants,uint32_t size) {
+        const std::size_t target = source == 2 ? 1 : 0;
+        const VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,bloomDownPass_,
+            postFramebuffers_[target],area,0,nullptr};
+        vk.vkCmdBeginRenderPass(command,&info,VK_SUBPASS_CONTENTS_INLINE);
+        vk.vkCmdSetViewport(command,0,1,&viewport);
+        vk.vkCmdSetScissor(command,0,1,&area);
+        vk.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
+        vk.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,postLayout_,0,1,&postSets_[source],0,nullptr);
+        vk.vkCmdPushConstants(command,postLayout_,VK_SHADER_STAGE_FRAGMENT_BIT,0,size,constants);
+        vk.vkCmdDraw(command,3,1,0,0);
+        vk.vkCmdEndRenderPass(command);
+        source = 2+target;
+    };
+    if (camera.depthOfField && depthOfField_) {
+        // A thin lens on a 24 mm tall sensor: the focal length that gives this field of view, and the aperture it has
+        // at this f-number.
+        constexpr float sensorHeight = 0.024f;
+        const float focalLength = sensorHeight/(2*std::tan(std::clamp(camera.verticalFov,0.01f,3.0f)/2));
+        struct { std::array<float,16> inverseViewProjection; float eye[4], forward[4], lens[4]; } constants{
+            camera.inverseViewProjection,{camera.eye[0],camera.eye[1],camera.eye[2],0},
+            {camera.forward[0],camera.forward[1],camera.forward[2],std::max(camera.focusDistance,focalLength*1.01f)},
+            {focalLength,focalLength/std::max(camera.fNumber,0.5f),float(extent_.height)/sensorHeight,24}};
+        effect(depthOfField_,&constants,sizeof(constants));
+    }
+    if (camera.motionBlur && motionBlur_ && accumulated_ > 0) {
+        struct { std::array<float,16> reprojection; float settings[4]; } constants{temporal.reprojection,
+            {std::clamp(camera.shutter,0.0f,1.0f),32,0,0}};
+        effect(motionBlur_,&constants,sizeof(constants));
+    }
+
     const VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,displayPass_,
         displayFramebuffers_[framebuffer],area,0,nullptr};
     vk.vkCmdBeginRenderPass(command,&info,VK_SUBPASS_CONTENTS_INLINE);
     vk.vkCmdSetViewport(command,0,1,&viewport);
     vk.vkCmdSetScissor(command,0,1,&area);
-
-    // TAA: the first frame after a reset shows only itself; a still view averages its first frames evenly
-    // and then holds; a moving view keeps blending in a sixteenth of each new frame.
-    const bool blend = temporal.enabled && accumulated_ > 0;
-    float weight = 1;
-    if (blend)
-        weight = accumulated_ < temporalSamples ? 1.0f/float(accumulated_+1) : temporal.still ? 0.0f : 1.0f/temporalSamples;
-    struct { std::array<float,16> reprojection; float settings[4]; } constants{temporal.reprojection,
-        {weight,blend ? 1.0f : 0.0f,temporal.still ? 0.0f : 1.0f,occlusion.enabled ? 1.0f : 0.0f}};
-    vk.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,temporal_);
-    vk.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,temporalLayout_,0,1,&temporalSets_[parity_],0,nullptr);
-    vk.vkCmdPushConstants(command,temporalLayout_,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(constants),&constants);
-    vk.vkCmdDraw(command,3,1,0,0);
-
-    vk.vkCmdNextSubpass(command,VK_SUBPASS_CONTENTS_INLINE);
     const bool metering = meterSlot >= 0 && uint32_t(meterSlot) < meterSlots_;
     const float settings[8]{color::exposureScale(exposureStops),transform == color::ViewTransform::AgX ? 1.0f : 0.0f,
         srgbOutput_ ? 1.0f : 0.0f,metering ? 1.0f : 0.0f,bloomShown ? bloom : 0.0f,float(bloomLevels),0,0};
     const uint32_t offset = metering ? uint32_t(meterSlot)*meterBytes : 0;
     vk.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,display_);
-    vk.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,displayLayout_,0,1,&displaySets_[parity_],1,&offset);
+    vk.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,displayLayout_,0,1,&displaySets_[source],1,&offset);
     vk.vkCmdPushConstants(command,displayLayout_,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(settings),settings);
     vk.vkCmdDraw(command,3,1,0,0);
 

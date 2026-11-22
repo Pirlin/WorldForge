@@ -999,6 +999,48 @@ void MainWindow::editAtmosphere()
     bloom->setToolTip(tr("Scatters a little light around bright areas, as a camera lens does: a glow around the sun, "
                          "lamps and bright reflections."));
     form->addRow(bloom);
+    // Camera effects, both off by default.
+    auto *depthOfField = new QCheckBox(tr("Depth of field"),&dialog);
+    depthOfField->setAccessibleName(tr("Depth of field"));
+    depthOfField->setChecked(initial.depthOfField);
+    depthOfField->setToolTip(tr("Blurs what is nearer or farther than the focus distance, as a camera lens does."));
+    form->addRow(depthOfField);
+    auto *focusDistance = new QDoubleSpinBox(&dialog);
+    focusDistance->setAccessibleName(tr("Focus distance"));
+    focusDistance->setRange(0.1,10000);
+    focusDistance->setDecimals(1);
+    focusDistance->setSuffix(tr(" m"));
+    focusDistance->setValue(initial.focusDistance);
+    form->addRow(tr("Focus distance"),focusDistance);
+    auto *fNumber = new QDoubleSpinBox(&dialog);
+    fNumber->setAccessibleName(tr("Aperture"));
+    fNumber->setRange(0.5,64);
+    fNumber->setDecimals(1);
+    fNumber->setPrefix(QStringLiteral("f/"));
+    fNumber->setValue(initial.fNumber);
+    fNumber->setToolTip(tr("A smaller f-number opens the lens wider and blurs more."));
+    form->addRow(tr("Aperture"),fNumber);
+    const auto lensFields = [depthOfField,focusDistance,fNumber] {
+        focusDistance->setEnabled(depthOfField->isChecked());
+        fNumber->setEnabled(depthOfField->isChecked());
+    };
+    lensFields();
+    connect(depthOfField,&QCheckBox::toggled,&dialog,lensFields);
+    auto *motionBlur = new QCheckBox(tr("Motion blur"),&dialog);
+    motionBlur->setAccessibleName(tr("Motion blur"));
+    motionBlur->setChecked(initial.motionBlur);
+    motionBlur->setToolTip(tr("Smears the image along the camera's movement while the shutter is open."));
+    form->addRow(motionBlur);
+    auto *shutter = new QDoubleSpinBox(&dialog);
+    shutter->setAccessibleName(tr("Shutter"));
+    shutter->setRange(0,1);
+    shutter->setDecimals(2);
+    shutter->setSingleStep(0.05);
+    shutter->setValue(initial.shutter);
+    shutter->setToolTip(tr("The share of each frame the shutter is open: 0.5 is a 180-degree film shutter."));
+    form->addRow(tr("Shutter"),shutter);
+    shutter->setEnabled(motionBlur->isChecked());
+    connect(motionBlur,&QCheckBox::toggled,shutter,&QWidget::setEnabled);
     auto *gravity = new QDoubleSpinBox(&dialog);
     gravity->setRange(0,50);
     gravity->setSuffix(tr(" m/s²"));
@@ -1016,7 +1058,7 @@ void MainWindow::editAtmosphere()
                               {"shadows",shadows->isChecked()},{"localFogRadius",localRadius->value()},
                               {"localFogDensity",localDensity->value()},
                               {"ev100",exposure->value()},{"exposureMode",exposureMode->currentData().toString()},
-                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},{"bloom",bloom->isChecked()},
+                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},{"bloom",bloom->isChecked()},{"depthOfField",depthOfField->isChecked()},{"focusDistance",focusDistance->value()},{"fNumber",fNumber->value()},{"motionBlur",motionBlur->isChecked()},{"shutter",shutter->value()},
                               {"localFogCenter",QJsonArray{localCenter[0]->value(),localCenter[1]->value(),localCenter[2]->value()}}});
 }
 

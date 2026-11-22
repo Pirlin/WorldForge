@@ -2236,7 +2236,8 @@ public:
             };
             frame_.createDisplayPipeline(spirv(":/shaders/Display.vert.spv"),spirv(":/shaders/Display.frag.spv"),
                                          spirv(":/shaders/Temporal.frag.spv"),spirv(":/shaders/Ambient.frag.spv"),
-                                         spirv(":/shaders/BloomDown.frag.spv"),spirv(":/shaders/BloomUp.frag.spv"));
+                                         spirv(":/shaders/BloomDown.frag.spv"),spirv(":/shaders/BloomUp.frag.spv"),
+                                         spirv(":/shaders/DepthOfField.frag.spv"),spirv(":/shaders/MotionBlur.frag.spv"));
             triangles_ = pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true);
             lines_ = pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false);
             if (window_.modelOnly_)
@@ -2550,7 +2551,8 @@ public:
             const auto toWorld = sceneCamera.inverted();
             std::copy_n(toWorld.constData(),16,occlusion.inverseViewProjection.begin());
             frame_.display(command,exposure,environment.viewTransform,environment.autoExposure ? int(frameIndex) : -1,temporal,
-                           occlusion,environment.bloom && !window_.modelOnly_ ? wf::color::bloomStrength : 0.0f);
+                           occlusion,environment.bloom && !window_.modelOnly_ ? wf::color::bloomStrength : 0.0f,
+                           cameraEffects(environment,toWorldMatrix,viewer,forward));
             window_.temporalSettled_ = !temporal.enabled || !temporal.still || frame_.accumulated() >= wf::vk::HdrFrame::temporalSamples;
             if (!window_.temporalSettled_)
                 window_.requestUpdate();
@@ -2607,6 +2609,23 @@ private:
         quint64 revision = 0;
         std::set<ModelComponent> highlights;
     };
+    // Depth of field and motion blur from the project's camera settings; world views only.
+    ViewportFrameVulkan::Camera cameraEffects(const WorldAtmosphere &environment,const QMatrix4x4 &toWorld,const QVector3D &eye,
+                                              const QVector3D &forward) const
+    {
+        ViewportFrameVulkan::Camera camera;
+        camera.depthOfField = environment.depthOfField && !window_.modelOnly_;
+        camera.focusDistance = environment.focusDistance;
+        camera.fNumber = environment.fNumber;
+        camera.verticalFov = qDegreesToRadians(45.0f);
+        camera.motionBlur = environment.motionBlur && !window_.modelOnly_;
+        camera.shutter = environment.shutter;
+        camera.eye = {eye.x(),eye.y(),eye.z()};
+        camera.forward = {forward.x(),forward.y(),forward.z()};
+        std::copy_n(toWorld.constData(),16,camera.inverseViewProjection.begin());
+        return camera;
+    }
+
     // Sun shadow cascades fitted to the steady camera (no TAA jitter) and to the scene's bounds.
     wf::shadow::Cascades shadowCascades(const Geometry &geometry,QVector3D sun,const QMatrix4x4 &camera)
     {
@@ -2788,9 +2807,9 @@ private:
         if (vertex && (fragment || shadow)) {
             // Sky and lit triangles render into the HDR scene; lines, overlays and outlines draw after
             // the display transform, and the scene shader keeps their sRGB colors (displayPass).
-            const uint32_t subpass = sky || (pass == Pass::Scene && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-                ? ViewportFrameVulkan::sceneSubpass : ViewportFrameVulkan::displaySubpass;
-            const VkBool32 displayPass = subpass == ViewportFrameVulkan::displaySubpass;
+            const bool inScene = sky || (pass == Pass::Scene && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+            const uint32_t subpass = inScene ? ViewportFrameVulkan::sceneSubpass : ViewportFrameVulkan::displaySubpass;
+            const VkBool32 displayPass = inScene ? VK_FALSE : VK_TRUE;
             const VkSpecializationMapEntry constant{0,0,sizeof(VkBool32)};
             const VkSpecializationInfo specialization{1,&constant,sizeof(displayPass),&displayPass};
             const VkPipelineShaderStageCreateInfo stages[]{
@@ -2833,7 +2852,7 @@ private:
             if (sky)
                 blends[1].colorWriteMask = blends[2].colorWriteMask = 0;
             VkPipelineColorBlendStateCreateInfo colors{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-            colors.attachmentCount = subpass == ViewportFrameVulkan::sceneSubpass ? wf::vk::HdrFrame::sceneColorAttachments : 1;
+            colors.attachmentCount = inScene ? wf::vk::HdrFrame::sceneColorAttachments : 1;
             colors.pAttachments = blends;
             const VkDynamicState states[]{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
             const VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, 2, states};
@@ -2849,8 +2868,7 @@ private:
             desc.pColorBlendState = shadow ? nullptr : &colors;
             desc.pDynamicState = &dynamic;
             desc.layout = layout_;
-            desc.renderPass = shadow ? lighting_.pass() : subpass == ViewportFrameVulkan::displaySubpass ? frame_.displayPass()
-                                                                                           : frame_.scenePass();
+            desc.renderPass = shadow ? lighting_.pass() : inScene ? frame_.scenePass() : frame_.displayPass();
             desc.subpass = shadow ? 0 : subpass;
             if (vk_->vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &desc, nullptr, &result) != VK_SUCCESS)
                 result = VK_NULL_HANDLE;
