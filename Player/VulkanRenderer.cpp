@@ -869,9 +869,11 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     lighting.skyZenith = view.skyZenith;
     lighting.skyGround = view.skyGround;
     lighting.sunTint = view.sunTint;
+    // Screen-space reflections and contact shadows trace the previous frame (View::shutter z and w).
     const bool reflections = view.shutter.z > 0.5f && reflectionReady_;
-    XMStoreFloat4x4(&lighting.previousViewProjection,reflections ? XMLoadFloat4x4(&reflectionClip_) : XMMatrixIdentity());
-    lighting.reflectionSettings = {reflections ? 1.0f : 0.0f,vk::HdrFrame::reflectionRange,0,0};
+    const bool contactShadows = view.shutter.w > 0.5f && view.lighting.y > 0 && reflectionReady_;
+    XMStoreFloat4x4(&lighting.previousViewProjection,reflectionReady_ ? XMLoadFloat4x4(&reflectionClip_) : XMMatrixIdentity());
+    lighting.reflectionSettings = {reflections ? 1.0f : 0.0f,vk::HdrFrame::reflectionRange,contactShadows ? 1.0f : 0.0f,0};
     if (view.skyEnvironment && frame.environmentRevision != view.skyRevision
         && view.skyEnvironment->size()*sizeof(std::array<float,4>) <= frame.environment.size) {
         std::memcpy(frame.environment.mapped,view.skyEnvironment->data(),view.skyEnvironment->size()*sizeof(std::array<float,4>));
@@ -1193,10 +1195,10 @@ bool VulkanRenderer::capture(const std::vector<PlayVertex> &vertices,const std::
     vk::HdrFrame::Temporal temporal;
     temporal.enabled = view.sky.y > 0.5f;
     temporal.still = true;
-    // Bloom reads the previous frame, so a capture with bloom renders at least two. Screen-space reflections trace
-    // the previous frame too, which the first frame lacks: a capture with them renders one frame first and then starts
-    // the TAA average over, so every averaged frame reflects, as in the editor.
-    const bool warmUp = view.shutter.z > 0.5f;
+    // Bloom reads the previous frame, so a capture with bloom renders at least two. Screen-space reflections and contact
+    // shadows trace the previous frame too, which the first frame lacks: a capture with them renders one frame first and
+    // then starts the TAA average over, so every averaged frame has one, as in the editor.
+    const bool warmUp = view.shutter.z > 0.5f || view.shutter.w > 0.5f;
     const int passes = std::max({temporal.enabled ? int(vk::HdrFrame::temporalSamples) : 1,automatic ? 2 : 1,
                                  view.bloom > 0 ? 2 : 1})+(warmUp ? 1 : 0);
     // A still view: the previous frame saw it through the same camera.

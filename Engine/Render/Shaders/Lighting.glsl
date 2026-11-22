@@ -26,8 +26,9 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     vec4 skyDirections[16];
     vec4 skySettings;      // sky visibility maps on, their meters per texel, physical sky on, unused
     vec4 sunTint;          // the color of sunlight at the ground, luminance 1 (white for the gradient sky)
-    // Screen-space reflections (Shading.glsl): the previous frame's clip space without jitter, and settings (on with a
-    // previous frame to trace, the longest ray in meters, unused, unused).
+    // Screen-space reflections and contact shadows (Shading.glsl), which trace the previous frame: its clip space
+    // without jitter, and settings (reflections on, the longest reflection ray in meters, contact shadows on, unused;
+    // each on only when there is a previous frame to trace).
     mat4 previousViewProjection;
     vec4 reflectionSettings;
 } lighting;

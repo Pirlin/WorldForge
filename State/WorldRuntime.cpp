@@ -519,6 +519,7 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QS
     scene.motionBlur = atmosphere.motionBlur;
     scene.shutter = atmosphere.shutter;
     scene.reflections = atmosphere.reflections;
+    scene.contactShadows = atmosphere.contactShadows;
     scene.exposureCompensation = atmosphere.exposureCompensation;
     scene.viewTransform = atmosphere.viewTransform;
     std::size_t vertices = 0, animationSamples = 0;

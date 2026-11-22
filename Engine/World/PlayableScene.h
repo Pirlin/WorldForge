@@ -71,6 +71,8 @@ struct PlayableScene {
     bool bloom = true;
     // Screen-space reflections: glossy surfaces reflect what the previous frame shows (format version 19 when off).
     bool reflections = true;
+    // Contact shadows from a short ray toward the sun on screen (format version 20 when off).
+    bool contactShadows = true;
     // Camera effects (format version 18 when either is on): depth of field focused at focusDistance meters with the
     // aperture f-number fNumber, and motion blur with the shutter open for that share of a frame.
     bool depthOfField = false;

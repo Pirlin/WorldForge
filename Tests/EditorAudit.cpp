@@ -3184,6 +3184,61 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
     while (store.history().index() > historyStart && store.history().canUndo())
         store.history().undo();
 
+    // Contact shadows: a box resting on a slab, lit from behind so its shadow falls toward the camera. They may only
+    // darken, and open ground away from the box must not shadow itself.
+    const Shot contactShot{"contact-shadows",{-120,-61.2f,1.1f},{-120,-58,0.1f}};
+    store.addCube();
+    if (const auto *selected = store.selectedObject()) {
+        auto ground = *selected;
+        ground.position = {-120,-58,0.05f};
+        ground.scale = {8,8,0.1f};
+        store.updateObject(ground,"Contact ground");
+    }
+    store.addCube();
+    if (const auto *selected = store.selectedObject()) {
+        auto box = *selected;
+        box.position = {-120,-58,0.3f};
+        box.scale = {0.4f,0.4f,0.4f};
+        store.updateObject(box,"Contact box");
+    }
+    store.select({});
+    setDisplay({{"fogDensity",0},{"localFogRadius",0},{"bloom",false},{"shadows",true},{"sunElevation",35},
+                {"sunAzimuth",90},{"contactShadows",true}});
+    const auto contact = settled(contactShot);
+    {
+        std::ostringstream contactPlayable;
+        QFile contactFile(playablePath);
+        const bool contactExported = WorldRuntime::exportScene(store,contactPlayable) && contactFile.open(QIODevice::WriteOnly);
+        const auto bytes = contactPlayable.str();
+        const bool written = contactExported && contactFile.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+        contactFile.close();
+        const auto played = written ? playerCapture(contactShot,contact.size()) : QImage();
+        const auto alike = difference(played,contact,"rendering-contact-shadows-editor-player-diff.png");
+        audit.check(page,"contact shadows","Editor and Player match with contact shadows",
+                    !played.isNull() && alike.mean <= 1 && alike.share <= 0.005,describe(alike));
+    }
+    setDisplay({{"contactShadows",false}});
+    const auto noContact = settled(contactShot);
+    contact.save(output.filePath("rendering-contact-shadows.png"));
+    noContact.save(output.filePath("rendering-contact-shadows-off.png"));
+    const auto whole = difference(contact,noContact,"rendering-contact-shadows-diff.png");
+    // Around the box and its shadow, in the middle of the view.
+    const auto aroundBox = [](const QImage &image) {
+        return image.copy(image.width()*2/5,image.height()*7/20,image.width()/5,image.height()*3/10);
+    };
+    const double darkening = luminance(aroundBox(noContact))-luminance(aroundBox(contact));
+    // The bottom corners show open ground in front of and beside the box, away from its shadow.
+    const auto corner = [](const QImage &image) {
+        return image.copy(0,image.height()*4/5,image.width()/6,image.height()/5);
+    };
+    const auto openGround = difference(corner(contact),corner(noContact),"rendering-contact-shadows-open-diff.png");
+    audit.check(page,"contact shadows","Contact shadows darken near the box and leave open ground alone",
+                !contact.isNull() && !noContact.isNull() && darkening*255 > 0.3 && openGround.mean < 0.3,
+                QString("The view around the box darkens by %1 levels on average (whole view: %2); open ground: %3.")
+                    .arg(darkening*255,0,'f',2).arg(describe(whole)).arg(describe(openGround)));
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+
     setDisplay({{"ev100",22},{"exposureMode","Manual"}});
     const auto tooDark = capture(shots[0].eye,shots[0].target);
     setDisplay({{"exposureMode","Auto"}});

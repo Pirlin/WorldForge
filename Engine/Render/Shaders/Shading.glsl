@@ -220,6 +220,53 @@ vec4 screenReflection(vec3 position,vec3 direction,float roughness)
     return vec4(max(texelFetch(previousFrame,ivec2(pixel),0).rgb,vec3(0.0)),confidence);
 }
 
+// Contact shadows: a short ray from the surface toward the sun, marched through the previous frame's depth like
+// screenReflection. It finds the small occluders the sun's shadow map is too coarse for (objects resting on a floor,
+// gaps under a ledge) and returns 0 where one blocks the sun, 1 otherwise. A ray shorter than a few pixels on screen
+// adds nothing the shadow map lacks, so it is skipped.
+float contactShadow(vec3 position,vec3 normal,vec3 towardSun)
+{
+    if (lighting.reflectionSettings.z < 0.5)
+        return 1.0;
+    const float rayLength = 0.5; // meters
+    mat4 m = lighting.previousViewProjection;
+    vec3 origin = position+normal*0.005;
+    vec4 start = m*vec4(origin,1.0);
+    vec4 end = m*vec4(origin+towardSun*rayLength,1.0);
+    const float near = 0.05;
+    if (start.w <= near || end.w <= near)
+        return 1.0;
+    vec2 size = vec2(textureSize(previousFrame,0));
+    vec2 a = (start.xy/start.w*0.5+0.5)*size, b = (end.xy/end.w*0.5+0.5)*size;
+    float pixels = length(b-a);
+    if (pixels < 4.0)
+        return 1.0;
+    float inverseStart = 1.0/start.w, inverseEnd = 1.0/end.w;
+    const int steps = 12;
+    float noise = pixelNoise(vec2(13.0,59.0));
+    // From 2 pixels out, as for reflections: nearer, the ray cannot be told apart from the surface it leaves.
+    float first = min(2.0/pixels,0.5);
+    float before = first, beforeDepth = 1.0/mix(inverseStart,inverseEnd,first);
+    for (int i = 0; i < steps; ++i) {
+        float t = first+(1.0-first)*(float(i)+noise)/float(steps);
+        vec2 pixel = mix(a,b,t);
+        if (any(lessThan(pixel,vec2(0.0))) || any(greaterThanEqual(pixel,size)))
+            return 1.0;
+        float rayDepth = 1.0/mix(inverseStart,inverseEnd,t);
+        float sceneDepth = texelFetch(previousFrame,ivec2(pixel),0).a;
+        float behind = rayDepth-sceneDepth;
+        // The jitter slack of screenReflection, plus 0.4% of the depth for its 16-bit storage (a ray toward a low sun
+        // runs close above the ground it leaves), and occluders up to 30 cm thick (more far away, where depth is coarser).
+        float slack = 2.5*abs(rayDepth-beforeDepth)/max((t-before)*pixels,1e-3)+0.004*sceneDepth;
+        float thickness = abs(rayDepth-beforeDepth)+0.3+0.01*sceneDepth;
+        if (sceneDepth > 0.0 && behind > slack && behind < thickness)
+            return 0.0;
+        before = t;
+        beforeDepth = rayDepth;
+    }
+    return 1.0;
+}
+
 // Light leaving the surface toward the eye. sunVisibility is the sun's shadow term (1 lit, 0 shadowed). indirect
 // receives the sky-light part of the result, which ambient occlusion later scales (Temporal.frag).
 vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out vec3 indirect)
@@ -234,7 +281,10 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
     // Multiple-scattering compensation (Turquin 2019): a single GGX bounce reflects brdf.x+brdf.y of the light for a
     // perfect mirror material; the rest bounces again and leaves tinted by f0.
     vec3 energy = 1.0+f0*(1.0/max(brdf.x+brdf.y,1e-3)-1.0);
-    vec3 result = directLight(surface,v,normalize(lighting.sun.xyz),lighting.sun.w*sunVisibility,energy)*lighting.sunTint.rgb;
+    vec3 towardSun = normalize(lighting.sun.xyz);
+    if (sunVisibility > 0.0 && lighting.sun.w > 0.0 && dot(surface.normal,towardSun) > 0.0)
+        sunVisibility = min(sunVisibility,contactShadow(position,surface.normal,towardSun));
+    vec3 result = directLight(surface,v,towardSun,lighting.sun.w*sunVisibility,energy)*lighting.sunTint.rgb;
     // Directional lights reach every pixel; point lights come from this pixel's cluster (LightClusters.h).
     uint directionalCount = clusterHeader.y;
     for (uint i = 0; i < directionalCount; ++i)

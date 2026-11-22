@@ -38,6 +38,8 @@ struct WorldAtmosphere {
     bool bloom = true;
     // Screen-space reflections: glossy surfaces reflect what the previous frame shows, where it shows it.
     bool reflections = true;
+    // Contact shadows: a short ray toward the sun on screen finds small occluders the sun's shadow map misses.
+    bool contactShadows = true;
     // Camera effects: depth of field (a lens focused at focusDistance meters with aperture f-number fNumber) and
     // motion blur from the camera's movement, with the shutter open for that share of a frame. Both off by default.
     bool depthOfField = false;

@@ -38,7 +38,7 @@ Put Qt on PATH first (`%LOCALAPPDATA%/WorldForge/Qt/6.8.3/msvc2022_64/bin`), the
 - Timings depend on the Windows power plan. Before blaming a change, measure the previous commit in the same session.
 
 ## Frame architecture (`Engine/Render/Vulkan/HdrFrame.*`, shared by the editor and the Player)
-1. **Scene pass.** Writes three color targets (scene; indirect sky light with the depth along the camera's forward axis in alpha; albedo plus fog transmission) and depth. Shading is in `Shaders/Shading.glsl` and `Lighting.glsl`. Screen-space reflections trace the previous frame's TAA result here (binding 8, `HdrFrame::previousFrame`), which the renderers rebind every frame.
+1. **Scene pass.** Writes three color targets (scene; indirect sky light with the depth along the camera's forward axis in alpha; albedo plus fog transmission) and depth. Shading is in `Shaders/Shading.glsl` and `Lighting.glsl`. Screen-space reflections and contact shadows trace the previous frame's TAA result here (binding 8, `HdrFrame::previousFrame`), which the renderers rebind every frame. The editor restarts the TAA average one frame after a camera move or edit, so averaged frames never trace another view.
 2. **Occlusion pass.** GTAO plus screen-space bounce light (`Ambient.frag`).
 3. **Bloom.** Built from the previous frame's history (`BloomDown`/`BloomUp.frag`).
 4. **TAA.** Runs in its own pass (`Temporal.frag`) and writes `history_[parity]`: light in RGB, this frame's depth in alpha.
@@ -65,7 +65,7 @@ Settings flow through these files:
 ## Status (2026-11-22)
 **Realism** is 94.9 over 4 views (mean FLIP 0.0508). The Cycles comparison runs with fog disabled.
 
-**Street frame time** (`--street`, GTX 1650 laptop on the Windows "Power saver" plan) is 13.2–13.5 ms on average with fog and screen-space reflections (about 14.6 ms at p95; the budget is 16.7 ms; 12.7–13.0 ms with fog alone). The same machine and plan measured 10.0 ms before fog, so the fog costs about 2.8 ms. The plan matters: before fog the street measured about 7 ms on a faster plan. Compare timings only within one run of measurements.
+**Street frame time** (`--street`, GTX 1650 laptop on the Windows "Power saver" plan) is 13.6–14.1 ms on average with fog, screen-space reflections and contact shadows (15.6–15.8 ms at p95; the budget is 16.7 ms, so the margin is thin on this plan; 13.2–13.5 ms before contact shadows, 12.7–13.0 ms with fog alone). The same machine and plan measured 10.0 ms before fog, so the fog costs about 2.8 ms. The plan matters: before fog the street measured about 7 ms on a faster plan. Compare timings only within one run of measurements.
 
 **R1 done:**
 - HDR, EV100 exposure and AgX tonemapping
@@ -80,14 +80,14 @@ Settings flow through these files:
 - Depth of field and motion blur
 - Volumetric height fog
 - Screen-space reflections
+- Contact shadows
 
 ## Next, in order
-1. **Contact shadows.** Plan: in `Shading.glsl`, march a short ray (about 0.5 m, 8–12 steps) from each sunlit pixel toward the sun through the previous frame's depth, the way `screenReflection` does, and scale the sun's visibility where it passes behind something. Reuse its jitter slack so surfaces do not shadow themselves. Add a rendering audit case and measure the street's frame time.
-2. **Per-object motion vectors.**
-3. **R2 materials:**
+1. **Per-object motion vectors.** Today motion blur and TAA reprojection use only the camera's motion. Plan: a velocity target written by the scene shaders from each object's previous transform (the editor and the Player both know when objects move in Play), read by TAA reprojection and `MotionBlur.frag`.
+2. **R2 materials:**
    - clear coat, sheen, transmission and glass
    - subsurface and anisotropy
    - glTF material extensions
    - wet and puddle layers
    - decals and parallax occlusion
-4. **R3 GI.** Bounce light from beyond the screen is the largest remaining gap against Cycles.
+3. **R3 GI.** Bounce light from beyond the screen is the largest remaining gap against Cycles.

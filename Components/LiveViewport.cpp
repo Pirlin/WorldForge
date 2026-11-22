@@ -2291,8 +2291,17 @@ public:
         const bool playing = window_.runtime_.has_value();
         const bool changed = !previousValid_ || camera != previousCamera_ || size != previousSize_
             || window_.geometryRevision_ != previousGeometry_ || window_.textureRevision_ != previousTextures_;
-        if (temporal.enabled && !playing && changed)
+        // Screen-space reflections and contact shadows trace the previous frame, which after a change shows another
+        // view or the scene before the edit. The first frame after a change is a warm-up: the average starts over once
+        // more after it, so every frame in it traces a frame of the same view, as Player captures do.
+        if (temporal.enabled && !playing && changed) {
             frame_.resetHistory();
+            warmUpFrame_ = true;
+        } else if (warmUpFrame_) {
+            if (temporal.enabled && !playing)
+                frame_.resetHistory();
+            warmUpFrame_ = false;
+        }
         temporal.still = !playing && !geometry.animated;
         const auto reprojection = (previousValid_ ? previousCamera_ : camera)*camera.inverted();
         std::copy_n(reprojection.constData(),16,temporal.reprojection.begin());
@@ -2391,13 +2400,15 @@ public:
         for (int c = 0; c < 3; ++c)
             lighting.sunTint[c] = sunStrength > 0 ? sunLight[std::size_t(c)]/sunStrength : 1.0f;
         lighting.skySettings[2] = environment.physicalSky ? 1.0f : 0.0f;
-        // Screen-space reflections trace the previous frame, seen through the previous steady camera.
-        // Orthographic views have no perspective depth to trace with.
-        const bool reflections = environment.reflections && !window_.modelOnly_ && !window_.ortho_ && previousValid_
-            && frame_.previousFrameReady();
-        std::copy_n((reflections ? previousCamera_ : QMatrix4x4()).constData(),16,lighting.previousViewProjection);
+        // Screen-space reflections and contact shadows trace the previous frame, seen through the previous steady
+        // camera. Orthographic views have no perspective depth to trace with.
+        const bool traceable = !window_.modelOnly_ && !window_.ortho_ && previousValid_ && frame_.previousFrameReady();
+        const bool reflections = environment.reflections && traceable;
+        const bool contactShadows = environment.contactShadows && shadows && traceable;
+        std::copy_n((traceable ? previousCamera_ : QMatrix4x4()).constData(),16,lighting.previousViewProjection);
         lighting.reflectionSettings[0] = reflections ? 1.0f : 0.0f;
         lighting.reflectionSettings[1] = wf::vk::HdrFrame::reflectionRange;
+        lighting.reflectionSettings[2] = contactShadows ? 1.0f : 0.0f;
         for (std::size_t i = 0; i < 9; ++i)
             std::copy_n(skyLight.irradiance[i].data(),4,lighting.skyIrradiance[i]);
         std::copy_n(skyLight.horizon.data(),3,lighting.skyHorizon);
@@ -2904,6 +2915,7 @@ private:
     QElapsedTimer adaptClock_;
     // TAA: what the previous frame showed, to restart or reproject the history.
     QMatrix4x4 previousCamera_;
+    bool warmUpFrame_ = false; // the next frame restarts the TAA average once more (temporalFor)
     QSize previousSize_;
     quint64 previousGeometry_ = 0, previousTextures_ = 0;
     // The scene's bounds for fitting shadow cascades, for geometry revision shadowBoundsRevision_.

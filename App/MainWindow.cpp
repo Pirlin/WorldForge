@@ -1005,6 +1005,12 @@ void MainWindow::editAtmosphere()
     reflections->setToolTip(tr("Glossy surfaces reflect the buildings and objects on screen, not only the sky. "
                                "Surfaces with roughness above 0.55 are unaffected."));
     form->addRow(reflections);
+    auto *contactShadows = new QCheckBox(tr("Contact shadows"),&dialog);
+    contactShadows->setAccessibleName(tr("Contact shadows"));
+    contactShadows->setChecked(initial.contactShadows);
+    contactShadows->setToolTip(tr("Adds the small, sharp sun shadows the shadow map is too coarse for, such as under "
+                                  "objects resting on the ground. Needs Cast sun shadows."));
+    form->addRow(contactShadows);
     // Camera effects, both off by default.
     auto *depthOfField = new QCheckBox(tr("Depth of field"),&dialog);
     depthOfField->setAccessibleName(tr("Depth of field"));
@@ -1064,7 +1070,7 @@ void MainWindow::editAtmosphere()
                               {"shadows",shadows->isChecked()},{"localFogRadius",localRadius->value()},
                               {"localFogDensity",localDensity->value()},
                               {"ev100",exposure->value()},{"exposureMode",exposureMode->currentData().toString()},
-                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},{"bloom",bloom->isChecked()},{"reflections",reflections->isChecked()},{"depthOfField",depthOfField->isChecked()},{"focusDistance",focusDistance->value()},{"fNumber",fNumber->value()},{"motionBlur",motionBlur->isChecked()},{"shutter",shutter->value()},
+                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},{"bloom",bloom->isChecked()},{"reflections",reflections->isChecked()},{"contactShadows",contactShadows->isChecked()},{"depthOfField",depthOfField->isChecked()},{"focusDistance",focusDistance->value()},{"fNumber",fNumber->value()},{"motionBlur",motionBlur->isChecked()},{"shutter",shutter->value()},
                               {"localFogCenter",QJsonArray{localCenter[0]->value(),localCenter[1]->value(),localCenter[2]->value()}}});
 }
 

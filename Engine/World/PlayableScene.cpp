@@ -128,7 +128,7 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
     const bool display = scene.exposure != 0 || scene.viewTransform != color::ViewTransform::AgX || scene.autoExposure
         || scene.exposureCompensation != 0 || !scene.temporalAntiAliasing || !scene.ambientOcclusion;
     const bool spots = std::ranges::any_of(scene.lights,[](const PlayLight &light) { return light.spotAngle > 0; });
-    const int version = !scene.reflections ? 19 : scene.depthOfField || scene.motionBlur ? 18 : spots ? 17 : !scene.bloom ? 16 : scene.physicalSky ? 15 : display ? 14 : !scene.nativeInstances.empty() ? 13 : !scene.nativeBodies.empty() ? 12
+    const int version = !scene.contactShadows ? 20 : !scene.reflections ? 19 : scene.depthOfField || scene.motionBlur ? 18 : spots ? 17 : !scene.bloom ? 16 : scene.physicalSky ? 15 : display ? 14 : !scene.nativeInstances.empty() ? 13 : !scene.nativeBodies.empty() ? 12
         : hasRemoteLaunch ? 11 : hasLaunch ? 10 : 9;
     if (!std::isfinite(scene.exposure) || scene.exposure < color::minimumExposure || scene.exposure > color::maximumExposure
         || !std::isfinite(scene.exposureCompensation) || std::abs(scene.exposureCompensation) > color::maximumCompensation)
@@ -156,6 +156,8 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
             << scene.shutter << ' ';
     if (version >= 19)
         out << scene.reflections << ' ';
+    if (version >= 20)
+        out << scene.contactShadows << ' ';
     out << '\n';
     for (const auto &body : world.bodies) {
         writeVector(out,body.position);
@@ -354,7 +356,7 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     std::string signature;
     int version;
     std::size_t bodies,terrains,joints,meshes,lights;
-    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 19
+    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 20
         || !(in >> bodies >> terrains >> joints >> meshes >> lights >> scene.player)
         || bodies > 257 || terrains > 256 || joints > 256 || meshes > 4096 || lights > 256 || scene.player >= bodies
         || !readValue(in,world.gravity,0,50) || !(in >> scene.sky)
@@ -382,6 +384,8 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
                           || !readValue(in,scene.fNumber,0.5f,64) || !(in >> scene.motionBlur) || !readValue(in,scene.shutter,0,1)))
         return {};
     if (version >= 19 && !(in >> scene.reflections))
+        return {};
+    if (version >= 20 && !(in >> scene.contactShadows))
         return {};
     world.bodies.resize(bodies);
     for (auto &body : world.bodies) {

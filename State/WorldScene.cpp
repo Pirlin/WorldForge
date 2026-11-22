@@ -63,6 +63,7 @@ WorldAtmosphere readAtmosphere(const QJsonObject &details)
     environment.physicalSky = details.value("skyModel").toString() == QStringLiteral("Physical");
     environment.bloom = details.value("bloom").toBool(true);
     environment.reflections = details.value("reflections").toBool(true);
+    environment.contactShadows = details.value("contactShadows").toBool(true);
     environment.depthOfField = details.value("depthOfField").toBool(false);
     environment.focusDistance = float(std::clamp(details.value("focusDistance").toDouble(10),0.1,10000.0));
     environment.fNumber = float(std::clamp(details.value("fNumber").toDouble(2.8),0.5,64.0));
