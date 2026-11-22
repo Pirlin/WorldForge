@@ -3242,12 +3242,18 @@ void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
     nightAtmosphere.insert("ev100",5);
     store.setAtmosphere(nightAtmosphere);
     bool lampsPlaced = true;
+    // The outer lamps are spot lights pointing down with a 120-degree cone, as street lamps are; the middle ones are
+    // point lights.
     for (const float x : {-20.0f,0.0f,20.0f})
         for (const float y : {-8.0f,8.0f}) {
-            store.addObject("Point Light","Lighting");
+            store.addObject(x == 0 ? "Point Light" : "Spot Light","Lighting");
             auto lamp = *store.selectedObject();
             lamp.position = {x,y,5};
             setLightPhotometric(lamp.details,lamp.type,2000);
+            if (lamp.type == "Spot Light") {
+                lamp.details.insert("coneAngle",120);
+                lamp.details.insert("coneBlend",0.3);
+            }
             lampsPlaced &= store.updateObjects({lamp},"Place street lamp",error);
         }
     const auto nightPath = output.filePath("realism-night.wfplay");

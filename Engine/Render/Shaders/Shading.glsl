@@ -131,7 +131,7 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
     // Directional lights reach every pixel; point lights come from this pixel's cluster (LightClusters.h).
     uint directionalCount = clusterHeader.y;
     for (uint i = 0; i < directionalCount; ++i)
-        result += directLight(surface,v,normalize(lightData[2u*i].xyz),1.0,energy)*lightData[2u*i+1u].rgb;
+        result += directLight(surface,v,normalize(lightData[4u*i].xyz),1.0,energy)*lightData[4u*i+1u].rgb;
     const float nearDepth = 0.1, farDepth = 1000.0;
     float depth = dot(position-eye,lighting.clusterForward.xyz);
     int slice = depth <= nearDepth ? 0 : clamp(int(log(depth/nearDepth)/log(farDepth/nearDepth)*24.0),0,23);
@@ -139,20 +139,30 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
     uvec2 range = clusterRanges[(slice*9+tile.y)*16+tile.x];
     for (uint k = 0u; k < range.y; ++k) {
         uint i = lightIndices[range.x+k];
-        vec4 place = lightData[2u*i];
+        vec4 place = lightData[4u*i];
         vec3 offset = place.xyz-position;
         float distanceSquared = max(dot(offset,offset),0.01);
         // Inverse-square falloff, faded to zero over the last part of the light's range.
         float fade = clamp(1.0-pow(distanceSquared/(place.w*place.w),2.0),0.0,1.0);
-        vec4 light = lightData[2u*i+1u];
+        vec4 light = lightData[4u*i+1u];
+        vec4 cone = lightData[4u*i+2u];
+        vec3 toLight = offset*inversesqrt(distanceSquared);
+        // Spot lights fade at the cone's edge as Cycles' do; point lights pass with 1.
+        float spot = smoothstep(0.0,1.0,(dot(-toLight,cone.xyz)-cone.w)*lightData[4u*i+3u].x);
+        if (spot <= 0.0)
+            continue;
         float shadow = light.w >= 2.0 ? pointShadow(uint(light.w-1.5),position,surface.normal,place.xyz) : 1.0;
-        result += directLight(surface,v,offset*inversesqrt(distanceSquared),1.0,energy)*light.rgb
-            *(fade*fade*shadow/distanceSquared);
+        result += directLight(surface,v,toLight,1.0,energy)*light.rgb*(fade*fade*shadow*spot/distanceSquared);
     }
     vec3 specularColor = (f0*brdf.x+brdf.y)*energy;
     vec3 r = reflect(-v,surface.normal);
     vec3 reflected = skyReflection(r,surface.roughness);
     vec3 diffuse = surface.albedo*(1.0-surface.metallic)*(1.0-specularColor)*skyIrradiance(surface.normal);
-    indirect = (diffuse+reflected*specularColor)*surface.occlusion*skyOpenness(position,surface.normal);
+    // Occlusion: diffuse sky light keeps the share of the sky the point sees (the material's own occlusion times the
+    // large-scale openness). Reflections come from a narrower cone, so they lose more of it, the more for glossy
+    // surfaces seen head-on (specular occlusion, Lagarde and de Rousiers 2014).
+    float ambient = surface.occlusion*skyOpenness(position,surface.normal);
+    float specularOcclusion = clamp(pow(nv+ambient,exp2(-16.0*surface.roughness-1.0))-1.0+ambient,0.0,1.0);
+    indirect = diffuse*ambient+reflected*specularColor*specularOcclusion;
     return result+indirect;
 }

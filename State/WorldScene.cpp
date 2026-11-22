@@ -1,6 +1,7 @@
 #include "State/WorldScene.h"
 #include "State/ProjectStore.h"
 #include <QJsonArray>
+#include <QQuaternion>
 #include <algorithm>
 #include <cmath>
 
@@ -80,7 +81,7 @@ float lightUnits(const SceneObject &object)
     namespace color = worldforge::color;
     if (object.type == "Directional Light" && object.details.contains("illuminance"))
         return color::unitsFromLux(std::clamp(object.details.value("illuminance").toDouble(),0.0,maximumIlluminance));
-    if (object.type == "Point Light" && object.details.contains("luminousIntensity"))
+    if ((object.type == "Point Light" || object.type == "Spot Light") && object.details.contains("luminousIntensity"))
         return color::unitsFromCandela(std::clamp(object.details.value("luminousIntensity").toDouble(),0.0,
                                                   maximumLuminousIntensity));
     return float(std::clamp(object.details.value("lightIntensity").toDouble(1),0.0,4.0));
@@ -89,15 +90,30 @@ float lightUnits(const SceneObject &object)
 double lightPhotometric(const SceneObject &object)
 {
     const double units = lightUnits(object);
-    return object.type == "Point Light" ? worldforge::color::candelaFromUnits(float(units))
+    return object.type == "Point Light" || object.type == "Spot Light" ? worldforge::color::candelaFromUnits(float(units))
                                         : worldforge::color::luxFromUnits(float(units));
 }
 
 void setLightPhotometric(QJsonObject &details,const QString &type,double value)
 {
     details.remove("lightIntensity");
-    if (type == "Point Light")
+    if (type == "Point Light" || type == "Spot Light")
         details.insert("luminousIntensity",std::clamp(value,0.0,maximumLuminousIntensity));
     else
         details.insert("illuminance",std::clamp(value,0.0,maximumIlluminance));
+}
+
+double spotConeAngle(const SceneObject &object)
+{
+    return std::clamp(object.details.value("coneAngle").toDouble(defaultConeAngle),1.0,179.0);
+}
+
+double spotConeBlend(const SceneObject &object)
+{
+    return std::clamp(object.details.value("coneBlend").toDouble(defaultConeBlend),0.0,1.0);
+}
+
+QVector3D spotDirection(const SceneObject &object)
+{
+    return QQuaternion::fromEulerAngles(object.rotation).rotatedVector({0,0,-1}).normalized();
 }

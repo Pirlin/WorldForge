@@ -301,7 +301,7 @@ void checkLightClusters()
             "A lamp's range follows its intensity");
     // Point light shadows: the nearest on-screen lamp gets slot 0, and its cube faces see points in their own direction
     // at the center, with depth growing from the near plane to the light's range.
-    require(clusters.header[2] == 1 && clusters.lights[3][3] == 2.0f && clusters.shadowed.size() == 1,
+    require(clusters.header[2] == 1 && clusters.lights[5][3] == 2.0f && clusters.shadowed.size() == 1,
             "The nearest lamp on screen gets a point light shadow");
     const auto faces = lights::cubeFaces({2,0,3},20);
     const auto project = [](const std::array<float,16> &m,float x,float y,float z) {

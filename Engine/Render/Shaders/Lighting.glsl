@@ -32,13 +32,13 @@ layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles,
 // the map prefiltered for roughness 1/3, 2/3 and 1 at 64 x 32.
 layout(std430, set = 0, binding = 5) readonly buffer SkyEnvironment { vec4 skyMap[]; };
 // The lights and the clusters that list them (Engine/Render/LightClusters.h): a header (light count, directional
-// count, shadowed point lights); the shadowed lights' cube faces (slot * 6 + face); per light, position or direction
-// with range, then color times intensity (w: 1 directional, 0 point, 2 + slot a point light with a shadow); each
-// cluster's offset and count.
+// count, shadowed point lights); the shadowed lights' cube faces (slot * 6 + face); per light four vec4 (position or
+// direction with range; color times intensity, w: 1 directional, 0 point or spot, 2 + slot one with a shadow; the spot
+// direction and cos(cone / 2); the spot scale); each cluster's offset and count.
 layout(std430, set = 0, binding = 6) readonly buffer Clusters {
     uvec4 clusterHeader;
     mat4 shadowFaces[8*6];
-    vec4 lightData[2048];
+    vec4 lightData[4096];
     uvec2 clusterRanges[16*9*24];
     uint lightIndices[];
 };

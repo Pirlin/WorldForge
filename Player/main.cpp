@@ -630,7 +630,8 @@ public:
                 continue;
             }
             if (light.intensity > 0)
-                sceneLights_.push_back({{light.vector[0],light.vector[1],light.vector[2]},light.intensity,{1,1,1},light.directional});
+                sceneLights_.push_back({{light.vector[0],light.vector[1],light.vector[2]},light.intensity,{1,1,1},light.directional,
+                                        light.spotDirection,light.spotAngle,light.spotBlend});
             if (view.eye.w < 16 && light.intensity > 0) {
                 view.lights[int(view.eye.w)] = parameter(light.vector,light.directional ? -light.intensity : light.intensity);
                 ++view.eye.w;

@@ -93,6 +93,9 @@ struct Light {
     QVector3D vector;
     float intensity;
     bool directional;
+    // Spot lights (State/WorldScene.h): the direction they point, the full cone in radians (0 for a point light), blend.
+    QVector3D spotDirection{0,0,-1};
+    float spotAngle = 0, spotBlend = 0.15f;
 };
 
 using ImageRange = std::array<uint32_t,3>;
@@ -159,14 +162,20 @@ std::vector<Light> sceneLights(const QList<SceneObject> &objects,const WorldAtmo
     bool usedPrimary = false;
     for (const auto &object : objects) {
         const bool directional = object.type == "Directional Light";
-        if (!object.visible || (!directional && object.type != "Point Light"))
+        if (!object.visible || (!directional && object.type != "Point Light" && object.type != "Spot Light"))
             continue;
         if (directional && !usedPrimary) {
             usedPrimary = true;
             continue;
         }
         const auto vector = directional ? QQuaternion::fromEulerAngles(object.rotation).rotatedVector({0,0,1}) : object.position;
-        lights.push_back({vector,lightUnits(object),directional});
+        Light light{vector,lightUnits(object),directional};
+        if (object.type == "Spot Light") {
+            light.spotDirection = spotDirection(object);
+            light.spotAngle = float(qDegreesToRadians(spotConeAngle(object)));
+            light.spotBlend = float(spotConeBlend(object));
+        }
+        lights.push_back(light);
     }
     return lights;
 }
@@ -2391,7 +2400,9 @@ public:
         for (std::size_t i = 1; i < lights.size(); ++i)
             if (lights[i].intensity > 0)
                 clusterLights.push_back({{lights[i].vector.x(),lights[i].vector.y(),lights[i].vector.z()},lights[i].intensity,
-                                         {1,1,1},lights[i].directional});
+                                         {1,1,1},lights[i].directional,
+                                         {lights[i].spotDirection.x(),lights[i].spotDirection.y(),lights[i].spotDirection.z()},
+                                         lights[i].spotAngle,lights[i].spotBlend});
         const auto steady = window_.camera(size);
         const auto toWorldMatrix = steady.inverted();
         const auto eyePoint = toWorldMatrix.map(QVector4D(0,0,0,1)), farPoint = toWorldMatrix.map(QVector4D(0,0,1,1));

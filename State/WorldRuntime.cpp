@@ -527,12 +527,17 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QS
             continue;
         }
         const auto q = QQuaternion::fromEulerAngles(object.rotation);
-        if (object.type == "Directional Light" || object.type == "Point Light") {
+        if (object.type == "Directional Light" || object.type == "Point Light" || object.type == "Spot Light") {
             const bool directional = object.type == "Directional Light";
             hasSun |= directional;
             const auto direction = object.id == "sun" && object.rotation.isNull() ? sunDirection(atmosphere) : q.rotatedVector({0,0,1});
-            scene.lights.push_back({point(directional ? direction : object.position),
-                lightUnits(object),directional});
+            worldforge::PlayLight light{point(directional ? direction : object.position),lightUnits(object),directional};
+            if (object.type == "Spot Light") {
+                light.spotDirection = point(spotDirection(object));
+                light.spotAngle = float(qDegreesToRadians(spotConeAngle(object)));
+                light.spotBlend = float(spotConeBlend(object));
+            }
+            scene.lights.push_back(light);
             continue;
         }
         const auto asset = runtime.assets_.constFind(object.meshAsset);

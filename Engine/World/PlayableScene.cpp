@@ -127,7 +127,8 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
     });
     const bool display = scene.exposure != 0 || scene.viewTransform != color::ViewTransform::AgX || scene.autoExposure
         || scene.exposureCompensation != 0 || !scene.temporalAntiAliasing || !scene.ambientOcclusion;
-    const int version = !scene.bloom ? 16 : scene.physicalSky ? 15 : display ? 14 : !scene.nativeInstances.empty() ? 13 : !scene.nativeBodies.empty() ? 12
+    const bool spots = std::ranges::any_of(scene.lights,[](const PlayLight &light) { return light.spotAngle > 0; });
+    const int version = spots ? 17 : !scene.bloom ? 16 : scene.physicalSky ? 15 : display ? 14 : !scene.nativeInstances.empty() ? 13 : !scene.nativeBodies.empty() ? 12
         : hasRemoteLaunch ? 11 : hasLaunch ? 10 : 9;
     if (!std::isfinite(scene.exposure) || scene.exposure < color::minimumExposure || scene.exposure > color::maximumExposure
         || !std::isfinite(scene.exposureCompensation) || std::abs(scene.exposureCompensation) > color::maximumCompensation)
@@ -178,7 +179,13 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
     }
     for (const auto &light : scene.lights) {
         writeVector(out,light.vector);
-        out << light.intensity << ' ' << light.directional << '\n';
+        out << light.intensity << ' ' << light.directional;
+        if (version >= 17) {
+            out << ' ';
+            writeVector(out,light.spotDirection);
+            out << light.spotAngle << ' ' << light.spotBlend;
+        }
+        out << '\n';
     }
     std::size_t remainingClipSamples = MeshClip::maxSamples*3;
     for (const auto &mesh : scene.meshes) {
@@ -342,7 +349,7 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     std::string signature;
     int version;
     std::size_t bodies,terrains,joints,meshes,lights;
-    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 16
+    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 17
         || !(in >> bodies >> terrains >> joints >> meshes >> lights >> scene.player)
         || bodies > 257 || terrains > 256 || joints > 256 || meshes > 4096 || lights > 256 || scene.player >= bodies
         || !readValue(in,world.gravity,0,50) || !(in >> scene.sky)
@@ -416,7 +423,9 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     }
     scene.lights.resize(lights);
     for (auto &light : scene.lights)
-        if (!readVector(in,light.vector) || !readValue(in,light.intensity,0,4) || !(in >> light.directional))
+        if (!readVector(in,light.vector) || !readValue(in,light.intensity,0,4) || !(in >> light.directional)
+            || (version >= 17 && (!readVector(in,light.spotDirection,-1,1) || !readValue(in,light.spotAngle,0,3.1416f)
+                                  || !readValue(in,light.spotBlend,0,1))))
             return {};
     scene.meshes.resize(meshes);
     std::size_t remaining = 1500000;

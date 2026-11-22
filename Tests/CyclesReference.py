@@ -251,7 +251,14 @@ def add_light(name, kind, intensity, vector, shadows=True, color=(1, 1, 1)):
 if sun["intensity"] > 0:
     add_light("Sun", "SUN", sun["intensity"], sun["direction"], sun["shadows"], tuple(sun.get("color", (1, 1, 1))))
 for number, light in enumerate(description["lights"]):
-    add_light("Light %d" % number, "SUN" if light["directional"] else "POINT", light["intensity"], light["vector"])
+    spot = light.get("spot")
+    kind = "SUN" if light["directional"] else "SPOT" if spot else "POINT"
+    item = add_light("Light %d" % number, kind, light["intensity"], light["vector"])
+    if spot:
+        # Blender's spot light has the point light's intensity on its axis, inside a cone along its -Z axis.
+        item.data.spot_size = spot["angle"]
+        item.data.spot_blend = spot["blend"]
+        item.rotation_euler = Vector(spot["direction"]).normalized().to_track_quat("-Z", "Y").to_euler()
 
 camera_settings = description["camera"]
 camera_data = bpy.data.cameras.new("Camera")

@@ -95,7 +95,7 @@ QString selectedGroup(QTreeView *tree)
 QString sceneGroup(const SceneObject &object)
 {
     const bool supported = !object.meshAsset.isEmpty() || object.type == "Empty" || object.type == "Folder"
-        || object.type == "Directional Light" || object.type == "Point Light" || object.type == "Terrain"
+        || object.type == "Directional Light" || object.type == "Point Light" || object.type == "Spot Light" || object.type == "Terrain"
         || object.type == "World Atmosphere" || object.type == "Player Start";
     return supported ? (object.group.isEmpty() ? QObject::tr("Ungrouped") : object.group)
                      : QObject::tr("Unrendered Scene Data");
@@ -192,7 +192,7 @@ Outliner::Outliner(ProjectStore &store, QWidget *parent)
     add->setPopupMode(QToolButton::InstantPopup);
     auto *addMenu = new QMenu(add);
     addMenu->addAction(tr("Cube"), this, [this] { store_.addCube(); });
-    for (const QString &type : QStringList{"Directional Light", "Point Light", "Terrain", "Player Start", "Empty", "Folder"}) {
+    for (const QString &type : QStringList{"Directional Light", "Point Light", "Spot Light", "Terrain", "Player Start", "Empty", "Folder"}) {
         addMenu->addAction(type, this, [this, type] {
             store_.addObject(type, type.endsWith("Light") ? "Lighting" : type == "Terrain" ? "Environment"
                 : type == "Player Start" ? "Gameplay" : selectedGroup(tree_));
@@ -636,6 +636,23 @@ Inspector::Inspector(ProjectStore &store, QWidget *parent)
     intensity_->setAccessibleName(tr("Light intensity"));
     lightForm->addRow(tr("Intensity"), intensity_);
     connect(intensity_, &QDoubleSpinBox::editingFinished, this, &Inspector::apply);
+    // Spot lights: the cone's full angle and how much of its edge fades, as Blender's Spot Size and Blend.
+    coneAngle_ = new QDoubleSpinBox(light);
+    coneAngle_->setRange(1, 179);
+    coneAngle_->setDecimals(1);
+    coneAngle_->setSuffix(QStringLiteral("°"));
+    coneAngle_->setAccessibleName(tr("Cone angle"));
+    coneAngle_->setToolTip(tr("The spot light's full cone angle. A street lamp spreads its light over about 120°."));
+    lightForm->addRow(tr("Cone angle"), coneAngle_);
+    connect(coneAngle_, &QDoubleSpinBox::editingFinished, this, &Inspector::apply);
+    coneBlend_ = new QDoubleSpinBox(light);
+    coneBlend_->setRange(0, 1);
+    coneBlend_->setDecimals(2);
+    coneBlend_->setSingleStep(0.05);
+    coneBlend_->setAccessibleName(tr("Cone blend"));
+    coneBlend_->setToolTip(tr("How softly the light fades at the cone's edge: 0 for a hard edge, 1 for a fade from the center."));
+    lightForm->addRow(tr("Cone blend"), coneBlend_);
+    connect(coneBlend_, &QDoubleSpinBox::editingFinished, this, &Inspector::apply);
 
     auto *physics = section(sections, tr("Physics"), false);
     auto *physicsForm = new QFormLayout(physics);
@@ -811,9 +828,14 @@ void Inspector::refresh()
             materialSlot_->addItem(QString::fromStdString(material.name));
     if (materialIndex >= 0 && materialIndex < materialSlot_->count())
         materialSlot_->setCurrentIndex(materialIndex);
-    const bool light = object->type == "Directional Light" || object->type == "Point Light";
+    const bool light = object->type == "Directional Light" || object->type == "Point Light" || object->type == "Spot Light";
     intensity_->setEnabled(light);
-    const bool point = object->type == "Point Light";
+    const bool point = object->type == "Point Light" || object->type == "Spot Light";
+    const bool spot = object->type == "Spot Light";
+    coneAngle_->setEnabled(spot);
+    coneBlend_->setEnabled(spot);
+    coneAngle_->setValue(spot ? spotConeAngle(*object) : defaultConeAngle);
+    coneBlend_->setValue(spot ? spotConeBlend(*object) : defaultConeBlend);
     intensity_->setSuffix(point ? tr(" cd") : tr(" lx"));
     intensity_->setMaximum(point ? maximumLuminousIntensity : maximumIlluminance);
     intensity_->setToolTip(point ? tr("Luminous intensity in candela. A bright street lamp is a few thousand candela.")
@@ -897,6 +919,11 @@ void Inspector::apply()
         if (std::abs(intensity_->value() - std::round(lightPhotometric(*current))) < 0.5)
             return;
         setLightPhotometric(next.details, next.type, intensity_->value());
+    } else if (sender() == coneAngle_ || sender() == coneBlend_) {
+        if (next.type != "Spot Light")
+            return;
+        next.details.insert("coneAngle", coneAngle_->value());
+        next.details.insert("coneBlend", coneBlend_->value());
     } else if (sender() == bodyMode_) {
         next.details.insert("physics", bodyMode_->currentData().toString());
     } else if (sender() == colliderShape_) {

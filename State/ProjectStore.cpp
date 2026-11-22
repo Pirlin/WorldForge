@@ -497,7 +497,8 @@ const QHash<QString, QHash<QString, SceneObject>> &demoPlaceholders()
             auto &placeholders = result[project.value("id").toString()];
             for (const auto &row : project.value("objects").toArray()) {
                 const auto object = readObject(row.toObject());
-                if (object.meshAsset.isEmpty() && object.type != "Directional Light" && object.type != "Point Light")
+                if (object.meshAsset.isEmpty() && object.type != "Directional Light" && object.type != "Point Light"
+                    && object.type != "Spot Light")
                     placeholders.insert(object.id, object);
             }
         }

@@ -124,12 +124,24 @@ bool writeReference(const std::filesystem::path &folder,const std::vector<PlayVe
     json << ", \"color\": ";
     write(json,{view.sunTint.x,view.sunTint.y,view.sunTint.z});
     json << ", \"shadows\": " << (view.lighting.y > 0.5f ? "true" : "false") << "},\n  \"lights\": [";
-    for (int i = 0; i < int(view.eye.w); ++i) {
-        const auto &light = view.lights[i];
-        json << (i ? ",\n    " : "\n    ") << "{\"directional\": " << (light.w < 0 ? "true" : "false") << ", \"vector\": ";
-        write(json,{light.x,light.y,light.z});
+    // Every light but the sun, with spot lights' cones (Blender's Spot Size and Blend).
+    const std::vector<lights::Light> none;
+    const auto &sceneLights = view.sceneLights ? *view.sceneLights : none;
+    for (std::size_t i = 0; i < sceneLights.size(); ++i) {
+        const auto &light = sceneLights[i];
+        json << (i ? ",\n    " : "\n    ") << "{\"directional\": " << (light.directional ? "true" : "false") << ", \"vector\": ";
+        write(json,{light.vector[0],light.vector[1],light.vector[2]});
         json << ", \"intensity\": ";
-        write(json,std::abs(light.w));
+        write(json,light.intensity);
+        if (!light.directional && light.spotAngle > 0) {
+            json << ", \"spot\": {\"direction\": ";
+            write(json,{light.spotDirection[0],light.spotDirection[1],light.spotDirection[2]});
+            json << ", \"angle\": ";
+            write(json,light.spotAngle);
+            json << ", \"blend\": ";
+            write(json,light.spotBlend);
+            json << '}';
+        }
         json << '}';
     }
     json << "],\n  \"display\": {\"exposure\": ";

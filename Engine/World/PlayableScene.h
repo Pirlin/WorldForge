@@ -35,6 +35,11 @@ struct PlayLight {
     Point3 vector;
     float intensity;
     bool directional;
+    // A spot light points along spotDirection with a full cone of spotAngle radians (0 for a point light), its edge
+    // fading over spotBlend of the cone, as Blender's Spot Size and Blend (format version 17).
+    Point3 spotDirection{0,0,-1};
+    float spotAngle = 0;
+    float spotBlend = 0.15f;
 };
 
 struct PlayableScene {

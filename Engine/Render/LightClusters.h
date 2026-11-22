@@ -38,25 +38,40 @@ struct Light {
     float intensity = 0;               // scene units at 1 m (point) or on a facing surface (directional)
     std::array<float,3> color{1,1,1};  // linear tint
     bool directional = false;
+    // A spot light: the direction it points, its full cone angle in radians (0 for a point light), and how much of the
+    // cone's edge fades out (0 a hard edge, 1 a fade from the axis), as Blender's Spot Size and Blend.
+    std::array<float,3> spotDirection{0,0,-1};
+    float spotAngle = 0, spotBlend = 0.15f;
 };
 
+// Cycles' spot falloff: smoothstep(0, 1, (cos(angle to the axis) - cos(cone / 2)) * scale), with
+// scale = 1 / ((1 - cos(cone / 2)) * blend). A point light uses cos = -2 and scale 1, which always gives 1.
+inline std::array<float,2> spotCone(const Light &light)
+{
+    if (light.directional || light.spotAngle <= 0)
+        return {-2,1};
+    const float half = std::cos(std::clamp(light.spotAngle,0.001f,3.14159f)*0.5f);
+    return {half,light.spotBlend > 0 ? 1/((1-half)*light.spotBlend) : 1e6f};
+}
+
 // The storage buffer Shading.glsl reads, in std430 layout: a header (light count, directional count, shadowed point
-// lights), the cube face matrices of the shadowed lights, then two vec4 per light (the second's w: 1 directional, 0 a
-// point light without shadow, 2 + slot a point light with its shadow in that slot), then each cluster's offset and
-// count, then the light indices the clusters list.
+// lights), the cube face matrices of the shadowed lights, then four vec4 per light (position or direction and range;
+// color times intensity, whose w is 1 for directional, 0 for a point or spot light without shadow, 2 + slot for one with
+// its shadow in that slot; the spot direction and cos(cone / 2); the spot scale), then each cluster's offset and count,
+// then the light indices the clusters list.
 struct Clusters {
     std::array<uint32_t,4> header{};
     // World space to each shadow face's clip space (column-major, Vulkan depth 0 to 1): slot * 6 + face.
     std::array<std::array<float,16>,shadowSlots*6> shadowFaces{};
     // The shadowed lights: position and range per slot, for rendering their faces and noticing when they move.
     std::vector<std::array<float,4>> shadowed;
-    std::vector<std::array<float,4>> lights;      // 2 per light: position or direction and range; color times intensity
+    std::vector<std::array<float,4>> lights;      // 4 per light (see above)
     std::vector<std::array<uint32_t,2>> ranges;   // clusterCount entries: offset, count
     std::vector<uint32_t> indices;
 
     static constexpr std::size_t facesOffset = 16;
     static constexpr std::size_t lightsOffset = facesOffset+std::size_t(shadowSlots)*6*64;
-    static constexpr std::size_t rangesOffset = lightsOffset+std::size_t(maximumLights)*32;
+    static constexpr std::size_t rangesOffset = lightsOffset+std::size_t(maximumLights)*64;
     static constexpr std::size_t indicesOffset = rangesOffset+std::size_t(clusterCount)*8;
     static constexpr std::size_t bufferBytes = indicesOffset+std::size_t(maximumIndices)*4;
 
@@ -141,6 +156,11 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
         result.lights.push_back({light->vector[0],light->vector[1],light->vector[2],reach});
         result.lights.push_back({light->color[0]*light->intensity,light->color[1]*light->intensity,
                                  light->color[2]*light->intensity,light->directional ? 1.0f : 0.0f});
+        const auto cone = spotCone(*light);
+        const auto &d = light->spotDirection;
+        const float length = std::max(std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]),1e-6f);
+        result.lights.push_back({d[0]/length,d[1]/length,d[2]/length,cone[0]});
+        result.lights.push_back({cone[1],0,0,0});
     }
 
     // Each point light's box of clusters: tiles from its projected bounds, slices from its depth range.
@@ -158,7 +178,7 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
     };
     for (std::size_t i = directional; i < ordered.size(); ++i) {
         const auto &light = *ordered[i];
-        const float r = result.lights[i*2][3];
+        const float r = result.lights[i*4][3];
         const auto &c = light.vector;
         const float depth = (c[0]-eye[0])*forward[0]+(c[1]-eye[1])*forward[1]+(c[2]-eye[2])*forward[2];
         if (depth+r < 0)
@@ -202,10 +222,10 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
         candidates.resize(std::size_t(shadowSlots));
     for (std::size_t slot = 0; slot < candidates.size(); ++slot) {
         const auto i = candidates[slot];
-        const auto &place = result.lights[i*2];
+        const auto &place = result.lights[i*4];
         const auto faces = cubeFaces(ordered[i]->vector,place[3]);
         std::copy(faces.begin(),faces.end(),result.shadowFaces.begin()+std::ptrdiff_t(slot*6));
-        result.lights[i*2+1][3] = 2.0f+float(slot);
+        result.lights[i*4+1][3] = 2.0f+float(slot);
         result.shadowed.push_back(place);
     }
     result.header[2] = uint32_t(candidates.size());

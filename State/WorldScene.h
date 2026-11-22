@@ -52,4 +52,10 @@ float lightUnits(const SceneObject &object);
 double lightPhotometric(const SceneObject &object);
 // Stores an authored lux or candela value in details for a light of the given type.
 void setLightPhotometric(QJsonObject &details,const QString &type,double value);
+// A spot light's cone: the full angle in degrees ("coneAngle", default 45, as Blender's Spot Size), how much of its edge
+// fades out ("coneBlend", 0 to 1, default 0.15), and the direction it points (its rotation applied to straight down).
+constexpr double defaultConeAngle = 45, defaultConeBlend = 0.15;
+double spotConeAngle(const SceneObject &object);
+double spotConeBlend(const SceneObject &object);
+QVector3D spotDirection(const SceneObject &object);
 inline constexpr double maximumIlluminance = 500000, maximumLuminousIntensity = 1000000;
