@@ -27,6 +27,11 @@ constexpr int maximumIndices = 65536;
 constexpr float nearDepth = 0.1f, farDepth = 1000.0f;
 constexpr float invisibleRadiance = 2e-6f;
 constexpr float minimumRange = 2, maximumRange = 250;
+// Point light shadows: the shadowSlots point lights nearest the camera each get a cube of six faceSize depth maps,
+// tiled shadowColumns across an atlas (slot s, face f at tile s * 6 + f).
+constexpr int shadowSlots = 8, faceSize = 256, shadowColumns = 8;
+constexpr int shadowAtlasWidth = faceSize*shadowColumns, shadowAtlasHeight = faceSize*(shadowSlots*6/shadowColumns);
+constexpr float shadowNear = 0.05f;
 
 struct Light {
     std::array<float,3> vector{};      // position, or the direction toward a directional light
@@ -35,15 +40,22 @@ struct Light {
     bool directional = false;
 };
 
-// The storage buffer Shading.glsl reads, in std430 layout: a header (light count, directional count), then two vec4 per
-// light, then each cluster's offset and count, then the light indices the clusters list.
+// The storage buffer Shading.glsl reads, in std430 layout: a header (light count, directional count, shadowed point
+// lights), the cube face matrices of the shadowed lights, then two vec4 per light (the second's w: 1 directional, 0 a
+// point light without shadow, 2 + slot a point light with its shadow in that slot), then each cluster's offset and
+// count, then the light indices the clusters list.
 struct Clusters {
     std::array<uint32_t,4> header{};
+    // World space to each shadow face's clip space (column-major, Vulkan depth 0 to 1): slot * 6 + face.
+    std::array<std::array<float,16>,shadowSlots*6> shadowFaces{};
+    // The shadowed lights: position and range per slot, for rendering their faces and noticing when they move.
+    std::vector<std::array<float,4>> shadowed;
     std::vector<std::array<float,4>> lights;      // 2 per light: position or direction and range; color times intensity
     std::vector<std::array<uint32_t,2>> ranges;   // clusterCount entries: offset, count
     std::vector<uint32_t> indices;
 
-    static constexpr std::size_t lightsOffset = 16;
+    static constexpr std::size_t facesOffset = 16;
+    static constexpr std::size_t lightsOffset = facesOffset+std::size_t(shadowSlots)*6*64;
     static constexpr std::size_t rangesOffset = lightsOffset+std::size_t(maximumLights)*32;
     static constexpr std::size_t indicesOffset = rangesOffset+std::size_t(clusterCount)*8;
     static constexpr std::size_t bufferBytes = indicesOffset+std::size_t(maximumIndices)*4;
@@ -53,6 +65,7 @@ struct Clusters {
     {
         auto *bytes = static_cast<unsigned char *>(buffer);
         std::copy_n(reinterpret_cast<const unsigned char *>(header.data()),16,bytes);
+        std::copy_n(reinterpret_cast<const unsigned char *>(shadowFaces.data()),shadowFaces.size()*64,bytes+facesOffset);
         std::copy_n(reinterpret_cast<const unsigned char *>(lights.data()),lights.size()*16,bytes+lightsOffset);
         std::copy_n(reinterpret_cast<const unsigned char *>(ranges.data()),ranges.size()*8,bytes+rangesOffset);
         std::copy_n(reinterpret_cast<const unsigned char *>(indices.data()),indices.size()*4,bytes+indicesOffset);
@@ -71,6 +84,38 @@ inline int slice(float depth)
         return 0;
     const int index = int(std::log(depth/nearDepth)/std::log(farDepth/nearDepth)*slices);
     return std::clamp(index,0,slices-1);
+}
+
+// The six faces of a point light's shadow cube at position, reaching far meters: world space to clip space (column-
+// major, Vulkan depth 0 near to 1 far), each a 90-degree perspective along +x, -x, +y, -y, +z, -z.
+inline std::array<std::array<float,16>,6> cubeFaces(const std::array<float,3> &position,float far)
+{
+    constexpr float axes[6][3]{{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+    constexpr float ups[6][3]{{0,0,1},{0,0,1},{0,0,1},{0,0,1},{0,1,0},{0,1,0}};
+    const float a = far/(shadowNear-far), b = shadowNear*far/(shadowNear-far);
+    std::array<std::array<float,16>,6> result{};
+    for (int face = 0; face < 6; ++face) {
+        const float *forward = axes[face], *up0 = ups[face];
+        // right = forward x up, up = right x forward
+        const float right[3]{forward[1]*up0[2]-forward[2]*up0[1],forward[2]*up0[0]-forward[0]*up0[2],
+                             forward[0]*up0[1]-forward[1]*up0[0]};
+        const float up[3]{right[1]*forward[2]-right[2]*forward[1],right[2]*forward[0]-right[0]*forward[2],
+                          right[0]*forward[1]-right[1]*forward[0]};
+        const auto dot = [&](const float *v) { return v[0]*position[0]+v[1]*position[1]+v[2]*position[2]; };
+        auto &m = result[std::size_t(face)];
+        // Rows: x = right, y = up, z = a * (view depth along -forward) + b, w = depth along forward.
+        for (int column = 0; column < 3; ++column) {
+            m[std::size_t(column*4+0)] = right[column];
+            m[std::size_t(column*4+1)] = up[column];
+            m[std::size_t(column*4+2)] = -a*forward[column];
+            m[std::size_t(column*4+3)] = forward[column];
+        }
+        m[12] = -dot(right);
+        m[13] = -dot(up);
+        m[14] = a*dot(forward)+b;
+        m[15] = -dot(forward);
+    }
+    return result;
 }
 
 // viewProjection maps world space to the camera's clip space (column-major, Vulkan: y down, depth 0 to 1, no TAA
@@ -142,6 +187,28 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
         };
         boxes[i] = {tile(minX,tilesX),tile(maxX,tilesX),tile(minY,tilesY),tile(maxY,tilesY),slice(depth-r),slice(depth+r)};
     }
+
+    // Shadows for the point lights nearest the camera among those on screen.
+    std::vector<std::size_t> candidates;
+    for (std::size_t i = directional; i < ordered.size(); ++i)
+        if (boxes[i].x0 <= boxes[i].x1)
+            candidates.push_back(i);
+    const auto distance = [&](std::size_t i) {
+        const auto &c = ordered[i]->vector;
+        return (c[0]-eye[0])*(c[0]-eye[0])+(c[1]-eye[1])*(c[1]-eye[1])+(c[2]-eye[2])*(c[2]-eye[2]);
+    };
+    std::ranges::stable_sort(candidates,[&](std::size_t a,std::size_t b) { return distance(a) < distance(b); });
+    if (candidates.size() > std::size_t(shadowSlots))
+        candidates.resize(std::size_t(shadowSlots));
+    for (std::size_t slot = 0; slot < candidates.size(); ++slot) {
+        const auto i = candidates[slot];
+        const auto &place = result.lights[i*2];
+        const auto faces = cubeFaces(ordered[i]->vector,place[3]);
+        std::copy(faces.begin(),faces.end(),result.shadowFaces.begin()+std::ptrdiff_t(slot*6));
+        result.lights[i*2+1][3] = 2.0f+float(slot);
+        result.shadowed.push_back(place);
+    }
+    result.header[2] = uint32_t(candidates.size());
 
     // Count, then lay out the lists, then fill them.
     std::vector<uint32_t> counts(std::size_t(clusterCount),0);

@@ -32,13 +32,44 @@ layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles,
 // the map prefiltered for roughness 1/3, 2/3 and 1 at 64 x 32.
 layout(std430, set = 0, binding = 5) readonly buffer SkyEnvironment { vec4 skyMap[]; };
 // The lights and the clusters that list them (Engine/Render/LightClusters.h): a header (light count, directional
-// count); per light, position or direction with range, then color times intensity; each cluster's offset and count.
+// count, shadowed point lights); the shadowed lights' cube faces (slot * 6 + face); per light, position or direction
+// with range, then color times intensity (w: 1 directional, 0 point, 2 + slot a point light with a shadow); each
+// cluster's offset and count.
 layout(std430, set = 0, binding = 6) readonly buffer Clusters {
     uvec4 clusterHeader;
+    mat4 shadowFaces[8*6];
     vec4 lightData[2048];
     uvec2 clusterRanges[16*9*24];
     uint lightIndices[];
 };
+// The point light shadow atlas: 8 cubes of six 256 x 256 depth faces, eight faces to a row (LightClusters.h).
+layout(set = 0, binding = 7) uniform sampler2D pointShadowMap;
+
+// How much of a shadowed point light at lightPosition reaches position (on a surface facing normal): the cube face
+// the point lies in, looked up with four samples around it.
+float pointShadow(uint slot,vec3 position,vec3 normal,vec3 lightPosition)
+{
+    vec3 offset = position-lightPosition;
+    vec3 size = abs(offset);
+    int face = size.x >= size.y && size.x >= size.z ? (offset.x > 0.0 ? 0 : 1)
+        : size.y >= size.z ? (offset.y > 0.0 ? 2 : 3) : (offset.z > 0.0 ? 4 : 5);
+    // Off the surface by about a texel of the face (which grows with distance), toward the light.
+    float texel = 2.0*max(size.x,max(size.y,size.z))/256.0;
+    vec3 n = dot(normal,offset) > 0.0 ? -normal : normal;
+    vec3 moved = position+n*texel*1.5-normalize(offset)*texel;
+    vec4 clip = shadowFaces[slot*6u+uint(face)]*vec4(moved,1.0);
+    vec3 c = clip.xyz/clip.w;
+    int tile = int(slot)*6+face;
+    vec2 uv = clamp(c.xy*0.5+0.5,vec2(1.0/256.0),vec2(1.0-1.0/256.0));
+    vec2 atlas = vec2(textureSize(pointShadowMap,0));
+    vec2 base = vec2(float(tile%8),float(tile/8))*256.0;
+    float visible = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        vec2 at = base+uv*256.0+vec2(i%2 == 0 ? -0.5 : 0.5,i/2 == 0 ? -0.5 : 0.5);
+        visible += step(c.z,textureLod(pointShadowMap,at/atlas,0.0).r);
+    }
+    return visible*0.25;
+}
 
 const float skyPi = 3.14159265359;
 

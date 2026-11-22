@@ -299,6 +299,20 @@ void checkLightClusters()
     require(listed(1) > 0 && listed(2) == 0, "A lamp whose light ends behind the camera is listed in no cluster");
     require(std::abs(lights::range(0.02f)-100) < 1 && lights::range(1e-9f) == lights::minimumRange,
             "A lamp's range follows its intensity");
+    // Point light shadows: the nearest on-screen lamp gets slot 0, and its cube faces see points in their own direction
+    // at the center, with depth growing from the near plane to the light's range.
+    require(clusters.header[2] == 1 && clusters.lights[3][3] == 2.0f && clusters.shadowed.size() == 1,
+            "The nearest lamp on screen gets a point light shadow");
+    const auto faces = lights::cubeFaces({2,0,3},20);
+    const auto project = [](const std::array<float,16> &m,float x,float y,float z) {
+        const float w = m[3]*x+m[7]*y+m[11]*z+m[15];
+        return std::array<float,3>{(m[0]*x+m[4]*y+m[8]*z+m[12])/w,(m[1]*x+m[5]*y+m[9]*z+m[13])/w,
+                                   (m[2]*x+m[6]*y+m[10]*z+m[14])/w};
+    };
+    const auto near = project(faces[0],3,0,3), far = project(faces[0],21.9f,0,3), below = project(faces[5],2,0,-2);
+    require(std::abs(near[0]) < 1e-4f && std::abs(near[1]) < 1e-4f && near[2] > 0 && near[2] < far[2] && far[2] < 1
+            && std::abs(below[0]) < 1e-4f && std::abs(below[1]) < 1e-4f,
+            "Point light shadow faces look along their axes with depth from near to the light's range");
 }
 
 int main(int argc,char *argv[])

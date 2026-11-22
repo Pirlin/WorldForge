@@ -50,6 +50,8 @@ public:
     // The sky visibility maps (Engine/Render/SkyVisibility.h), rendered with pass() like the shadow atlas.
     // One set shared by all frames: the viewport re-renders it only when the scene changes.
     VkFramebuffer skyFramebuffer() const { return sky_.framebuffer; }
+    // The point light shadow atlas (LightClusters.h), shared by all frames like the sky maps.
+    VkFramebuffer pointShadowFramebuffer() const { return pointShadows_.framebuffer; }
     VkRenderPass pass() const { return pass_; }
     VkDescriptorSetLayout layout() const { return layout_; }
 
@@ -75,7 +77,7 @@ private:
         VkDescriptorSet set{};
     };
     bool createFrame(Frame &frame,VkFormat format);
-    bool createDepthTarget(DepthTarget &target,VkFormat format,uint32_t size);
+    bool createDepthTarget(DepthTarget &target,VkFormat format,uint32_t width,uint32_t height);
     void destroyDepthTarget(const DepthTarget &target);
     bool allocate(VkDeviceMemory &memory,VkMemoryRequirements requirements,VkMemoryPropertyFlags properties);
     QVulkanDeviceFunctions *vk_ = nullptr;
@@ -87,5 +89,5 @@ private:
     VkSampler sampler_{};
     VkDeviceSize textureBytes_{};
     std::vector<Frame> frames_;
-    DepthTarget sky_;
+    DepthTarget sky_, pointShadows_;
 };

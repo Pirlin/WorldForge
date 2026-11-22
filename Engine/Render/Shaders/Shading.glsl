@@ -144,8 +144,10 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
         float distanceSquared = max(dot(offset,offset),0.01);
         // Inverse-square falloff, faded to zero over the last part of the light's range.
         float fade = clamp(1.0-pow(distanceSquared/(place.w*place.w),2.0),0.0,1.0);
-        result += directLight(surface,v,offset*inversesqrt(distanceSquared),1.0,energy)*lightData[2u*i+1u].rgb
-            *(fade*fade/distanceSquared);
+        vec4 light = lightData[2u*i+1u];
+        float shadow = light.w >= 2.0 ? pointShadow(uint(light.w-1.5),position,surface.normal,place.xyz) : 1.0;
+        result += directLight(surface,v,offset*inversesqrt(distanceSquared),1.0,energy)*light.rgb
+            *(fade*fade*shadow/distanceSquared);
     }
     vec3 specularColor = (f0*brdf.x+brdf.y)*energy;
     vec3 r = reflect(-v,surface.normal);

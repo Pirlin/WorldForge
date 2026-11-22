@@ -229,6 +229,14 @@ private:
     bool skyValid_ = false, skyInitialized_ = false;
     uint32_t skyAge_ = 0;
     void updateSky(View &view);
+    // Point light shadow cubes (LightClusters.h), shared by all frames like the sky maps: re-rendered when the shadowed
+    // lights change, and every skyRefreshFrames frames for moving objects.
+    vk::Image pointShadowImage_;
+    VkFramebuffer pointShadowFramebuffer_{};
+    std::vector<std::array<float,4>> pointShadowsRendered_;
+    uint32_t pointShadowAge_ = 0;
+    bool pointShadowsInitialized_ = false;
+    lights::Clusters clusters_; // the clusters prepare built for this frame
     vk::Buffer readback_;
     float adaptedStops_ = std::numeric_limits<float>::quiet_NaN();
     std::chrono::steady_clock::time_point adaptedAt_{};
@@ -387,11 +395,12 @@ bool VulkanRenderer::createLayouts()
         {3,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,both,nullptr},
         {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
+        {6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
     std::array<VkDescriptorSetLayoutBinding,5> materialBindings{};
     for (uint32_t i = 0; i < materialBindings.size(); ++i)
         materialBindings[i] = {i,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
-    const VkDescriptorSetLayoutCreateInfo frameInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,6,frameBindings};
+    const VkDescriptorSetLayoutCreateInfo frameInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,7,frameBindings};
     const VkDescriptorSetLayoutCreateInfo materialInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,
         uint32_t(materialBindings.size()),materialBindings.data()};
     if (api_.vkCreateDescriptorSetLayout(device,&frameInfo,nullptr,&frameLayout_) != VK_SUCCESS
@@ -526,7 +535,7 @@ bool VulkanRenderer::createPipelines()
 
 bool VulkanRenderer::createFrames()
 {
-    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2*framesInFlight},
+    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,3*framesInFlight},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2*framesInFlight},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2*framesInFlight}};
     const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,framesInFlight,3,sizes};
     if (api_.vkCreateDescriptorPool(device,&pool,nullptr,&framePool_) != VK_SUCCESS)
@@ -538,6 +547,15 @@ bool VulkanRenderer::createFrames()
         1,&skyImage_.view,sky::atlasSize,sky::atlasSize,1};
     if (api_.vkCreateFramebuffer(device,&skyFramebuffer,nullptr,&skyFramebuffer_) != VK_SUCCESS)
         return false;
+    if (!pointShadowImage_.create(device_,frame_.depthFormat(),{lights::shadowAtlasWidth,lights::shadowAtlasHeight},
+                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,VK_IMAGE_ASPECT_DEPTH_BIT))
+        return false;
+    const VkFramebufferCreateInfo pointShadowFramebuffer{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,nullptr,0,shadowPass_,
+        1,&pointShadowImage_.view,lights::shadowAtlasWidth,lights::shadowAtlasHeight,1};
+    if (api_.vkCreateFramebuffer(device,&pointShadowFramebuffer,nullptr,&pointShadowFramebuffer_) != VK_SUCCESS)
+        return false;
+    pointShadowsRendered_.clear();
+    pointShadowsInitialized_ = false;
     skyValid_ = skyInitialized_ = false;
     for (auto &frame : frames_) {
         const VkCommandBufferAllocateInfo command{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,nullptr,pool_,
@@ -562,6 +580,7 @@ bool VulkanRenderer::createFrames()
         if (api_.vkCreateFramebuffer(device,&framebuffer,nullptr,&frame.shadowFramebuffer) != VK_SUCCESS)
             return false;
         const VkDescriptorImageInfo skyMaps{shadowSampler_,skyImage_.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+        const VkDescriptorImageInfo pointShadows{shadowSampler_,pointShadowImage_.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
         const VkDescriptorImageInfo shadow{shadowSampler_,frame.shadow.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
         const VkDescriptorBufferInfo lighting{frame.lighting.buffer,0,sizeof(LightingBlock)};
         const VkDescriptorBufferInfo view{frame.view.buffer,0,sizeof(PlayViewBlock)};
@@ -573,8 +592,9 @@ bool VulkanRenderer::createFrames()
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,3,0,1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,nullptr,&view,nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,4,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&skyMaps,nullptr,nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,5,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&environment,nullptr},
-            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,6,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&clusters,nullptr}};
-        api_.vkUpdateDescriptorSets(device,6,writes,0,nullptr);
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,6,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&clusters,nullptr},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,7,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&pointShadows,nullptr,nullptr}};
+        api_.vkUpdateDescriptorSets(device,7,writes,0,nullptr);
     }
     return true;
 }
@@ -827,10 +847,10 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
         XMFLOAT3 forward;
         XMStoreFloat3(&forward,XMVector3Normalize(XMVectorSubtract(unproject(1),unproject(0))));
         const std::array eye{view.eye.x,view.eye.y,view.eye.z};
-        const auto clusters = lights::build(view.sceneLights ? std::span<const lights::Light>(*view.sceneLights)
-                                                             : std::span<const lights::Light>{},
-                                            matrix,eye,{forward.x,forward.y,forward.z});
-        clusters.write(frame.clusters.mapped);
+        clusters_ = lights::build(view.sceneLights ? std::span<const lights::Light>(*view.sceneLights)
+                                                   : std::span<const lights::Light>{},
+                                  matrix,eye,{forward.x,forward.y,forward.z});
+        clusters_.write(frame.clusters.mapped);
         lighting.clusterForward = {forward.x,forward.y,forward.z,0};
         lighting.clusterViewport = {float(width),float(height),0,0};
     }
@@ -936,6 +956,39 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
                 api_.vkCmdSetScissor(command,0,1,&tile);
                 CameraConstants camera{};
                 std::memcpy(&camera.matrix,view.skyVisibility.matrices[direction].data(),sizeof(camera.matrix));
+                camera.eye.w = view.lighting.z;
+                api_.vkCmdPushConstants(command,shadowLayout_,VK_SHADER_STAGE_VERTEX_BIT,0,sizeof(camera),&camera);
+                api_.vkCmdDraw(command,uint32_t(vertexCount),1,0,0);
+            }
+        }
+        api_.vkCmdEndRenderPass(command);
+    }
+
+
+    // Point light shadow cubes (LightClusters.h): re-rendered when the shadowed lights change, and every
+    // skyRefreshFrames frames for moving objects; cleared once before first use.
+    const bool pointShadowsChanged = clusters_.shadowed != pointShadowsRendered_;
+    if (!pointShadowsInitialized_
+        || (!clusters_.shadowed.empty() && (pointShadowsChanged || ++pointShadowAge_ >= skyRefreshFrames))) {
+        pointShadowsInitialized_ = true;
+        pointShadowsRendered_ = clusters_.shadowed;
+        pointShadowAge_ = 0;
+        const VkRect2D atlas{{0,0},{lights::shadowAtlasWidth,lights::shadowAtlasHeight}};
+        const VkRenderPassBeginInfo pointBegin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,shadowPass_,
+            pointShadowFramebuffer_,atlas,1,&clearDepth};
+        api_.vkCmdBeginRenderPass(command,&pointBegin,VK_SUBPASS_CONTENTS_INLINE);
+        if (vertexCount && !clusters_.shadowed.empty()) {
+            api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline_);
+            api_.vkCmdBindVertexBuffers(command,0,1,&frame.vertices.buffer,&offset);
+            for (std::size_t tile = 0; tile < clusters_.shadowed.size()*6; ++tile) {
+                const auto x = uint32_t(tile%lights::shadowColumns)*lights::faceSize;
+                const auto y = uint32_t(tile/lights::shadowColumns)*lights::faceSize;
+                const VkViewport viewport{float(x),float(y),float(lights::faceSize),float(lights::faceSize),0,1};
+                const VkRect2D face{{int32_t(x),int32_t(y)},{lights::faceSize,lights::faceSize}};
+                api_.vkCmdSetViewport(command,0,1,&viewport);
+                api_.vkCmdSetScissor(command,0,1,&face);
+                CameraConstants camera{};
+                std::memcpy(&camera.matrix,clusters_.shadowFaces[tile].data(),sizeof(camera.matrix));
                 camera.eye.w = view.lighting.z;
                 api_.vkCmdPushConstants(command,shadowLayout_,VK_SHADER_STAGE_VERTEX_BIT,0,sizeof(camera),&camera);
                 api_.vkCmdDraw(command,uint32_t(vertexCount),1,0,0);
@@ -1158,6 +1211,10 @@ void VulkanRenderer::release()
             api_.vkDestroyFramebuffer(device,skyFramebuffer_,nullptr);
         skyFramebuffer_ = VK_NULL_HANDLE;
         skyImage_.destroy(device_);
+        if (pointShadowFramebuffer_)
+            api_.vkDestroyFramebuffer(device,pointShadowFramebuffer_,nullptr);
+        pointShadowFramebuffer_ = VK_NULL_HANDLE;
+        pointShadowImage_.destroy(device_);
         readback_.destroy(device_);
         for (auto &texture : textures_)
             texture.destroy(device_);

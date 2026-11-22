@@ -2200,6 +2200,7 @@ public:
             window_.owner_.setRenderDevice(QString::fromUtf8(window_.physicalDeviceProperties()->deviceName), {}, 0, 0);
         frames_.resize(window_.concurrentFrameCount());
         skyValid_ = skyInitialized_ = false;
+        pointShadowsInitialized_ = false;
         if (!lighting_.create(window_,vk_,window_.modelOnly_)) {
             window_.report(QObject::tr("Vulkan could not allocate shadow resources."));
             return;
@@ -2449,12 +2450,27 @@ public:
             && lighting_.uploadEnvironment(frameIndex,skyLight.environment,skyRevision)
             && lighting_.uploadClusters(frameIndex,lightClusters);
         if (ready) {
-            recordDepthTiles(command,frame,lighting_.framebuffer(frameIndex),WorldLightingVulkan::shadowSize,wf::shadow::tileSize,
+            recordDepthTiles(command,frame,lighting_.framebuffer(frameIndex),WorldLightingVulkan::shadowSize,WorldLightingVulkan::shadowSize,
+                             wf::shadow::tileSize,
                              shadows,geometry.triangles.size(),cascades.matrices,windTime);
             if (skyRefresh || !skyInitialized_) {
-                recordDepthTiles(command,frame,lighting_.skyFramebuffer(),wf::sky::atlasSize,wf::sky::tileSize,
+                recordDepthTiles(command,frame,lighting_.skyFramebuffer(),wf::sky::atlasSize,wf::sky::atlasSize,wf::sky::tileSize,
                                  skyRefresh,geometry.triangles.size(),skyVisibility.matrices,windTime);
                 skyInitialized_ = true;
+            }
+            // Point light shadow cubes (LightClusters.h): at once after an edit or when the shadowed lights change, and at
+            // most every skyRefreshFrames frames while a running game moves objects.
+            const bool pointChanged = lightClusters.shadowed != pointShadowsRendered_
+                || (pointShadowRevision_ != window_.geometryRevision_ && (!window_.runtime_ || ++pointShadowAge_ >= skyRefreshFrames));
+            if (!pointShadowsInitialized_ || (!lightClusters.shadowed.empty() && pointChanged)) {
+                recordDepthTiles(command,frame,lighting_.pointShadowFramebuffer(),wf::lights::shadowAtlasWidth,
+                                 wf::lights::shadowAtlasHeight,wf::lights::faceSize,!lightClusters.shadowed.empty(),
+                                 geometry.triangles.size(),std::span(lightClusters.shadowFaces).first(lightClusters.shadowed.size()*6),
+                                 windTime);
+                pointShadowsInitialized_ = true;
+                pointShadowsRendered_ = lightClusters.shadowed;
+                pointShadowRevision_ = window_.geometryRevision_;
+                pointShadowAge_ = 0;
             }
         } else {
             skyValid_ = false; // nothing was drawn; render the maps on the next ready frame
@@ -2603,11 +2619,11 @@ private:
 
     // Renders the scene's depth into square tiles of an atlas, one per matrix: the sun shadow cascades or the
     // sky visibility maps. The atlas is always cleared, so it is ready to sample even when nothing is drawn.
-    void recordDepthTiles(VkCommandBuffer command,const Buffer &frame,VkFramebuffer framebuffer,uint32_t size,
+    void recordDepthTiles(VkCommandBuffer command,const Buffer &frame,VkFramebuffer framebuffer,uint32_t width,uint32_t height,
                           uint32_t tileSize,bool draw,std::size_t count,std::span<const wf::shadow::Matrix> matrices,float wind)
     {
-        const VkRect2D area{{0,0},{size,size}};
-        const uint32_t columns = size/tileSize;
+        const VkRect2D area{{0,0},{width,height}};
+        const uint32_t columns = width/tileSize;
         VkClearValue clear{};
         clear.depthStencil = {1,0};
         const VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,lighting_.pass(),
@@ -2862,6 +2878,11 @@ private:
     bool skyValid_ = false, skyInitialized_ = false;
     quint64 skyRevision_ = 0;
     uint32_t skyAge_ = 0;
+    // The point light shadow cubes as last rendered.
+    std::vector<std::array<float,4>> pointShadowsRendered_;
+    quint64 pointShadowRevision_ = 0;
+    uint32_t pointShadowAge_ = 0;
+    bool pointShadowsInitialized_ = false;
     bool previousValid_ = false;
 };
 
