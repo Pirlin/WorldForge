@@ -83,7 +83,11 @@ Settings flow through these files:
 - Contact shadows
 
 ## Next, in order
-1. **Per-object motion vectors.** Today motion blur and TAA reprojection use only the camera's motion. Plan: a velocity target written by the scene shaders from each object's previous transform (the editor and the Player both know when objects move in Play), read by TAA reprojection and `MotionBlur.frag`.
+1. **Per-object motion vectors.** Today TAA reprojection and motion blur use only the camera's motion, so moving cars ghost under TAA. Plan (designed, not started):
+   - Both renderers rebuild moving objects' world-space vertices on the CPU each frame (`Player/main.cpp` `vertices()`, the editor's `Geometry::triangles`). Keep the previous frame's positions as a second, tightly packed vertex stream (one `Point3` per vertex, binding 1), uploaded with each frame. When the vertex count or order changed since the last frame, upload the current positions instead (no object motion for that frame).
+   - The scene vertex shaders pass two clip positions, both through the previous frame's camera (`lighting.previousViewProjection`, which must then always hold the previous camera, with separate on flags): the previous position and the current one. The fragment writes their screen-space difference (object motion only) to a fourth scene target, `velocity` (R16G16_SFLOAT, cleared to 0, so sky and static geometry need nothing).
+   - `Temporal.frag` adds the velocity at the nearest-depth neighbour to its camera reprojection; `MotionBlur.frag` adds it to the camera motion. Both pipelines' blend states and the scene framebuffer gain the attachment (`HdrFrame::sceneColorAttachments` becomes 4).
+   - Test: in the street audit's Player run with traffic, or a rendering audit case that renders two frames with a moved object and checks the blur direction.
 2. **R2 materials:**
    - clear coat, sheen, transmission and glass
    - subsurface and anisotropy
