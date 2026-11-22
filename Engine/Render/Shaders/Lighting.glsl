@@ -26,9 +26,11 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     vec4 skyDirections[16];
     vec4 skySettings;      // sky visibility maps on, their meters per texel, physical sky on, unused
     vec4 sunTint;          // the color of sunlight at the ground, luminance 1 (white for the gradient sky)
-    // Screen-space reflections and contact shadows (Shading.glsl), which trace the previous frame: its clip space
-    // without jitter, and settings (reflections on, the longest reflection ray in meters, contact shadows on, unused;
-    // each on only when there is a previous frame to trace).
+    // The previous frame: its clip space without jitter (always set; the current one on the first frame), and settings
+    // (screen-space reflections on, the longest reflection ray in meters, contact shadows on, each on only when there
+    // is a previous frame to trace; the previous frame's wind time in seconds). Screen-space reflections and contact
+    // shadows (Shading.glsl) trace the previous frame; the scene vertex shaders read these two members alone
+    // (SceneMotion.glsl) for each surface's motion.
     mat4 previousViewProjection;
     vec4 reflectionSettings;
 } lighting;
@@ -287,4 +289,14 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
         transmission *= 1.0-opacity;
     }
     return vec4(inscatter,1.0-transmission);
+}
+
+// This surface's own motion on the previous frame's screen in UV units (HdrFrame::velocityFormat), from the two clip
+// positions the scene vertex shaders pass (SceneMotion.glsl): where it was and where it is, both through the previous
+// frame's camera.
+vec2 surfaceMotionOf(vec4 previousClip,vec4 currentClip)
+{
+    if (previousClip.w <= 0.0 || currentClip.w <= 0.0)
+        return vec2(0.0);
+    return (previousClip.xy/previousClip.w-currentClip.xy/currentClip.w)*0.5;
 }

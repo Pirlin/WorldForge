@@ -3239,6 +3239,78 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
     while (store.history().index() > historyStart && store.history().canUndo())
         store.history().undo();
 
+    // Per-object motion: a box falling in Simulate. Paused, nothing moves and its top edge is sharp. One physics step
+    // later, motion blur smears that edge along the fall; the camera is still, so only the box's own motion (the scene's
+    // velocity target) can do that.
+    const Shot fallShot{"falling-box",{-150,-66,2.5f},{-150,-58,2.5f}};
+    store.addCube();
+    if (const auto *selected = store.selectedObject()) {
+        auto ground = *selected;
+        ground.position = {-150,-58,0.05f};
+        ground.scale = {8,8,0.1f};
+        store.updateObject(ground,"Fall ground");
+    }
+    store.addCube();
+    QString fallingId;
+    if (const auto *selected = store.selectedObject()) {
+        auto box = *selected;
+        box.position = {-150,-58,6.5f};
+        box.details.insert("physics","Dynamic");
+        store.updateObject(box,"Falling box");
+        fallingId = box.id;
+    }
+    store.select({});
+    setDisplay({{"fogDensity",0},{"localFogRadius",0},{"bloom",false},{"motionBlur",true},{"shutter",1.0}});
+    // The sharpest step in brightness down the middle columns near row, within reach rows: the box's top edge.
+    const auto edgeSharpness = [](const QImage &image,int row,int reach) {
+        double total = 0;
+        int columns = 0;
+        for (int x = image.width()/2-8; x <= image.width()/2+8; ++x) {
+            double sharpest = 0;
+            for (int y = std::max(row-reach,0); y < std::min(row+reach,image.height()-1); ++y) {
+                const QColor a = image.pixel(x,y), b = image.pixel(x,y+1);
+                sharpest = std::max(sharpest,double(std::abs(a.lightnessF()-b.lightnessF())));
+            }
+            total += sharpest;
+            ++columns;
+        }
+        return columns ? total/columns : 0.0;
+    };
+    view.setCameraPreview(fallShot.eye,fallShot.target);
+    QImage stillFall, movingFall;
+    if (!fallingId.isEmpty() && view.start(LiveViewport::RunMode::Simulate)) {
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            const auto position = view.runtimePosition(fallingId);
+            if (position && position->z() < 3.2f)
+                break;
+            QTest::qWait(5);
+        }
+        view.pause(true);
+        for (int frame = 0; frame < 12; ++frame)
+            stillFall = view.captureFrame();
+        view.step();
+        movingFall = view.captureFrame();
+        view.stop();
+    }
+    stillFall.save(output.filePath("rendering-falling-box-still.png"));
+    movingFall.save(output.filePath("rendering-falling-box-moving.png"));
+    // The box's top edge: the first strong step from the sky down the middle of the still frame.
+    int edgeRow = -1;
+    for (int y = 0; !stillFall.isNull() && edgeRow < 0 && y < stillFall.height()*3/4; ++y) {
+        const QColor a = stillFall.pixel(stillFall.width()/2,y), b = stillFall.pixel(stillFall.width()/2,y+1);
+        if (std::abs(a.lightnessF()-b.lightnessF()) > 0.08f)
+            edgeRow = y;
+    }
+    const double stillSharpness = edgeRow < 0 ? 0 : edgeSharpness(stillFall,edgeRow,4);
+    // The box falls a few pixels in one step; the search stays well above its lower edge.
+    const double movingSharpness = edgeRow < 0 || movingFall.isNull() ? 0 : edgeSharpness(movingFall,edgeRow,12);
+    audit.check(page,"motion","Motion blur smears a falling box by its own motion",
+                stillSharpness > 0.08 && movingSharpness < 0.7*stillSharpness,
+                QString("Sharpest step at the top edge: %1 paused, %2 one step later.")
+                    .arg(stillSharpness,0,'f',3).arg(movingSharpness,0,'f',3));
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+
     setDisplay({{"ev100",22},{"exposureMode","Manual"}});
     const auto tooDark = capture(shots[0].eye,shots[0].target);
     setDisplay({{"exposureMode","Auto"}});

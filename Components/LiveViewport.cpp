@@ -2208,6 +2208,8 @@ public:
         if (window_.owner_.rendererName().isEmpty())
             window_.owner_.setRenderDevice(QString::fromUtf8(window_.physicalDeviceProperties()->deviceName), {}, 0, 0);
         frames_.resize(window_.concurrentFrameCount());
+        motionFrames_.resize(window_.concurrentFrameCount());
+        motionValid_ = false;
         skyValid_ = skyInitialized_ = false;
         pointShadowsInitialized_ = false;
         if (!lighting_.create(window_,vk_,window_.modelOnly_)) {
@@ -2273,6 +2275,9 @@ public:
         for (auto &frame : frames_)
             destroy(frame);
         frames_.clear();
+        for (auto &frame : motionFrames_)
+            destroy(frame);
+        motionFrames_.clear();
         if (layout_)
             vk_->vkDestroyPipelineLayout(device_, layout_, nullptr);
         lighting_.destroy();
@@ -2405,10 +2410,14 @@ public:
         const bool traceable = !window_.modelOnly_ && !window_.ortho_ && previousValid_ && frame_.previousFrameReady();
         const bool reflections = environment.reflections && traceable;
         const bool contactShadows = environment.contactShadows && shadows && traceable;
-        std::copy_n((traceable ? previousCamera_ : QMatrix4x4()).constData(),16,lighting.previousViewProjection);
+        // The previous camera also gives each surface's motion (SceneMotion.glsl), so it is always set.
+        std::copy_n((previousValid_ ? previousCamera_ : window_.camera(size)).constData(),16,lighting.previousViewProjection);
         lighting.reflectionSettings[0] = reflections ? 1.0f : 0.0f;
         lighting.reflectionSettings[1] = wf::vk::HdrFrame::reflectionRange;
         lighting.reflectionSettings[2] = contactShadows ? 1.0f : 0.0f;
+        lighting.reflectionSettings[3] = previousWindValid_ ? previousWindTime_ : windTime;
+        previousWindTime_ = windTime;
+        previousWindValid_ = true;
         for (std::size_t i = 0; i < 9; ++i)
             std::copy_n(skyLight.irradiance[i].data(),4,lighting.skyIrradiance[i]);
         std::copy_n(skyLight.horizon.data(),3,lighting.skyHorizon);
@@ -2475,7 +2484,8 @@ public:
         const auto frameIndex = window_.currentFrame();
         const auto exposure = exposureFor(environment,frameIndex);
         const bool ready = triangles_ && lines_ && sky_ && shadow_
-            && (!hasGeometry || upload(frame,geometry,window_.geometryRevision_)) && lighting_.upload(frameIndex,lighting)
+            && (!hasGeometry || (upload(frame,geometry,window_.geometryRevision_)
+                && uploadMotion(motionFrames_.at(window_.currentFrame()),geometry,window_.geometryRevision_))) && lighting_.upload(frameIndex,lighting)
             && lighting_.uploadTextures(frameIndex,window_.modelOnly_ ? geometry.texturePixels : window_.worldTexturePixels_,
                 window_.textureRevision_)
             && lighting_.uploadEnvironment(frameIndex,skyLight.environment,skyRevision)
@@ -2546,9 +2556,12 @@ public:
             uniforms.eye[3] = windTime;
             std::copy_n(sceneCamera.constData(),16,uniforms.matrix);
             vk_->vkCmdPushConstants(command, layout_, shaderStages, 0, sizeof(uniforms), &uniforms);
-            const VkDeviceSize offset = 0;
-            if (hasGeometry)
-                vk_->vkCmdBindVertexBuffers(command, 0, 1, &frame.buffer, &offset);
+            if (hasGeometry) {
+                // Binding 1: the previous frame's positions, for each surface's motion (uploadMotion).
+                const VkBuffer buffers[]{frame.buffer,motionFrames_.at(window_.currentFrame()).buffer};
+                const VkDeviceSize offsets[]{0,0};
+                vk_->vkCmdBindVertexBuffers(command,0,2,buffers,offsets);
+            }
             if (!geometry.triangles.empty() && (!window_.modelOnly_ || window_.modelShading_ != ModelShading::Wireframe)) {
                 vk_->vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, triangles_);
                 vk_->vkCmdDraw(command, uint32_t(geometry.triangles.size()), 1, 0, 0);
@@ -2626,6 +2639,7 @@ private:
         VkDeviceSize capacity{};
         quint64 revision = 0;
         std::set<ModelComponent> highlights;
+        bool moving = false; // uploadMotion: holds the previous frame's positions, not each vertex's own
     };
     // Depth of field and motion blur from the project's camera settings; world views only.
     ViewportFrameVulkan::Camera cameraEffects(const WorldAtmosphere &environment,const QMatrix4x4 &toWorld,const QVector3D &eye,
@@ -2705,6 +2719,77 @@ private:
             vk_->vkFreeMemory(device_, buffer.memory, nullptr);
         buffer = {};
     }
+    // A host-visible vertex buffer of at least bytes.
+    bool reserve(Buffer &buffer,VkDeviceSize bytes)
+    {
+        if (buffer.capacity >= bytes && buffer.buffer)
+            return true;
+        destroy(buffer);
+        VkBufferCreateInfo desc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        desc.size = std::max<VkDeviceSize>(bytes, 4096);
+        desc.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        if (vk_->vkCreateBuffer(device_, &desc, nullptr, &buffer.buffer) != VK_SUCCESS)
+            return false;
+        VkMemoryRequirements requirements;
+        vk_->vkGetBufferMemoryRequirements(device_, buffer.buffer, &requirements);
+        VkPhysicalDeviceMemoryProperties memory;
+        window_.vulkanInstance()->functions()->vkGetPhysicalDeviceMemoryProperties(window_.physicalDevice(), &memory);
+        uint32_t index = 0;
+        constexpr auto flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        while (index < memory.memoryTypeCount && (!(requirements.memoryTypeBits & (1u<<index))
+               || (memory.memoryTypes[index].propertyFlags & flags) != flags))
+            ++index;
+        const VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, requirements.size, index};
+        if (index == memory.memoryTypeCount || vk_->vkAllocateMemory(device_, &allocation, nullptr, &buffer.memory) != VK_SUCCESS
+            || vk_->vkBindBufferMemory(device_, buffer.buffer, buffer.memory, 0) != VK_SUCCESS) {
+            destroy(buffer);
+            return false;
+        }
+        buffer.capacity = desc.size;
+        return true;
+    }
+
+    // The previous frame's position of every vertex, parallel to the vertex buffer (binding 1 of Scene.vert), for each
+    // surface's motion. Objects move by rebuilding the geometry (Play and Simulate), so on the first frame of a new
+    // geometry revision the triangles carry their positions from the frame before; on every other frame, and when the
+    // triangles changed in number, each vertex's own position (no motion). Called once per frame.
+    bool uploadMotion(Buffer &buffer,const Geometry &geometry,quint64 revision)
+    {
+        const std::size_t count = geometry.triangles.size()+geometry.lines.size()+geometry.overlays.size()
+            +geometry.selectionOutline.size();
+        const bool changed = !motionValid_ || revision != motionRevision_;
+        const bool moving = changed && motionValid_ && lastPositions_.size() == geometry.triangles.size();
+        const auto bytes = VkDeviceSize(std::max<std::size_t>(count,1)*sizeof(std::array<float,3>));
+        if (moving || buffer.moving || buffer.revision != revision || buffer.capacity < bytes || !buffer.buffer) {
+            if (!reserve(buffer,bytes))
+                return false;
+            void *target = nullptr;
+            if (vk_->vkMapMemory(device_,buffer.memory,0,bytes,0,&target) != VK_SUCCESS)
+                return false;
+            auto *positions = static_cast<std::array<float,3> *>(target);
+            std::size_t next = 0;
+            for (const auto *part : {&geometry.triangles,&geometry.lines,&geometry.overlays,&geometry.selectionOutline})
+                for (const auto &vertex : *part) {
+                    const bool triangle = part == &geometry.triangles;
+                    positions[next] = triangle && moving ? lastPositions_[next]
+                        : std::array<float,3>{vertex.position[0],vertex.position[1],vertex.position[2]};
+                    ++next;
+                }
+            vk_->vkUnmapMemory(device_,buffer.memory);
+            buffer.moving = moving;
+            buffer.revision = revision;
+        }
+        if (changed) {
+            lastPositions_.resize(geometry.triangles.size());
+            for (std::size_t i = 0; i < geometry.triangles.size(); ++i)
+                lastPositions_[i] = {geometry.triangles[i].position[0],geometry.triangles[i].position[1],
+                                     geometry.triangles[i].position[2]};
+            motionRevision_ = revision;
+            motionValid_ = true;
+        }
+        return true;
+    }
+
     bool upload(Buffer &buffer,const Geometry &geometry,quint64 revision)
     {
         const auto &selection = window_.selection_;
@@ -2717,30 +2802,8 @@ private:
         const auto overlayBytes = geometry.overlays.size()*sizeof(Vertex);
         const auto outlineBytes = geometry.selectionOutline.size()*sizeof(Vertex);
         const auto bytes = triangleBytes + lineBytes + overlayBytes + outlineBytes;
-        if (buffer.capacity < bytes) {
-            destroy(buffer);
-            VkBufferCreateInfo desc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            desc.size = std::max<VkDeviceSize>(bytes, 4096);
-            desc.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-            if (vk_->vkCreateBuffer(device_, &desc, nullptr, &buffer.buffer) != VK_SUCCESS)
-                return false;
-            VkMemoryRequirements requirements;
-            vk_->vkGetBufferMemoryRequirements(device_, buffer.buffer, &requirements);
-            VkPhysicalDeviceMemoryProperties memory;
-            window_.vulkanInstance()->functions()->vkGetPhysicalDeviceMemoryProperties(window_.physicalDevice(), &memory);
-            uint32_t index = 0;
-            constexpr auto flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            while (index < memory.memoryTypeCount && (!(requirements.memoryTypeBits & (1u<<index))
-                   || (memory.memoryTypes[index].propertyFlags & flags) != flags))
-                ++index;
-            const VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, requirements.size, index};
-            if (index == memory.memoryTypeCount || vk_->vkAllocateMemory(device_, &allocation, nullptr, &buffer.memory) != VK_SUCCESS
-                || vk_->vkBindBufferMemory(device_, buffer.buffer, buffer.memory, 0) != VK_SUCCESS) {
-                destroy(buffer);
-                return false;
-            }
-            buffer.capacity = desc.size;
-        }
+        if (!reserve(buffer,bytes))
+            return false;
         void *target = nullptr;
         if (vk_->vkMapMemory(device_, buffer.memory, 0, bytes, 0, &target) != VK_SUCCESS)
             return false;
@@ -2833,18 +2896,21 @@ private:
             const VkPipelineShaderStageCreateInfo stages[]{
                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertex, "main", nullptr},
                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragment, "main", &specialization}};
-            const VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
+            // Scene.vert also reads the previous frame's positions from binding 1 (uploadMotion).
+            const VkVertexInputBindingDescription bindings[]{{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX},
+                {1, sizeof(float)*3, VK_VERTEX_INPUT_RATE_VERTEX}};
             const VkVertexInputAttributeDescription attributes[]{
                 {0,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(Vertex, position)}, {1,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(Vertex, color)},
                 {2,0,VK_FORMAT_R32_SFLOAT,offsetof(Vertex,wind)},{3,0,VK_FORMAT_R32_SFLOAT,offsetof(Vertex,sun)},
                 {4,0,VK_FORMAT_R32G32_SFLOAT,offsetof(Vertex,uv)},
                 {5,0,VK_FORMAT_R32G32B32_UINT,offsetof(Vertex,texture)},
                 {6,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(Vertex,materialNormal)},
-                {7,0,VK_FORMAT_R32G32_SFLOAT,offsetof(Vertex,surfaceFactors)}};
+                {7,0,VK_FORMAT_R32G32_SFLOAT,offsetof(Vertex,surfaceFactors)},
+                {8,1,VK_FORMAT_R32G32B32_SFLOAT,0}};
             const VkVertexInputAttributeDescription shadowAttributes[]{attributes[0],attributes[2]};
             const VkVertexInputAttributeDescription outlineAttributes[]{attributes[0],attributes[4],attributes[6]};
             const VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-                nullptr, 0, sky ? 0u : 1u, &binding, sky ? 0u : shadow ? 2u : outline ? 3u : 8u,
+                nullptr, 0, sky ? 0u : shadow || outline ? 1u : 2u, bindings, sky ? 0u : shadow ? 2u : outline ? 3u : 9u,
                 shadow ? shadowAttributes : outline ? outlineAttributes : attributes};
             const VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                 nullptr, 0, topology, VK_FALSE};
@@ -2910,12 +2976,20 @@ private:
     WorldLightingVulkan lighting_;
     ViewportFrameVulkan frame_;
     std::vector<Buffer> frames_;
+    // Per frame, the previous frame's vertex positions (uploadMotion), and the triangles' positions as last rendered.
+    std::vector<Buffer> motionFrames_;
+    std::vector<std::array<float,3>> lastPositions_;
+    quint64 motionRevision_ = 0;
+    bool motionValid_ = false;
     // Auto exposure: the adapted exposure in stops (NaN until the first metered frame) and the time between frames.
     float adaptedStops_ = std::numeric_limits<float>::quiet_NaN();
     QElapsedTimer adaptClock_;
     // TAA: what the previous frame showed, to restart or reproject the history.
     QMatrix4x4 previousCamera_;
     bool warmUpFrame_ = false; // the next frame restarts the TAA average once more (temporalFor)
+    // The previous frame's wind time, for the motion of swaying foliage (SceneMotion.glsl).
+    float previousWindTime_ = 0;
+    bool previousWindValid_ = false;
     QSize previousSize_;
     quint64 previousGeometry_ = 0, previousTextures_ = 0;
     // The scene's bounds for fitting shadow cascades, for geometry revision shadowBoundsRevision_.

@@ -96,7 +96,7 @@ if(Vulkan_INCLUDE_DIR AND WORLDFORGE_GLSLANG)
     target_include_directories(WorldForgeVulkan SYSTEM PUBLIC "${Vulkan_INCLUDE_DIR}")
     worldforge_compile_options(WorldForgeVulkan)
     set(worldforge_shader_includes Engine/Render/Shaders/Lighting.glsl Engine/Render/Shaders/ColorPipeline.glsl
-        Engine/Render/Shaders/PlayView.glsl Engine/Render/Shaders/Shading.glsl Engine/Render/AgxCurve.inc Engine/Render/AgxMatrices.inc)
+        Engine/Render/Shaders/PlayView.glsl Engine/Render/Shaders/SceneMotion.glsl Engine/Render/Shaders/Shading.glsl Engine/Render/AgxCurve.inc Engine/Render/AgxMatrices.inc)
     # Compiles GLSL to SPIR-V. With a variable name, the output is a C++ header that holds the words.
     function(worldforge_spirv source output variable)
         set(arguments -V "-I${CMAKE_CURRENT_SOURCE_DIR}")

@@ -13,6 +13,8 @@ layout(location = 3) in vec2 surfaceUv;
 layout(location = 4) flat in uvec3 baseColorRange;
 layout(location = 5) in vec3 materialNormal;
 layout(location = 6) flat in vec2 surfaceFactors;
+layout(location = 7) in vec4 previousClip; // SceneMotion.glsl
+layout(location = 8) in vec4 currentClip;
 layout(set = 0, binding = 2, std430) readonly buffer MaterialImages { uint pixels[]; } images;
 layout(location = 0) out vec4 color;
 // The sky-light part of color, which ambient occlusion scales, and in alpha the depth along the camera's forward axis,
@@ -159,5 +161,5 @@ void main()
     float transmission = fog.a*(1.0-local.a);
     indirectLight = vec4(indirect*transmission,max(dot(ray,lighting.clusterForward.xyz),1e-3));
     surfaceAlbedo = vec4(diffuseAlbedo,transmission);
-    surfaceMotion = vec4(0.0);
+    surfaceMotion = vec4(surfaceMotionOf(previousClip,currentClip),0.0,0.0);
 }

@@ -188,7 +188,7 @@ private:
         VkFence fence{};
         VkSemaphore acquired{};
         // environment: the sky's map (binding 5); clusters: the lights and their clusters (binding 6).
-        vk::Buffer vertices, lighting, view, environment, clusters;
+        vk::Buffer lighting, view, environment, clusters;
         std::uint64_t environmentRevision = ~std::uint64_t(0);
         vk::Image shadow;
         VkFramebuffer shadowFramebuffer{};
@@ -279,6 +279,16 @@ private:
     // the target holds a previous frame to trace.
     XMFLOAT4X4 reflectionClip_{};
     bool reflectionReady_ = false;
+    // Vertex buffers in a ring of three: each frame writes the next one, and its scene shader reads the one before as
+    // the previous frame's positions (SceneMotion.glsl). With two frames in flight, the buffer written is never one
+    // the GPU still reads. ringCounts_ holds each buffer's vertex count; vertexMotion_ is off for still captures.
+    std::array<vk::Buffer,3> vertexRing_;
+    std::array<std::size_t,3> ringCounts_{};
+    std::size_t ring_ = 0;
+    bool vertexMotion_ = true;
+    // The previous frame's wind time (for swaying foliage), and the one the frame being prepared uses.
+    float previousWindTime_ = 0, motionWindTime_ = 0;
+    bool previousWindValid_ = false;
 };
 
 bool VulkanRenderer::start(HWND window,std::wstring &error)
@@ -497,20 +507,23 @@ VkPipeline VulkanRenderer::pipeline(std::span<const uint32_t> vertexCode,std::sp
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_VERTEX_BIT,vertex,"main",nullptr},
             {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,nullptr,0,VK_SHADER_STAGE_FRAGMENT_BIT,fragment,"main",nullptr}};
         static_assert(sizeof(PlayVertex) == 48);
-        const VkVertexInputBindingDescription binding{0,sizeof(PlayVertex),VK_VERTEX_INPUT_RATE_VERTEX};
+        // PlayScene.vert also reads the previous frame's buffer (vertexRing_) as each vertex's previous position.
+        const VkVertexInputBindingDescription bindings[]{{0,sizeof(PlayVertex),VK_VERTEX_INPUT_RATE_VERTEX},
+            {1,sizeof(PlayVertex),VK_VERTEX_INPUT_RATE_VERTEX}};
         const VkVertexInputAttributeDescription attributes[]{
             {0,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(PlayVertex,position)},
             {1,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(PlayVertex,normal)},
             {2,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(PlayVertex,color)},
             {3,0,VK_FORMAT_R32_SFLOAT,offsetof(PlayVertex,wind)},
-            {4,0,VK_FORMAT_R32G32_SFLOAT,offsetof(PlayVertex,uv)}};
+            {4,0,VK_FORMAT_R32G32_SFLOAT,offsetof(PlayVertex,uv)},
+            {5,1,VK_FORMAT_R32G32B32_SFLOAT,offsetof(PlayVertex,position)}};
         // Shadow.vert reads position at location 0 and wind at location 2.
         const VkVertexInputAttributeDescription shadowAttributes[]{
             {0,0,VK_FORMAT_R32G32B32_SFLOAT,offsetof(PlayVertex,position)},
             {2,0,VK_FORMAT_R32_SFLOAT,offsetof(PlayVertex,wind)}};
         const bool geometry = scene || shadow;
         const VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,nullptr,0,
-            geometry ? 1u : 0u,&binding,shadow ? 2u : scene ? 5u : 0u,shadow ? shadowAttributes : attributes};
+            shadow ? 1u : scene ? 2u : 0u,bindings,shadow ? 2u : scene ? 6u : 0u,shadow ? shadowAttributes : attributes};
         const VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
             nullptr,0,VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,VK_FALSE};
         const VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -834,13 +847,18 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     const auto bytes = VkDeviceSize(vertices.size()*sizeof(PlayVertex));
     if (bytes > 240000000)
         return false;
-    if (bytes > frame.vertices.size) {
-        frame.vertices.destroy(device_);
-        if (!frame.vertices.create(device_,bytes+bytes/4,VK_BUFFER_USAGE_VERTEX_BUFFER_BIT))
+    // The next buffer in the ring (vertexRing_); the one before it holds the previous frame's positions.
+    ring_ = (ring_+1)%vertexRing_.size();
+    auto &buffer = vertexRing_[ring_];
+    // Always at least a little, so the scene pipeline has a buffer to bind.
+    if (bytes > buffer.size || !buffer.buffer) {
+        buffer.destroy(device_);
+        if (!buffer.create(device_,std::max<VkDeviceSize>(bytes+bytes/4,4096),VK_BUFFER_USAGE_VERTEX_BUFFER_BIT))
             return false;
     }
     if (bytes)
-        std::memcpy(frame.vertices.mapped,vertices.data(),bytes);
+        std::memcpy(buffer.mapped,vertices.data(),bytes);
+    ringCounts_[ring_] = vertices.size();
     LightingBlock lighting{};
     for (int i = 0; i < shadow::cascadeCount; ++i) {
         std::memcpy(&lighting.cascadeMatrices[i],view.cascades.matrices[i].data(),sizeof(lighting.cascadeMatrices[i]));
@@ -872,8 +890,10 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     // Screen-space reflections and contact shadows trace the previous frame (View::shutter z and w).
     const bool reflections = view.shutter.z > 0.5f && reflectionReady_;
     const bool contactShadows = view.shutter.w > 0.5f && view.lighting.y > 0 && reflectionReady_;
-    XMStoreFloat4x4(&lighting.previousViewProjection,reflectionReady_ ? XMLoadFloat4x4(&reflectionClip_) : XMMatrixIdentity());
-    lighting.reflectionSettings = {reflections ? 1.0f : 0.0f,vk::HdrFrame::reflectionRange,contactShadows ? 1.0f : 0.0f,0};
+    // The previous camera also gives each surface's motion (SceneMotion.glsl), so it is always set.
+    XMStoreFloat4x4(&lighting.previousViewProjection,XMLoadFloat4x4(&reflectionClip_));
+    lighting.reflectionSettings = {reflections ? 1.0f : 0.0f,vk::HdrFrame::reflectionRange,contactShadows ? 1.0f : 0.0f,
+                                   motionWindTime_};
     if (view.skyEnvironment && frame.environmentRevision != view.skyRevision
         && view.skyEnvironment->size()*sizeof(std::array<float,4>) <= frame.environment.size) {
         std::memcpy(frame.environment.mapped,view.skyEnvironment->data(),view.skyEnvironment->size()*sizeof(std::array<float,4>));
@@ -970,7 +990,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
     api_.vkCmdBeginRenderPass(command,&shadowBegin,VK_SUBPASS_CONTENTS_INLINE);
     if (view.lighting.y > 0 && vertexCount) {
         api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline_);
-        api_.vkCmdBindVertexBuffers(command,0,1,&frame.vertices.buffer,&offset);
+        api_.vkCmdBindVertexBuffers(command,0,1,&vertexRing_[ring_].buffer,&offset);
         // One tile of the atlas per cascade.
         for (int cascade = 0; cascade < shadow::cascadeCount; ++cascade) {
             const auto origin = shadow::tileOrigin(cascade);
@@ -998,7 +1018,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         api_.vkCmdBeginRenderPass(command,&skyBegin,VK_SUBPASS_CONTENTS_INLINE);
         if (view.skyRefresh && vertexCount) {
             api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline_);
-            api_.vkCmdBindVertexBuffers(command,0,1,&frame.vertices.buffer,&offset);
+            api_.vkCmdBindVertexBuffers(command,0,1,&vertexRing_[ring_].buffer,&offset);
             for (int direction = 0; direction < sky::directionCount; ++direction) {
                 const auto origin = sky::tileOrigin(direction);
                 const VkViewport viewport{float(origin[0]),float(origin[1]),float(sky::tileSize),float(sky::tileSize),0,1};
@@ -1030,7 +1050,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         api_.vkCmdBeginRenderPass(command,&pointBegin,VK_SUBPASS_CONTENTS_INLINE);
         if (vertexCount && !clusters_.shadowed.empty()) {
             api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline_);
-            api_.vkCmdBindVertexBuffers(command,0,1,&frame.vertices.buffer,&offset);
+            api_.vkCmdBindVertexBuffers(command,0,1,&vertexRing_[ring_].buffer,&offset);
             for (std::size_t tile = 0; tile < clusters_.shadowed.size()*6; ++tile) {
                 const auto x = uint32_t(tile%lights::shadowColumns)*lights::faceSize;
                 const auto y = uint32_t(tile/lights::shadowColumns)*lights::faceSize;
@@ -1053,7 +1073,12 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
     if (vertexCount) {
         api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,scene_);
         api_.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,sceneLayout_,0,1,&frame.set,0,nullptr);
-        api_.vkCmdBindVertexBuffers(command,0,1,&frame.vertices.buffer,&offset);
+        // Binding 1: the previous frame's buffer as each vertex's previous position, when it holds the same vertices.
+        const std::size_t previous = (ring_+vertexRing_.size()-1)%vertexRing_.size();
+        const bool moving = vertexMotion_ && vertexRing_[previous].buffer && ringCounts_[previous] == vertexCount;
+        const VkBuffer buffers[]{vertexRing_[ring_].buffer,moving ? vertexRing_[previous].buffer : vertexRing_[ring_].buffer};
+        const VkDeviceSize offsets[]{0,0};
+        api_.vkCmdBindVertexBuffers(command,0,2,buffers,offsets);
         for (const auto &range : ranges) {
             const auto set = materialSet(range.material);
             if (!set || std::size_t(range.start)+range.count > vertexCount)
@@ -1114,13 +1139,17 @@ bool VulkanRenderer::draw(const std::vector<PlayVertex> &vertices,const std::vec
     if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR)
         return false;
     api_.vkResetFences(device,1,&frame.fence);
-    // TAA: render with this frame's jitter and reproject the history with the camera's motion. Moving objects
-    // rely on the history clamp.
+    // TAA: render with this frame's jitter and reproject the history with the camera's motion and each surface's own
+    // (the scene's velocity target).
     vk::HdrFrame::Temporal temporal;
     temporal.enabled = view.sky.y > 0.5f;
     const auto clip = vulkanClip(view.viewProjection);
     temporal.reprojection = reprojection(clip,previousValid_ ? previousClip_ : clip);
     reflectionClip_ = previousValid_ ? previousClip_ : clip;
+    vertexMotion_ = true;
+    motionWindTime_ = previousWindValid_ ? previousWindTime_ : view.lighting.z;
+    previousWindTime_ = view.lighting.z;
+    previousWindValid_ = true;
     reflectionReady_ = previousValid_ && frame_.previousFrameReady();
     previousClip_ = clip;
     previousValid_ = true;
@@ -1203,6 +1232,9 @@ bool VulkanRenderer::capture(const std::vector<PlayVertex> &vertices,const std::
                                  view.bloom > 0 ? 2 : 1})+(warmUp ? 1 : 0);
     // A still view: the previous frame saw it through the same camera.
     reflectionClip_ = vulkanClip(view.viewProjection);
+    // Nothing moves in a capture: no motion from the previous frame's vertices or wind.
+    vertexMotion_ = false;
+    motionWindTime_ = view.lighting.z;
     float stops = std::log2(std::max(view.display.x,1e-6f));
     for (int pass = 0; ok && pass < passes; ++pass) {
         auto shown = withShadows(temporal.enabled ? jittered(view,target.jitter(),width,height) : view,view,vertices,
@@ -1252,8 +1284,10 @@ void VulkanRenderer::release()
         api_.vkDeviceWaitIdle(device);
         destroySwapchain();
         frame_.destroy();
+        for (auto &buffer : vertexRing_)
+            buffer.destroy(device_);
+        ringCounts_ = {};
         for (auto &frame : frames_) {
-            frame.vertices.destroy(device_);
             frame.lighting.destroy(device_);
             frame.view.destroy(device_);
             frame.environment.destroy(device_);

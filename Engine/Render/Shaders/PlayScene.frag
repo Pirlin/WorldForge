@@ -17,6 +17,8 @@ layout(location = 0) in vec3 worldPosition;
 layout(location = 1) in vec3 albedo;
 layout(location = 2) in vec2 surfaceUv;
 layout(location = 3) in vec3 surfaceNormal;
+layout(location = 4) in vec4 previousClip; // SceneMotion.glsl
+layout(location = 5) in vec4 currentClip;
 layout(location = 0) out vec4 color;
 // The sky-light part of color, which ambient occlusion scales, and in alpha the depth along the camera's forward axis,
 // which TAA keeps with its result for screen-space reflections (0 where only sky shows).
@@ -71,5 +73,5 @@ void main()
     float transmission = fog.a*(1.0-mist.a);
     indirectLight = vec4(indirect*transmission,max(dot(ray,lighting.clusterForward.xyz),1e-3));
     surfaceAlbedo = vec4(surface.albedo*(1.0-surface.metallic),transmission);
-    surfaceMotion = vec4(0.0);
+    surfaceMotion = vec4(surfaceMotionOf(previousClip,currentClip),0.0,0.0);
 }
