@@ -230,7 +230,7 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
         float marchEnd = min(distance,shadowRange);
         vec2 pixel = gl_FragCoord.xy+5.588238*lighting.settings.z;
         float jitter = fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
-        const int steps = 16;
+        const int steps = 8; // TAA turns the jitter each frame, so a still view averages 128 samples
         float start = 0.0, before = 1.0;
         for (int i = 0; i < steps; ++i) {
             float fraction = float(i+1)/float(steps);

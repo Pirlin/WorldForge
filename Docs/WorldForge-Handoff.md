@@ -32,6 +32,8 @@ Put Qt on PATH first (`%LOCALAPPDATA%/WorldForge/Qt/6.8.3/msvc2022_64/bin`), the
 
 - If the full audit stops writing `controls.csv`, a modal dialog is open outside `withDialog`.
 - The Authoring check "Sun casts visible geometry shadows" is flaky. Rerun it before treating a failure as real.
+- Run one audit at a time, with a visible window. Two audits at once, or a leftover audit process, slow the GPU and time each other out. An audit started with a hidden window (for example `Start-Process -WindowStyle Hidden`) fails the rendering check "The street renders" with "No Vulkan frame", because its viewport is never exposed.
+- Timings depend on the Windows power plan. Before blaming a change, measure the previous commit in the same session.
 
 ## Frame architecture (`Engine/Render/Vulkan/HdrFrame.*`, shared by the editor and the Player)
 1. **Scene pass.** Writes three color targets (scene, indirect sky light, albedo plus fog transmission) and depth. Shading is in `Shaders/Shading.glsl` and `Lighting.glsl`.
@@ -61,7 +63,7 @@ Settings flow through these files:
 ## Status (2026-11-22)
 **Realism** is 94.9 over 4 views (mean FLIP 0.0508). The Cycles comparison runs with fog disabled.
 
-**Street frame time** with volumetric height fog is 9.97-10.23 ms on average (12.02-13.19 ms at p95 on the GTX 1650).
+**Street frame time** (`--street`, GTX 1650 laptop on the Windows "Power saver" plan) is 12.7–13.0 ms on average with fog (14.7–15.9 ms at p95; the budget is 16.7 ms). The same machine and plan measured 10.0 ms before fog, so the fog costs about 2.8 ms. The plan matters: before fog the street measured about 7 ms on a faster plan. Compare timings only within one run of measurements.
 
 **R1 done:**
 - HDR, EV100 exposure and AgX tonemapping
