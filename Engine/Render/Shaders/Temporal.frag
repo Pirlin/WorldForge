@@ -2,8 +2,8 @@
 // Temporal anti-aliasing resolve. Each frame the scene is rendered with a different sub-pixel jitter
 // (HdrFrame::jitter); this pass blends it into the history of earlier frames, which together cover
 // the pixel like supersampling.
-// - Reprojection: the history is read where this pixel's surface was last frame, from its depth and
-//   the camera matrices (camera motion; moving objects rely on the clamp below).
+// - Reprojection: the history is read where this pixel's surface was last frame, from its depth, its own motion and
+//   the camera matrices.
 // - Clamp: the history is clipped to the colour spread of this pixel's 3x3 neighbourhood (variance
 //   clipping in YCoCg), which rejects history that no longer matches, such as newly revealed surfaces.
 //   Still frames skip the clamp so the result is an exact average of the jittered samples.
@@ -13,6 +13,7 @@ layout(set = 0, binding = 2) uniform sampler2D history; // the previous resolve,
 layout(set = 0, binding = 3) uniform sampler2D indirect; // this frame's sky light after fog, nearest
 layout(set = 0, binding = 4) uniform sampler2D ambient;  // bounce light and sky visibility (Ambient.frag), nearest
 layout(set = 0, binding = 5) uniform sampler2D albedo;   // diffuse albedo and fog transmission, nearest
+layout(set = 0, binding = 6) uniform sampler2D surfaceMotion; // each surface's own motion in the previous frame's UV, nearest
 layout(push_constant) uniform Temporal {
     mat4 reprojection; // this frame's clip space to the previous frame's clip space
     vec4 settings;     // weight of this frame, history valid, clamp history, ambient occlusion on
@@ -65,18 +66,24 @@ void main()
     }
     vec3 sum = vec3(0.0), squares = vec3(0.0);
     float nearest = 1.0;
+    ivec2 nearestPixel = pixel;
     for (int y = -1; y <= 1; ++y)
         for (int x = -1; x <= 1; ++x) {
             ivec2 neighbour = clamp(pixel+ivec2(x,y),ivec2(0),size-1);
             vec3 value = toYCoCg(sceneAt(neighbour));
             sum += value;
             squares += value*value;
-            nearest = min(nearest,texelFetch(depth,neighbour,0).r);
+            float neighbourDepth = texelFetch(depth,neighbour,0).r;
+            if (neighbourDepth < nearest) {
+                nearest = neighbourDepth;
+                nearestPixel = neighbour;
+            }
         }
     // Reproject with the nearest depth around the pixel so edges of foreground objects follow them.
     vec2 uv = (vec2(pixel)+0.5)/vec2(size);
     vec4 previous = taa.reprojection*vec4(uv*2.0-1.0,nearest,1.0);
-    vec2 previousUv = previous.xy/previous.w*0.5+0.5;
+    // The camera's motion, plus the surface's own where it moved (a car driving by).
+    vec2 previousUv = previous.xy/previous.w*0.5+0.5+texelFetch(surfaceMotion,nearestPixel,0).xy;
     if (previous.w <= 0.0 || any(lessThan(previousUv,vec2(0.0))) || any(greaterThan(previousUv,vec2(1.0)))) {
         color = vec4(current,depthAlong);
         return;

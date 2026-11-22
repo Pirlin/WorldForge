@@ -19,6 +19,8 @@ layout(location = 0) out vec4 color;
 // which TAA keeps with its result for screen-space reflections (0 where only sky shows).
 layout(location = 1) out vec4 indirectLight;
 layout(location = 2) out vec4 surfaceAlbedo; // diffuse albedo and fog transmission, for bounce light
+// This surface's own motion since the previous frame, apart from the camera's (HdrFrame::velocityFormat).
+layout(location = 3) out vec4 surfaceMotion;
 layout(push_constant) uniform View {
     mat4 matrix;
     vec4 eye;
@@ -157,4 +159,5 @@ void main()
     float transmission = fog.a*(1.0-local.a);
     indirectLight = vec4(indirect*transmission,max(dot(ray,lighting.clusterForward.xyz),1e-3));
     surfaceAlbedo = vec4(diffuseAlbedo,transmission);
+    surfaceMotion = vec4(0.0);
 }

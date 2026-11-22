@@ -45,11 +45,13 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
         || !device.supports(sceneFormat,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
                                         | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
         || !device.supports(occlusionFormat,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
-        || !device.supports(albedoFormat,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+        || !device.supports(albedoFormat,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+        || !device.supports(velocityFormat,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
         return false;
     srgbOutput_ = srgbFormat(outputFormat);
 
-    // Scene pass: the lit scene, its sky-light part, the albedo and depth, all read by the passes after it.
+    // Scene pass: the lit scene, its sky-light part, the albedo, each surface's own motion and depth, all read by the
+    // passes after it.
     {
         const VkAttachmentDescription attachments[]{
             {0,sceneFormat,VK_SAMPLE_COUNT_1_BIT,VK_ATTACHMENT_LOAD_OP_CLEAR,VK_ATTACHMENT_STORE_OP_STORE,
@@ -61,14 +63,18 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
             {0,albedoFormat,VK_SAMPLE_COUNT_1_BIT,VK_ATTACHMENT_LOAD_OP_CLEAR,VK_ATTACHMENT_STORE_OP_STORE,
              VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_STORE_OP_DONT_CARE,
              VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {0,velocityFormat,VK_SAMPLE_COUNT_1_BIT,VK_ATTACHMENT_LOAD_OP_CLEAR,VK_ATTACHMENT_STORE_OP_STORE,
+             VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_STORE_OP_DONT_CARE,
+             VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
             {0,depthFormat_,VK_SAMPLE_COUNT_1_BIT,VK_ATTACHMENT_LOAD_OP_CLEAR,VK_ATTACHMENT_STORE_OP_STORE,
              VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_STORE_OP_DONT_CARE,
              VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL}
         };
         const VkAttachmentReference colors[]{{0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
                                              {1,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
-                                             {2,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}};
-        const VkAttachmentReference depth{3,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+                                             {2,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+                                             {3,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}};
+        const VkAttachmentReference depth{sceneColorAttachments,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
         const VkSubpassDescription subpass{0,VK_PIPELINE_BIND_POINT_GRAPHICS,0,nullptr,sceneColorAttachments,colors,nullptr,
             &depth,0,nullptr};
         const VkSubpassDependency dependencies[]{
@@ -83,7 +89,7 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
              VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT,0}
         };
-        const VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,nullptr,0,4,attachments,1,&subpass,
+        const VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,nullptr,0,uint32_t(std::size(attachments)),attachments,1,&subpass,
             uint32_t(std::size(dependencies)),dependencies};
         if (vk.vkCreateRenderPass(device.device,&info,nullptr,&scenePass_) != VK_SUCCESS)
             return false;
@@ -173,8 +179,9 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
         return false;
     const VkDescriptorSetLayoutBinding postBindings[]{
         {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
-    const VkDescriptorSetLayoutCreateInfo postLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,2,
+        {1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
+    const VkDescriptorSetLayoutCreateInfo postLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,3,
         postBindings};
     if (vk.vkCreateDescriptorSetLayout(device.device,&postLayout,nullptr,&postSetLayout_) != VK_SUCCESS)
         return false;
@@ -184,13 +191,14 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
         {2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {3,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {5,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
+        {5,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {6,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
     const VkDescriptorSetLayoutBinding occlusionBindings[]{
         {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
     const VkDescriptorSetLayoutCreateInfo displayLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,3,
         displayBindings};
-    const VkDescriptorSetLayoutCreateInfo temporalLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,6,
+    const VkDescriptorSetLayoutCreateInfo temporalLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,7,
         temporalBindings};
     const VkDescriptorSetLayoutCreateInfo occlusionLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,2,
         occlusionBindings};
@@ -199,7 +207,7 @@ bool HdrFrame::create(const Device &device,VkFormat outputFormat,VkImageLayout o
         || vk.vkCreateDescriptorSetLayout(device.device,&occlusionLayout,nullptr,&occlusionSetLayout_) != VK_SUCCESS)
         return false;
     const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,4},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,40+bloomLevels+2}};
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,46+bloomLevels+2}};
     const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,11+bloomLevels+2,2,sizes};
     if (vk.vkCreateDescriptorPool(device.device,&pool,nullptr,&pool_) != VK_SUCCESS)
         return false;
@@ -314,6 +322,8 @@ bool HdrFrame::createTargets(VkExtent2D extent,std::span<const VkImageView> outp
                              VK_IMAGE_ASPECT_COLOR_BIT)
         || !albedo_.create(*device_,albedoFormat,extent_,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                            VK_IMAGE_ASPECT_COLOR_BIT)
+        || !velocity_.create(*device_,velocityFormat,extent_,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT)
         || !occlusion_.create(*device_,occlusionFormat,extent_,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                               VK_IMAGE_ASPECT_COLOR_BIT)
         || !depth_.create(*device_,depthFormat_,extent_,VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -330,7 +340,7 @@ bool HdrFrame::createTargets(VkExtent2D extent,std::span<const VkImageView> outp
             uint32_t(views.size()),views.data(),extent_.width,extent_.height,1};
         return vk.vkCreateFramebuffer(device_->device,&info,nullptr,&result) == VK_SUCCESS;
     };
-    const std::array sceneViews{scene_.view,indirect_.view,albedo_.view,depth_.view};
+    const std::array sceneViews{scene_.view,indirect_.view,albedo_.view,velocity_.view,depth_.view};
     if (!framebuffer(scenePass_,sceneViews,sceneFramebuffer_)
         || !framebuffer(occlusionPass_,std::span(&occlusion_.view,1),occlusionFramebuffer_))
         return false;
@@ -353,11 +363,12 @@ bool HdrFrame::createTargets(VkExtent2D extent,std::span<const VkImageView> outp
             {linear_,history_[1-i].view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
             {nearest_,indirect_.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
             {nearest_,occlusion_.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-            {nearest_,albedo_.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+            {nearest_,albedo_.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            {nearest_,velocity_.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
         const VkWriteDescriptorSet writes[]{
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,displaySets_[i],0,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
              &input,nullptr,nullptr},
-            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,temporalSets_[i],0,0,6,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,temporalSets_[i],0,0,7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
              images,nullptr,nullptr}};
         vk.vkUpdateDescriptorSets(device_->device,2,writes,0,nullptr);
     }
@@ -404,10 +415,11 @@ bool HdrFrame::createTargets(VkExtent2D extent,std::span<const VkImageView> outp
     for (std::size_t i = 0; i < 4; ++i) {
         const auto view = i < 2 ? history_[i].view : post_[i-2].view;
         const VkDescriptorImageInfo images[]{{linear_,view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-                                             {nearest_,depth_.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL}};
+                                             {nearest_,depth_.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
+                                             {nearest_,velocity_.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
         const VkDescriptorImageInfo final{nearest_,view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         const VkWriteDescriptorSet writes[]{
-            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,postSets_[i],0,0,2,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,postSets_[i],0,0,3,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
              images,nullptr,nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,displaySets_[i],0,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
              &final,nullptr,nullptr}};
@@ -438,6 +450,7 @@ void HdrFrame::releaseTargets()
     scene_.destroy(*device_);
     indirect_.destroy(*device_);
     albedo_.destroy(*device_);
+    velocity_.destroy(*device_);
     occlusion_.destroy(*device_);
     depth_.destroy(*device_);
     for (auto &history : history_)
@@ -591,11 +604,11 @@ void HdrFrame::begin(VkCommandBuffer command,std::size_t output,const float back
     const auto &vk = *device_->api;
     initializeLayouts(command);
     output_ = output;
-    VkClearValue clear[4]{};
+    VkClearValue clear[sceneColorAttachments+1]{};
     clear[0].color = {{background[0],background[1],background[2],1.0f}};
-    clear[3].depthStencil = {1.0f,0};
+    clear[sceneColorAttachments].depthStencil = {1.0f,0};
     const VkRect2D area{{0,0},extent_};
-    const VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,scenePass_,sceneFramebuffer_,area,4,clear};
+    const VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,scenePass_,sceneFramebuffer_,area,sceneColorAttachments+1,clear};
     vk.vkCmdBeginRenderPass(command,&info,VK_SUBPASS_CONTENTS_INLINE);
     const VkViewport viewport{0,0,float(extent_.width),float(extent_.height),0,1};
     vk.vkCmdSetViewport(command,0,1,&viewport);

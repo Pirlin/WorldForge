@@ -20,10 +20,13 @@ public:
     static constexpr uint32_t sceneSubpass = 0, displaySubpass = 0;
     // Samples in the jitter sequence, and how many frames a still view averages.
     static constexpr uint32_t temporalSamples = 16;
-    // The scene pass writes the lit scene and, separately, its sky-light part (which ambient occlusion scales) and
-    // the surfaces' diffuse albedo with the fog transmission in alpha (which bounce light needs).
-    static constexpr uint32_t sceneColorAttachments = 3;
+    // The scene pass writes the lit scene and, separately, its sky-light part (which ambient occlusion scales), the
+    // surfaces' diffuse albedo with the fog transmission in alpha (which bounce light needs) and their motion.
+    static constexpr uint32_t sceneColorAttachments = 4;
     static constexpr VkFormat albedoFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    // Each surface's own motion since the previous frame, apart from the camera's: the change in its position in the
+    // previous frame's screen (UV units), 0 for static geometry and sky. TAA and motion blur add it to the camera's.
+    static constexpr VkFormat velocityFormat = VK_FORMAT_R16G16_SFLOAT;
     // Bounce light in RGB and sky visibility in alpha (Ambient.frag). Float, so a frame may exceed 1: the noisy
     // per-frame values average to the unbiased result under TAA.
     static constexpr VkFormat occlusionFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -155,7 +158,7 @@ private:
     bool bloomInitialized_ = false;
     uint32_t framesShown_ = 0; // since the targets were created; the previous resolve exists from the second frame
     VkSampler nearest_{}, linear_{};
-    Image scene_, indirect_, albedo_, occlusion_, depth_;
+    Image scene_, indirect_, albedo_, velocity_, occlusion_, depth_;
     std::array<Image,2> history_;
     std::array<bool,2> historyReady_{};
     VkExtent2D extent_{};

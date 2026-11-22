@@ -531,10 +531,10 @@ VkPipeline VulkanRenderer::pipeline(std::span<const uint32_t> vertexCode,std::sp
         VkPipelineColorBlendAttachmentState blend{};
         blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT
             | VK_COLOR_COMPONENT_A_BIT;
-        // The scene pass has targets for the sky-light part and the surface albedo, which only the scene shader writes.
-        VkPipelineColorBlendAttachmentState blends[vk::HdrFrame::sceneColorAttachments]{blend,blend,blend};
+        // The scene pass has targets for the sky-light part, the surface albedo and motion, which only the scene shader writes.
+        VkPipelineColorBlendAttachmentState blends[vk::HdrFrame::sceneColorAttachments]{blend,blend,blend,blend};
         if (!geometry)
-            blends[1].colorWriteMask = blends[2].colorWriteMask = 0;
+            blends[1].colorWriteMask = blends[2].colorWriteMask = blends[3].colorWriteMask = 0;
         VkPipelineColorBlendStateCreateInfo colors{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         colors.attachmentCount = vk::HdrFrame::sceneColorAttachments;
         colors.pAttachments = blends;
