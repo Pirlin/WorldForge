@@ -44,7 +44,7 @@ struct View {
     // The authored sun intensity (sunlight with the sun overhead), from which the physical sky is built; sun.w is what
     // reaches the ground, 0 once the sun has set.
     float authoredSun = 0;
-    float padding2 = 0; // keeps View a multiple of 16 bytes
+    float bloom = 0; // the share of light scattered around bright areas (color::bloomStrength), 0 for none
     // Sun shadow cascades (Engine/Render/ShadowCascades.h), fitted to the view without TAA jitter. Direct3D 11 uses
     // lightProjection instead.
     shadow::Cascades cascades;

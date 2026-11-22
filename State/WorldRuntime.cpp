@@ -512,6 +512,7 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QS
     scene.temporalAntiAliasing = atmosphere.temporalAntiAliasing;
     scene.ambientOcclusion = atmosphere.ambientOcclusion;
     scene.physicalSky = atmosphere.physicalSky;
+    scene.bloom = atmosphere.bloom;
     scene.exposureCompensation = atmosphere.exposureCompensation;
     scene.viewTransform = atmosphere.viewTransform;
     std::size_t vertices = 0, animationSamples = 0;

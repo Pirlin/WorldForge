@@ -6,8 +6,12 @@
 // Engine/Render/ColorPipeline.h for the bins).
 layout(input_attachment_index = 0, set = 0, binding = 0) uniform subpassInput scene;
 layout(std430, set = 0, binding = 1) buffer Meter { uint bins[64]; } meter;
+// Bloom (BloomDown.frag, BloomUp.frag): the light every bright area scatters around it, half size, from the previous
+// frame. It holds the sum of the chain's levels.
+layout(set = 0, binding = 2) uniform sampler2D bloomLight;
 layout(push_constant) uniform Display {
     vec4 settings; // exposure scale, view transform (0 Standard, 1 AgX), sRGB swap chain, metering
+    vec4 bloom;    // strength (0 off), levels in the chain, unused, unused
 } display;
 layout(location = 0) out vec4 color;
 void main()
@@ -21,7 +25,13 @@ void main()
         int bin = stops < low ? 0 : clamp(1+int((stops-low)*(63.0/(high-low))),1,63);
         atomicAdd(meter.bins[bin],1u);
     }
-    vec3 light = scene*display.settings.x;
+    // A lens scatters a few percent of the light that reaches it around the image; mixing keeps the total.
+    vec3 lit = scene;
+    if (display.bloom.x > 0.0) {
+        vec3 scattered = texture(bloomLight,gl_FragCoord.xy/vec2(textureSize(bloomLight,0)*2)).rgb/display.bloom.y;
+        lit = mix(scene,scattered,display.bloom.x);
+    }
+    vec3 light = lit*display.settings.x;
     vec3 encoded = display.settings.y > 0.5 ? agx(light) : linearToSrgb(light);
     // Half a level of ordered noise keeps 8-bit sky gradients from banding.
     float noise = fract(52.9829189*fract(dot(gl_FragCoord.xy,vec2(0.06711056,0.00583715))));

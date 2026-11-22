@@ -34,6 +34,8 @@ struct WorldAtmosphere {
     // The physically based atmosphere (Engine/Render/Atmosphere.h) sets the sky and the sunlight's color from the
     // sun's position, instead of the horizon and zenith colors.
     bool physicalSky = false;
+    // Bloom: light scattered around bright areas, as a camera lens does.
+    bool bloom = true;
     worldforge::color::ViewTransform viewTransform = worldforge::color::ViewTransform::AgX;
 };
 

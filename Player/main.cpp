@@ -577,11 +577,13 @@ public:
     }
 
     // The realism check compares lighting and materials without fog, which Cycles would need a volume for.
+    // The Cycles reference has no fog and no lens: compare the scene's light alone.
     void clearFog()
     {
         playable_.fogDensity = 0;
         playable_.localFogRadius = 0;
         playable_.localFogDensity = 0;
+        playable_.bloom = false;
     }
 
     wf::BoxBody &player() { return playable_.simulation.bodies[playable_.player]; }
@@ -655,6 +657,7 @@ public:
             ++skyRevision_;
         }
         view.authoredSun = view.sun.w;
+        view.bloom = playable_.bloom ? wf::color::bloomStrength : 0.0f;
         // The physical sky's sun reaches the ground dimmer and warmer than overhead.
         const auto &sunLight = skyLight_->sunLight;
         const float sunLuminance = 0.2126f*sunLight[0]+0.7152f*sunLight[1]+0.0722f*sunLight[2];

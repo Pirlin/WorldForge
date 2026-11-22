@@ -2226,7 +2226,8 @@ public:
                 return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
             };
             frame_.createDisplayPipeline(spirv(":/shaders/Display.vert.spv"),spirv(":/shaders/Display.frag.spv"),
-                                         spirv(":/shaders/Temporal.frag.spv"),spirv(":/shaders/Ambient.frag.spv"));
+                                         spirv(":/shaders/Temporal.frag.spv"),spirv(":/shaders/Ambient.frag.spv"),
+                                         spirv(":/shaders/BloomDown.frag.spv"),spirv(":/shaders/BloomUp.frag.spv"));
             triangles_ = pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true);
             lines_ = pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false);
             if (window_.modelOnly_)
@@ -2538,7 +2539,7 @@ public:
             const auto toWorld = sceneCamera.inverted();
             std::copy_n(toWorld.constData(),16,occlusion.inverseViewProjection.begin());
             frame_.display(command,exposure,environment.viewTransform,environment.autoExposure ? int(frameIndex) : -1,temporal,
-                           occlusion);
+                           occlusion,environment.bloom && !window_.modelOnly_ ? wf::color::bloomStrength : 0.0f);
             window_.temporalSettled_ = !temporal.enabled || !temporal.still || frame_.accumulated() >= wf::vk::HdrFrame::temporalSamples;
             if (!window_.temporalSettled_)
                 window_.requestUpdate();

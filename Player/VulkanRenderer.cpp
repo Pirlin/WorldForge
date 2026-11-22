@@ -24,6 +24,8 @@
 #include "Display_frag.h"
 #include "Temporal_frag.h"
 #include "Ambient_frag.h"
+#include "BloomDown_frag.h"
+#include "BloomUp_frag.h"
 #include "PlayScene_vert.h"
 #include "PlayScene_frag.h"
 
@@ -277,7 +279,7 @@ bool VulkanRenderer::start(HWND window,std::wstring &error)
     }
     if (format_ == VK_FORMAT_UNDEFINED || !frame_.create(device_,format_,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
         || !frame_.createDisplayPipeline(spirv(spirv_Display_vert),spirv(spirv_Display_frag),spirv(spirv_Temporal_frag),
-                                    spirv(spirv_Ambient_frag))) {
+                                    spirv(spirv_Ambient_frag),spirv(spirv_BloomDown_frag),spirv(spirv_BloomUp_frag))) {
         error = L"Vulkan could not create the HDR frame pass.";
         return false;
     }
@@ -1032,7 +1034,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         }
     }
     target.display(command,exposureStops,view.display.y > 0.5f ? color::ViewTransform::AgX : color::ViewTransform::Standard,
-                   meterSlot,temporal,occlusion);
+                   meterSlot,temporal,occlusion,view.bloom);
     api_.vkCmdEndRenderPass(command);
     if (meterSlot >= 0)
         target.finishMeter(command);
@@ -1135,7 +1137,7 @@ bool VulkanRenderer::capture(const std::vector<PlayVertex> &vertices,const std::
                             VK_IMAGE_ASPECT_COLOR_BIT)
         && target.create(device_,format_,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,1)
         && target.createDisplayPipeline(spirv(spirv_Display_vert),spirv(spirv_Display_frag),spirv(spirv_Temporal_frag),
-                                    spirv(spirv_Ambient_frag))
+                                    spirv(spirv_Ambient_frag),spirv(spirv_BloomDown_frag),spirv(spirv_BloomUp_frag))
         && target.createTargets({width,height},std::span(&output.view,1))
         && (readback_.size >= bytes || (readback_.destroy(device_),readback_.create(device_,bytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT)));
     // A capture is a still view, so it converges at once. Auto exposure meters the first frame and the later frames
@@ -1145,7 +1147,9 @@ bool VulkanRenderer::capture(const std::vector<PlayVertex> &vertices,const std::
     vk::HdrFrame::Temporal temporal;
     temporal.enabled = view.sky.y > 0.5f;
     temporal.still = true;
-    const int passes = std::max(temporal.enabled ? int(vk::HdrFrame::temporalSamples) : 1,automatic ? 2 : 1);
+    // Bloom reads the previous frame, so a capture with bloom renders at least two.
+    const int passes = std::max({temporal.enabled ? int(vk::HdrFrame::temporalSamples) : 1,automatic ? 2 : 1,
+                                 view.bloom > 0 ? 2 : 1});
     float stops = std::log2(std::max(view.display.x,1e-6f));
     for (int pass = 0; ok && pass < passes; ++pass) {
         auto shown = withShadows(temporal.enabled ? jittered(view,target.jitter(),width,height) : view,view,vertices,

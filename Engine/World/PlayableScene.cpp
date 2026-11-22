@@ -127,7 +127,7 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
     });
     const bool display = scene.exposure != 0 || scene.viewTransform != color::ViewTransform::AgX || scene.autoExposure
         || scene.exposureCompensation != 0 || !scene.temporalAntiAliasing || !scene.ambientOcclusion;
-    const int version = scene.physicalSky ? 15 : display ? 14 : !scene.nativeInstances.empty() ? 13 : !scene.nativeBodies.empty() ? 12
+    const int version = !scene.bloom ? 16 : scene.physicalSky ? 15 : display ? 14 : !scene.nativeInstances.empty() ? 13 : !scene.nativeBodies.empty() ? 12
         : hasRemoteLaunch ? 11 : hasLaunch ? 10 : 9;
     if (!std::isfinite(scene.exposure) || scene.exposure < color::minimumExposure || scene.exposure > color::maximumExposure
         || !std::isfinite(scene.exposureCompensation) || std::abs(scene.exposureCompensation) > color::maximumCompensation)
@@ -148,6 +148,8 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
             << scene.ambientOcclusion << ' ';
     if (version >= 15)
         out << scene.physicalSky << ' ';
+    if (version >= 16)
+        out << scene.bloom << ' ';
     out << '\n';
     for (const auto &body : world.bodies) {
         writeVector(out,body.position);
@@ -340,7 +342,7 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     std::string signature;
     int version;
     std::size_t bodies,terrains,joints,meshes,lights;
-    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 15
+    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 16
         || !(in >> bodies >> terrains >> joints >> meshes >> lights >> scene.player)
         || bodies > 257 || terrains > 256 || joints > 256 || meshes > 4096 || lights > 256 || scene.player >= bodies
         || !readValue(in,world.gravity,0,50) || !(in >> scene.sky)
@@ -361,6 +363,8 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
         scene.viewTransform = color::ViewTransform(transform);
     }
     if (version >= 15 && !(in >> scene.physicalSky))
+        return {};
+    if (version >= 16 && !(in >> scene.bloom))
         return {};
     world.bodies.resize(bodies);
     for (auto &body : world.bodies) {

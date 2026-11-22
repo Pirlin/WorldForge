@@ -993,6 +993,12 @@ void MainWindow::editAtmosphere()
     ambientOcclusion->setChecked(initial.ambientOcclusion);
     ambientOcclusion->setToolTip(tr("Darkens sky light in corners, creases and openings that the sky cannot reach."));
     form->addRow(ambientOcclusion);
+    auto *bloom = new QCheckBox(tr("Bloom"),&dialog);
+    bloom->setAccessibleName(tr("Bloom"));
+    bloom->setChecked(initial.bloom);
+    bloom->setToolTip(tr("Scatters a little light around bright areas, as a camera lens does: a glow around the sun, "
+                         "lamps and bright reflections."));
+    form->addRow(bloom);
     auto *gravity = new QDoubleSpinBox(&dialog);
     gravity->setRange(0,50);
     gravity->setSuffix(tr(" m/s²"));
@@ -1010,7 +1016,7 @@ void MainWindow::editAtmosphere()
                               {"shadows",shadows->isChecked()},{"localFogRadius",localRadius->value()},
                               {"localFogDensity",localDensity->value()},
                               {"ev100",exposure->value()},{"exposureMode",exposureMode->currentData().toString()},
-                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},
+                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},{"bloom",bloom->isChecked()},
                               {"localFogCenter",QJsonArray{localCenter[0]->value(),localCenter[1]->value(),localCenter[2]->value()}}});
 }
 

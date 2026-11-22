@@ -84,6 +84,10 @@ inline float exposureScale(float stops)
     return std::exp2(std::clamp(stops,minimumExposure,maximumExposure));
 }
 
+// Bloom: the share of light a camera lens scatters around bright areas (Jimenez 2014). HdrFrame mixes the blurred
+// scene into the sharp one by this much.
+inline constexpr float bloomStrength = 0.04f;
+
 // Auto exposure. The display pass counts scene luminance into a histogram: bin 0 holds black pixels
 // and bins 1 to 63 cover log2 luminance in scene units from meterLowStops to meterHighStops.
 inline constexpr int meterBins = 64;

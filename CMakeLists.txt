@@ -118,7 +118,8 @@ if(WIN32)
     target_compile_definitions(WorldForgePlayer PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
     worldforge_compile_options(WorldForgePlayer)
     if(TARGET WorldForgeVulkan)
-        foreach(shader Sky.vert Sky.frag Shadow.vert Display.vert Display.frag Temporal.frag Ambient.frag PlayScene.vert PlayScene.frag)
+        foreach(shader Sky.vert Sky.frag Shadow.vert Display.vert Display.frag Temporal.frag Ambient.frag BloomDown.frag BloomUp.frag
+                       PlayScene.vert PlayScene.frag)
             string(REPLACE "." "_" variable "${shader}")
             set(output "${CMAKE_CURRENT_BINARY_DIR}/player-shaders/${variable}.h")
             worldforge_spirv("Engine/Render/Shaders/${shader}" "${output}" "spirv_${variable}")
@@ -212,7 +213,7 @@ if(TARGET WorldForgeVulkan)
                    Components/Shaders/SelectionOutline.vert Components/Shaders/SelectionOutline.frag
                    Engine/Render/Shaders/Sky.vert Engine/Render/Shaders/Sky.frag Engine/Render/Shaders/Shadow.vert
                    Engine/Render/Shaders/Display.vert Engine/Render/Shaders/Display.frag Engine/Render/Shaders/Temporal.frag
-                   Engine/Render/Shaders/Ambient.frag)
+                   Engine/Render/Shaders/Ambient.frag Engine/Render/Shaders/BloomDown.frag Engine/Render/Shaders/BloomUp.frag)
         get_filename_component(name "${shader}" NAME)
         set(output "${CMAKE_CURRENT_BINARY_DIR}/shaders/${name}.spv")
         worldforge_spirv("${shader}" "${output}" "")

@@ -62,6 +62,8 @@ struct PlayableScene {
     // The physically based atmosphere (Engine/Render/Atmosphere.h) instead of the horizon and zenith gradient
     // (format version 15).
     bool physicalSky = false;
+    // Bloom: light scattered around bright areas, as a camera lens does (format version 16 when off).
+    bool bloom = true;
     color::ViewTransform viewTransform = color::ViewTransform::AgX;
     Gameplay gameplay;
     std::vector<NativeBodyBinding> nativeBodies;

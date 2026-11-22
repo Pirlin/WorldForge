@@ -25,6 +25,10 @@ public:
     // Bounce light in RGB and sky visibility in alpha (Ambient.frag). Float, so a frame may exceed 1: the noisy
     // per-frame values average to the unbiased result under TAA.
     static constexpr VkFormat occlusionFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    // Bloom: a chain of bloomLevels images from half size down, built from the previous frame's TAA result before the
+    // display pass (one frame late, which motion hides), and mixed into the scene by the display step.
+    static constexpr int bloomLevels = 6;
+    static constexpr float bloomStrength = color::bloomStrength;
 
     struct Temporal {
         bool enabled = false;
@@ -51,9 +55,11 @@ public:
     bool createTargets(VkExtent2D extent,std::span<const VkImageView> outputs);
     void releaseTargets();
     // The display step uses vertex and fragment (Display.vert, Display.frag); TAA uses vertex and temporal
-    // (Temporal.frag); ambient occlusion uses vertex and ambient (Ambient.frag).
+    // (Temporal.frag); ambient occlusion uses vertex and ambient (Ambient.frag); bloom uses vertex with bloomDown and
+    // bloomUp (BloomDown.frag, BloomUp.frag).
     bool createDisplayPipeline(std::span<const uint32_t> vertex,std::span<const uint32_t> fragment,
-                               std::span<const uint32_t> temporal,std::span<const uint32_t> ambient);
+                               std::span<const uint32_t> temporal,std::span<const uint32_t> ambient,
+                               std::span<const uint32_t> bloomDown,std::span<const uint32_t> bloomUp);
     void destroyDisplayPipeline();
 
     // Scene geometry pipelines use scenePass subpass 0; editor overlays use displayPass subpass 1.
@@ -61,7 +67,7 @@ public:
     VkRenderPass displayPass() const { return displayPass_; }
     VkFormat depthFormat() const { return depthFormat_; }
     VkExtent2D extent() const { return extent_; }
-    bool displayReady() const { return display_ && temporal_ && ambient_ && sceneFramebuffer_; }
+    bool displayReady() const { return display_ && temporal_ && ambient_ && bloomDown_ && bloomUp_ && sceneFramebuffer_; }
 
     // The sub-pixel offset in pixels, each in [-0.5, 0.5), to render the next frame with when TAA is on.
     std::array<float,2> jitter() const;
@@ -75,10 +81,11 @@ public:
     // Begins the scene pass for output image `output`.
     void begin(VkCommandBuffer command,std::size_t output,const float background[3]);
     // Ends the scene pass, computes ambient occlusion, resolves TAA and draws the display step in the display
-    // pass. With meterSlot set, it also counts the scene luminance into that histogram for auto exposure. The caller may draw editor
+    // pass. With meterSlot set, it also counts the scene luminance into that histogram for auto exposure. bloom is the
+    // share of light scattered around bright areas (bloomStrength, or 0 for none). The caller may draw editor
     // overlays, then ends the render pass; call finishMeter after that when metering.
     void display(VkCommandBuffer command,float exposureStops,color::ViewTransform transform,int meterSlot,
-                 const Temporal &temporal,const Occlusion &occlusion);
+                 const Temporal &temporal,const Occlusion &occlusion,float bloom);
     void finishMeter(VkCommandBuffer command) const;
     // After the frame that metered into slot has finished: reads and clears the histogram, and gives the
     // log2 average scene luminance. Returns false when nothing was metered.
@@ -87,18 +94,28 @@ public:
 
 private:
     bool createPipeline(VkShaderModule vertex,VkShaderModule fragment,VkPipelineLayout layout,VkRenderPass pass,
-                        uint32_t subpass,VkPipeline &pipeline);
+                        uint32_t subpass,VkPipeline &pipeline,bool additive = false);
+    // Builds the bloom chain from the previous frame's TAA result.
+    void bloomChain(VkCommandBuffer command);
 
     const Device *device_ = nullptr;
     VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
     bool srgbOutput_ = false;
-    VkRenderPass scenePass_{}, occlusionPass_{}, displayPass_{};
-    VkDescriptorSetLayout displaySetLayout_{}, temporalSetLayout_{}, occlusionSetLayout_{};
+    VkRenderPass scenePass_{}, occlusionPass_{}, displayPass_{}, bloomDownPass_{}, bloomUpPass_{};
+    VkDescriptorSetLayout displaySetLayout_{}, temporalSetLayout_{}, occlusionSetLayout_{}, bloomSetLayout_{};
     VkDescriptorSet occlusionSet_{};
     VkDescriptorPool pool_{};
     std::array<VkDescriptorSet,2> displaySets_{}, temporalSets_{};
-    VkPipelineLayout displayLayout_{}, temporalLayout_{}, occlusionLayout_{};
-    VkPipeline display_{}, temporal_{}, ambient_{};
+    VkPipelineLayout displayLayout_{}, temporalLayout_{}, occlusionLayout_{}, bloomLayout_{};
+    VkPipeline display_{}, temporal_{}, ambient_{}, bloomDown_{}, bloomUp_{};
+    // Bloom levels, their framebuffers, and descriptor sets reading each level (0 to bloomLevels - 1) and each history
+    // image (bloomLevels, bloomLevels + 1).
+    std::array<Image,bloomLevels> bloom_;
+    std::array<VkExtent2D,bloomLevels> bloomExtents_{};
+    std::array<VkFramebuffer,bloomLevels> bloomFramebuffers_{};
+    std::array<VkDescriptorSet,bloomLevels+2> bloomSets_{};
+    bool bloomInitialized_ = false;
+    uint32_t framesShown_ = 0; // since the targets were created; the previous resolve exists from the second frame
     VkSampler nearest_{}, linear_{};
     Image scene_, indirect_, albedo_, occlusion_, depth_;
     std::array<Image,2> history_;

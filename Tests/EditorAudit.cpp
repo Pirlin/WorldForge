@@ -3163,6 +3163,18 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
     audit.check(page,"display","Editor and Player match with TAA off",!playedOff.isNull() && offAlike.mean <= 1 && offAlike.share <= 0.005,
                 playedOff.isNull() ? QStringLiteral("The Player did not capture the view.") : describe(offAlike));
 
+    // Bloom: turning it off removes the glow around the bright, sunlit road (the street corner faces the sun), and
+    // only that: the change is small and spread out.
+    const auto bloomed = settled(shots[1]);
+    setDisplay({{"bloom",false}});
+    const auto sharp = settled(shots[1]);
+    sharp.save(output.filePath("rendering-bloom-off.png"));
+    bloomed.save(output.filePath("rendering-bloom-on.png"));
+    const auto glow = difference(bloomed,sharp,"rendering-bloom-diff.png");
+    audit.check(page,"display","Bloom spreads a little light around bright areas",glow.mean > 0.05 && glow.mean < 4 && glow.share < 0.01,
+                describe(glow));
+    setDisplay({{"bloom",true}});
+
     // The physical atmosphere: a different sky and sunlight from the gradient, the same in the editor and the Player.
     setDisplay({{"antiAliasing","TAA"}});
     const auto gradient = settled(shots[0]);
