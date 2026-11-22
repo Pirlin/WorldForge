@@ -34,7 +34,7 @@ void write(std::ostream &json,std::initializer_list<float> values)
 // first row at the top), in the Radiance RGBE format Cycles reads.
 bool writeSky(const std::filesystem::path &file,const View &view)
 {
-    constexpr int width = 512, height = 256;
+    constexpr int width = 2048, height = 1024; // fine enough for a horizon as sharp as the engine's
     constexpr float pi = 3.14159265358979f;
     const std::array towardSun{view.sun.x,view.sun.y,view.sun.z};
     // The atmosphere is built from the authored sun (with the sun overhead), as the Player built it.
