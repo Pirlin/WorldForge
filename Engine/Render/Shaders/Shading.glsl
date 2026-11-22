@@ -27,12 +27,10 @@ vec3 skyIrradiance(vec3 n)
     return max(result,vec3(0.0));
 }
 
-// The sky seen in direction r, without the sun glow (direct sunlight covers the highlight).
+// The sky seen in direction r (its radiance map).
 vec3 skyRadianceToward(vec3 r)
 {
-    if (r.z < 0.0)
-        return lighting.skyGround.rgb;
-    return mix(lighting.skyHorizon.rgb,lighting.skyZenith.rgb,pow(r.z,0.55));
+    return skyEnvironment(r,0);
 }
 
 // The share of sky light that reaches position on a surface facing normal: each sky direction counts by its
@@ -53,7 +51,8 @@ float skyOpenness(vec3 position,vec3 normal)
     float open = 0.0, total = 0.0;
     for (int i = 0; i < 16; ++i) {
         vec3 direction = lighting.skyDirections[i].xyz;
-        float weight = dot(skyRadianceToward(direction),vec3(0.2126,0.7152,0.0722))*(max(dot(normal,direction),0.0)+0.05);
+        // w: the sky's luminance in that direction, the same for every pixel, so the renderer computes it once.
+        float weight = lighting.skyDirections[i].w*(max(dot(normal,direction),0.0)+0.05);
         vec3 c = (lighting.skyMatrices[i]*vec4(lifted,1.0)).xyz;
         vec2 uv = c.xy*0.5+0.5+jitter;
         float visible = 1.0;
@@ -68,18 +67,13 @@ float skyOpenness(vec3 position,vec3 normal)
     return total > 0.0 ? open/total : 1.0;
 }
 
-// The sky reflected in direction r by a surface of the given roughness, prefiltered with its GGX lobe. Mirror-like
-// surfaces use the sky itself, whose sharp horizon the table's 16 elevations would blur.
+// The sky reflected in direction r by a surface of the given roughness: the radiance map for a mirror, then its
+// levels prefiltered with the GGX lobe of roughness 1/3, 2/3 and 1.
 vec3 skyReflection(vec3 r,float roughness)
 {
-    float level = clamp(roughness,0.0,1.0)*7.0;
-    float elevation = clamp(r.z*0.5+0.5,0.0,1.0)*15.0;
-    int low = min(int(level),6), row = min(int(elevation),14);
-    float across = elevation-float(row);
-    vec3 lower = low == 0 ? skyRadianceToward(r)
-        : mix(lighting.skyReflections[low*16+row].rgb,lighting.skyReflections[low*16+row+1].rgb,across);
-    vec3 upper = mix(lighting.skyReflections[(low+1)*16+row].rgb,lighting.skyReflections[(low+1)*16+row+1].rgb,across);
-    return mix(lower,upper,level-float(low));
+    float level = clamp(roughness,0.0,1.0)*3.0;
+    int low = min(int(level),2);
+    return mix(skyEnvironment(r,low),skyEnvironment(r,low+1),level-float(low));
 }
 
 // The split-sum environment BRDF, analytic fit (Karis 2014, after Lazarov 2013): scale and bias for F0.
@@ -133,7 +127,7 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
     // Multiple-scattering compensation (Turquin 2019): a single GGX bounce reflects brdf.x+brdf.y of the light for a
     // perfect mirror material; the rest bounces again and leaves tinted by f0.
     vec3 energy = 1.0+f0*(1.0/max(brdf.x+brdf.y,1e-3)-1.0);
-    vec3 result = directLight(surface,v,normalize(lighting.sun.xyz),lighting.sun.w*sunVisibility,energy);
+    vec3 result = directLight(surface,v,normalize(lighting.sun.xyz),lighting.sun.w*sunVisibility,energy)*lighting.sunTint.rgb;
     int count = int(lighting.skyHorizon.w);
     for (int i = 0; i < count && i < 16; ++i) {
         vec4 light = lighting.lights[i];

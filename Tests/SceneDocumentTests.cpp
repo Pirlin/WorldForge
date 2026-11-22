@@ -12,6 +12,7 @@
 #include "Engine/Render/SkyLight.h"
 #include "Engine/Render/ShadowCascades.h"
 #include "Engine/Render/SkyVisibility.h"
+#include "Engine/Render/Atmosphere.h"
 #include "Tests/AgxReference.h"
 #include <algorithm>
 #include <sstream>
@@ -142,18 +143,22 @@ void checkColorPipeline()
             "Sunlight brightens the ground and the light it bounces");
     // Prefiltered reflections of the uniform sky: straight up a smooth-ish surface sees the sky, straight down the
     // ground, and a rough surface facing the horizon sees a blend of the two.
-    const auto reflection = [&](int level,int elevation) {
-        return uniformSky.reflections[std::size_t(level*color::reflectionElevations+elevation)][1];
+    const auto reflection = [&](float z,float roughness) {
+        const float d[3]{std::sqrt(1-z*z),0,z};
+        return color::skyReflection(uniformSky,d,roughness)[1];
     };
-    require(std::abs(reflection(2,color::reflectionElevations-1)-radiance) < 0.01f*radiance
-            && std::abs(reflection(2,0)-uniformSky.ground[1]) < 0.01f*radiance,
+    require(std::abs(reflection(0.99f,0.3f)-radiance) < 0.01f*radiance && std::abs(reflection(-0.99f,0.3f)-uniformSky.ground[1]) < 0.01f*radiance,
             "Prefiltered reflections show the sky above and the ground below");
-    const float belowHorizon = reflection(color::reflectionRoughnessLevels-1,color::reflectionElevations/2-1);
+    const float belowHorizon = reflection(-0.05f,1);
     require(belowHorizon > uniformSky.ground[1]*1.1f && belowHorizon < radiance*0.95f,
             "A rough reflection just below the horizon blends sky and ground");
     // Upward reflections leave out the part of the lobe under the surface, so they never see the ground.
-    require(std::abs(reflection(color::reflectionRoughnessLevels-1,color::reflectionElevations/2)-radiance) < 0.01f*radiance,
-            "A rough reflection just above the horizon sees only the sky");
+    require(std::abs(reflection(0.05f,1)-radiance) < 0.02f*radiance, "A rough reflection just above the horizon sees only the sky");
+    // The physical sky lights the scene with its own sunlight and blue sky.
+    const auto physical = color::physicalSkyLight({0.3f,0.2f,0.93f},1);
+    const auto physicalFloor = color::skyIrradiance(physical,0,0,1);
+    require(physical.environment.size() == color::mapTexels && physicalFloor[2] > physicalFloor[0] && physical.sunLight[0] > physical.sunLight[2],
+            "The physical sky gives blue sky light and warm sunlight");
     require(color::skyAmbientScale({166/255.0f,197/255.0f,219/255.0f},{65/255.0f,119/255.0f,177/255.0f}) == 1,
             "The default sky keeps the ambient light unchanged");
     require(color::skyAmbientScale({0.03f,0.03f,0.06f},{0.01f,0.01f,0.03f}) < 0.01f, "A night sky gives almost no ambient light");
@@ -242,6 +247,27 @@ void checkSkyVisibility()
     }
 }
 
+void checkAtmosphere()
+{
+    const auto lum = [](const color::Rgb &c) { return 0.2126f*c[0]+0.7152f*c[1]+0.0722f*c[2]; };
+    const atmosphere::Sky noon({0.3f,0.2f,0.93f},1), evening({-0.66f,0.71f,0.12f},1);
+    const float up[3]{0,0,1}, horizon[3]{1,0,0.02f}, away[3]{0.3f,0.95f,0.05f};
+    const auto zenith = noon.radiance(up), side = noon.radiance(horizon);
+    if (std::getenv("WORLDFORGE_PRINT_ATMOSPHERE")) {
+        const auto p = [](const char *name,const color::Rgb &c) { std::cout << name << ' ' << c[0] << ' ' << c[1] << ' ' << c[2] << '\n'; };
+        p("noon zenith",zenith); p("noon horizon",side); p("noon sun",noon.sunLight());
+        p("evening zenith",evening.radiance(up)); p("evening away",evening.radiance(away)); p("evening sun",evening.sunLight());
+        const float down[3]{0,0.3f,-0.95f};
+        p("noon ground",noon.radiance(down));
+    }
+    require(zenith[2] > zenith[1] && zenith[1] > zenith[0], "The physical sky is blue overhead");
+    require(lum(side) > lum(zenith) && side[2]/side[0] < zenith[2]/zenith[0], "The physical sky is brighter and whiter at the horizon");
+    require(std::abs(lum(atmosphere::Sky({0,0,1},1).sunLight())-1) < 0.01f, "An overhead sun gives the authored sunlight");
+    const auto low = evening.sunLight(), high = noon.sunLight();
+    require(lum(low) < lum(high) && low[0]/low[2] > 1.5f*high[0]/high[2], "A low sun is dimmer and redder");
+    require(lum(zenith)/lum(high) > 0.05f && lum(zenith)/lum(high) < 0.5f, "The blue sky's radiance is a realistic fraction of sunlight");
+}
+
 int main(int argc,char *argv[])
 {
     if (argc == 2) {
@@ -269,6 +295,7 @@ int main(int argc,char *argv[])
     checkFlip();
     checkShadowCascades();
     checkSkyVisibility();
+    checkAtmosphere();
     const auto example = Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAC");
     require(example && example->toString() == "a1723291-8a22-47dc-b098-1f6718cffaac", "GUID canonicalizes");
     require(!Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAX"), "Invalid GUID rejected");

@@ -17,16 +17,42 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     vec4 skyZenith;        // linear sky radiance at the zenith
     vec4 skyGround;        // linear radiance of the ground below the horizon
     vec4 lights[16];       // position or direction, intensity in scene units (negative for directional)
-    // Large-scale sky occlusion (Engine/Render/SkyVisibility.h): world space to each sky direction's depth map,
-    // the directions toward the sky, and settings: enabled, meters per texel, unused, unused.
+    // Large-scale sky occlusion (Engine/Render/SkyVisibility.h): world space to each sky direction's depth map, and
+    // the directions toward the sky with the sky's luminance in each (w).
     mat4 skyMatrices[16];
     vec4 skyDirections[16];
-    vec4 skySettings;
-    // The sky prefiltered for reflections (Engine/Render/SkyLight.h): roughness 0, 1/7 .. 1 by reflected elevation
-    // -1 .. 1 in 16 steps.
-    vec4 skyReflections[128];
+    vec4 skySettings;      // sky visibility maps on, their meters per texel, physical sky on, unused
+    vec4 sunTint;          // the color of sunlight at the ground, luminance 1 (white for the gradient sky)
 } lighting;
 layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles, one per sky direction, nearest
+// The sky's environment (Engine/Render/SkyLight.h): a 128 x 64 radiance map with rows closer near the horizon, then
+// the map prefiltered for roughness 1/3, 2/3 and 1 at 64 x 32.
+layout(std430, set = 0, binding = 5) readonly buffer SkyEnvironment { vec4 skyMap[]; };
+
+const float skyPi = 3.14159265359;
+
+// Bilinear lookup in direction d (unit, z up) of the map at offset, wrapping around the vertical.
+vec3 skyMapSample(int offset,int width,int height,vec3 d)
+{
+    float elevation = asin(clamp(d.z,-1.0,1.0));
+    float t = sign(elevation)*sqrt(abs(elevation)/(0.5*skyPi));
+    vec2 uv = vec2(atan(d.y,d.x)/(2.0*skyPi)+0.5,0.5+0.5*t);
+    float x = uv.x*float(width)-0.5, y = clamp(uv.y*float(height)-0.5,0.0,float(height-1));
+    int x0 = int(floor(x)), y0 = min(int(y),height-2);
+    float sx = x-float(x0), sy = clamp(y-float(y0),0.0,1.0);
+    int xa = ((x0%width)+width)%width, xb = ((x0+1)%width+width)%width;
+    vec3 low = mix(skyMap[offset+y0*width+xa].rgb,skyMap[offset+y0*width+xb].rgb,sx);
+    vec3 high = mix(skyMap[offset+(y0+1)*width+xa].rgb,skyMap[offset+(y0+1)*width+xb].rgb,sx);
+    return mix(low,high,sy);
+}
+
+// The sky in direction d: level 0 is its radiance, levels 1 to 3 its reflection by roughness 1/3, 2/3 and 1.
+vec3 skyEnvironment(vec3 d,int level)
+{
+    if (level == 0)
+        return skyMapSample(0,128,64,d);
+    return skyMapSample(128*64+(level-1)*64*32,64,32,d);
+}
 
 const float sunAngularDiameter = 0.00925; // radians, as in ShadowCascades.h
 const vec2 shadowDisk[16] = vec2[16](

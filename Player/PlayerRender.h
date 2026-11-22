@@ -27,12 +27,16 @@ struct View {
     // Manual exposure scale, view transform (0 Standard, 1 AgX), auto exposure (1 on), and its compensation in
     // stops. Backends without metering (Direct3D 11) use the manual exposure.
     DirectX::XMFLOAT4 display;
-    DirectX::XMFLOAT4 sky; // ambient light scale from the sky colors (color::skyAmbientScale), TAA, ambient occlusion
+    // Ambient light scale from the sky colors (color::skyAmbientScale), TAA, ambient occlusion, physical sky.
+    DirectX::XMFLOAT4 sky;
     // Light from the sky (color::skyLight): irradiance / pi as spherical harmonics, and linear sky radiance at the
     // horizon, the zenith and the ground. Direct3D 11 does not use them.
     DirectX::XMFLOAT4 skyIrradiance[9], skyHorizon, skyZenith, skyGround;
-    // The sky prefiltered for reflections (color::SkyLight::reflections). Direct3D 11 does not use it.
-    DirectX::XMFLOAT4 skyReflections[color::reflectionRoughnessLevels*color::reflectionElevations];
+    DirectX::XMFLOAT4 sunTint; // the color of sunlight at the ground, luminance 1
+    // The sky's environment map (color::SkyLight::environment) and a number that changes whenever it does.
+    // Direct3D 11 does not use them.
+    const std::vector<std::array<float,4>> *skyEnvironment = nullptr;
+    std::uint64_t skyRevision = 0;
     // Sun shadow cascades (Engine/Render/ShadowCascades.h), fitted to the view without TAA jitter. Direct3D 11 uses
     // lightProjection instead.
     shadow::Cascades cascades;

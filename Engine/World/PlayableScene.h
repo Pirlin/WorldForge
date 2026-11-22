@@ -59,6 +59,9 @@ struct PlayableScene {
     bool temporalAntiAliasing = true;
     // Ground-truth ambient occlusion darkens sky light in creases, corners and openings.
     bool ambientOcclusion = true;
+    // The physically based atmosphere (Engine/Render/Atmosphere.h) instead of the horizon and zenith gradient
+    // (format version 15).
+    bool physicalSky = false;
     color::ViewTransform viewTransform = color::ViewTransform::AgX;
     Gameplay gameplay;
     std::vector<NativeBodyBinding> nativeBodies;

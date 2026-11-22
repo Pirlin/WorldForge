@@ -881,6 +881,21 @@ void MainWindow::editAtmosphere()
     };
     auto *horizon = colorControl(tr("Horizon"),initial.horizon);
     auto *zenith = colorControl(tr("Zenith"),initial.zenith);
+    auto *skyModel = new QComboBox(&dialog);
+    skyModel->setAccessibleName(tr("Sky model"));
+    skyModel->addItem(tr("Gradient (horizon and zenith colors)"),QStringLiteral("Gradient"));
+    skyModel->addItem(tr("Physical atmosphere"),QStringLiteral("Physical"));
+    skyModel->setCurrentIndex(initial.physicalSky ? 1 : 0);
+    skyModel->setToolTip(tr("The physical atmosphere scatters sunlight as air does: a blue sky, a white horizon and an "
+                            "orange low sun, all set by the sun's position."));
+    form->addRow(tr("Sky model"),skyModel);
+    const auto skyColors = [skyModel,horizon,zenith] {
+        const bool gradient = skyModel->currentIndex() == 0;
+        horizon->setEnabled(gradient);
+        zenith->setEnabled(gradient);
+    };
+    skyColors();
+    connect(skyModel,&QComboBox::currentIndexChanged,&dialog,skyColors);
     auto *fogColor = colorControl(tr("Fog color"),initial.fogColor);
     auto *fog = new QDoubleSpinBox(&dialog);
     fog->setAccessibleName(tr("Fog density"));
@@ -995,7 +1010,7 @@ void MainWindow::editAtmosphere()
                               {"shadows",shadows->isChecked()},{"localFogRadius",localRadius->value()},
                               {"localFogDensity",localDensity->value()},
                               {"ev100",exposure->value()},{"exposureMode",exposureMode->currentData().toString()},
-                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},
+                              {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},
                               {"localFogCenter",QJsonArray{localCenter[0]->value(),localCenter[1]->value(),localCenter[2]->value()}}});
 }
 

@@ -42,14 +42,15 @@ bool WorldLightingVulkan::create(QVulkanWindow &window,QVulkanDeviceFunctions *v
         {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
+        {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
     };
-    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,4,bindings};
+    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,5,bindings};
     if (vk_->vkCreateDescriptorSetLayout(device_,&layout,nullptr,&layout_) != VK_SUCCESS)
         return false;
     const auto count = uint32_t(window.concurrentFrameCount());
     const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2*count},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,count}};
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2*count}};
     const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,count,3,sizes};
     if (vk_->vkCreateDescriptorPool(device_,&pool,nullptr,&pool_) != VK_SUCCESS)
         return false;
@@ -126,6 +127,14 @@ bool WorldLightingVulkan::createFrame(Frame &frame,VkFormat format)
     if (!allocate(frame.textureMemory,requirements,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         || vk_->vkBindBufferMemory(device_,frame.textures,frame.textureMemory,0) != VK_SUCCESS)
         return false;
+    const VkBufferCreateInfo environmentBuffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,nullptr,0,environmentBytes,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_SHARING_MODE_EXCLUSIVE,0,nullptr};
+    if (vk_->vkCreateBuffer(device_,&environmentBuffer,nullptr,&frame.environment) != VK_SUCCESS)
+        return false;
+    vk_->vkGetBufferMemoryRequirements(device_,frame.environment,&requirements);
+    if (!allocate(frame.environmentMemory,requirements,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        || vk_->vkBindBufferMemory(device_,frame.environment,frame.environmentMemory,0) != VK_SUCCESS)
+        return false;
     const VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,nullptr,pool_,1,&layout_};
     if (vk_->vkAllocateDescriptorSets(device_,&allocation,&frame.set) != VK_SUCCESS)
         return false;
@@ -133,13 +142,15 @@ bool WorldLightingVulkan::createFrame(Frame &frame,VkFormat format)
     const VkDescriptorImageInfo skyMaps{sampler_,sky_.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
     const VkDescriptorBufferInfo uniform{frame.uniform,0,sizeof(LightingUniform)};
     const VkDescriptorBufferInfo textures{frame.textures,0,textureBytes_};
+    const VkDescriptorBufferInfo environment{frame.environment,0,environmentBytes};
     const VkWriteDescriptorSet writes[]{
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,0,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&depth,nullptr,nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,1,0,1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,nullptr,&uniform,nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,2,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&textures,nullptr},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,4,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&skyMaps,nullptr,nullptr}
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,4,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&skyMaps,nullptr,nullptr},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,5,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&environment,nullptr}
     };
-    vk_->vkUpdateDescriptorSets(device_,4,writes,0,nullptr);
+    vk_->vkUpdateDescriptorSets(device_,5,writes,0,nullptr);
     return true;
 }
 
@@ -180,6 +191,22 @@ bool WorldLightingVulkan::uploadTextures(int index,std::span<const uint32_t> pix
     return true;
 }
 
+bool WorldLightingVulkan::uploadEnvironment(int index,std::span<const std::array<float,4>> environment,uint64_t revision)
+{
+    auto &frame = frames_[index];
+    if (environment.empty() || frame.environmentRevision == revision)
+        return true;
+    if (environment.size_bytes() > environmentBytes)
+        return false;
+    void *destination = nullptr;
+    if (vk_->vkMapMemory(device_,frame.environmentMemory,0,environment.size_bytes(),0,&destination) != VK_SUCCESS)
+        return false;
+    std::memcpy(destination,environment.data(),environment.size_bytes());
+    vk_->vkUnmapMemory(device_,frame.environmentMemory);
+    frame.environmentRevision = revision;
+    return true;
+}
+
 void WorldLightingVulkan::destroy()
 {
     if (!vk_)
@@ -192,6 +219,8 @@ void WorldLightingVulkan::destroy()
         if (frame.uniformMemory) vk_->vkFreeMemory(device_,frame.uniformMemory,nullptr);
         if (frame.textures) vk_->vkDestroyBuffer(device_,frame.textures,nullptr);
         if (frame.textureMemory) vk_->vkFreeMemory(device_,frame.textureMemory,nullptr);
+        if (frame.environment) vk_->vkDestroyBuffer(device_,frame.environment,nullptr);
+        if (frame.environmentMemory) vk_->vkFreeMemory(device_,frame.environmentMemory,nullptr);
     }
     destroyDepthTarget(sky_);
     if (sampler_) vk_->vkDestroySampler(device_,sampler_,nullptr);

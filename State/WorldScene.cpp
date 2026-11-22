@@ -58,6 +58,7 @@ WorldAtmosphere readAtmosphere(const QJsonObject &details)
     environment.autoExposure = details.value("exposureMode").toString() == "Auto";
     environment.temporalAntiAliasing = details.value("antiAliasing").toString() != "Off";
     environment.ambientOcclusion = details.value("ambientOcclusion").toBool(true);
+    environment.physicalSky = details.value("skyModel").toString() == QStringLiteral("Physical");
     environment.exposureCompensation = float(std::clamp(details.value("exposureCompensation").toDouble(),
         -double(units::maximumCompensation),double(units::maximumCompensation)));
     environment.viewTransform = details.value("viewTransform").toString() == "Standard"

@@ -23,21 +23,24 @@ struct LightingUniform {
     float lights[16][4];        // position or direction, intensity (negative for directional)
     float skyMatrices[worldforge::sky::directionCount][16]; // Engine/Render/SkyVisibility.h
     float skyDirections[worldforge::sky::directionCount][4];
-    float skySettings[4];       // enabled, meters per texel
-    float skyReflections[worldforge::color::reflectionRoughnessLevels*worldforge::color::reflectionElevations][4];
+    float skySettings[4];       // sky visibility maps on, meters per texel, physical sky on
+    float sunTint[4];           // sunlight color at the ground, luminance 1
 };
-static_assert(sizeof(LightingUniform) == 4160);
+static_assert(sizeof(LightingUniform) == 2128);
 
 class WorldLightingVulkan {
 public:
     static constexpr uint32_t shadowSize = worldforge::shadow::atlasSize; // the cascade atlas
     static constexpr uint32_t textureCapacity = 2048 * 2048;
     static constexpr uint32_t worldTextureCapacity = 1024 * 1024;
+    static constexpr VkDeviceSize environmentBytes = worldforge::color::mapTexels*sizeof(std::array<float,4>);
 
     bool create(QVulkanWindow &window,QVulkanDeviceFunctions *vk,bool modeling);
     void destroy();
     bool upload(int frame,const LightingUniform &data);
     bool uploadTextures(int frame,std::span<const uint32_t> pixels,uint64_t revision);
+    // The sky's environment map (color::SkyLight::environment) for binding 5, copied when revision changes.
+    bool uploadEnvironment(int frame,std::span<const std::array<float,4>> environment,uint64_t revision);
     VkDescriptorSet descriptor(int frame) const { return frames_[frame].set; }
     VkFramebuffer framebuffer(int frame) const { return frames_[frame].shadow.framebuffer; }
     // The sky visibility maps (Engine/Render/SkyVisibility.h), rendered with pass() like the shadow atlas.
@@ -60,6 +63,9 @@ private:
         VkBuffer textures{};
         VkDeviceMemory textureMemory{};
         uint64_t textureRevision{};
+        VkBuffer environment{};
+        VkDeviceMemory environmentMemory{};
+        uint64_t environmentRevision = ~uint64_t(0);
         VkDescriptorSet set{};
     };
     bool createFrame(Frame &frame,VkFormat format);

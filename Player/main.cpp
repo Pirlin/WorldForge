@@ -643,19 +643,27 @@ public:
             playable_.viewTransform == wf::color::ViewTransform::AgX ? 1.0f : 0.0f,playable_.autoExposure ? 1.0f : 0.0f,
             playable_.exposureCompensation};
         view.sky = {wf::color::skyAmbientScale(playable_.horizon,playable_.zenith),playable_.temporalAntiAliasing ? 1.0f : 0.0f,
-            playable_.ambientOcclusion ? 1.0f : 0.0f,0};
+            playable_.ambientOcclusion ? 1.0f : 0.0f,playable_.physicalSky ? 1.0f : 0.0f};
         // The scene's sky and sun do not change while it plays, so its sky light is computed once.
-        if (!skyLight_)
-            skyLight_ = wf::color::skyLight(playable_.horizon,playable_.zenith,{view.sun.x,view.sun.y,view.sun.z},view.sun.w);
+        if (!skyLight_) {
+            const std::array towardSun{view.sun.x,view.sun.y,view.sun.z};
+            skyLight_ = playable_.physicalSky ? wf::color::physicalSkyLight(towardSun,view.sun.w)
+                                              : wf::color::skyLight(playable_.horizon,playable_.zenith,towardSun,view.sun.w);
+            ++skyRevision_;
+        }
+        // The physical sky's sun reaches the ground dimmer and warmer than overhead.
+        const auto &sunLight = skyLight_->sunLight;
+        const float sunLuminance = 0.2126f*sunLight[0]+0.7152f*sunLight[1]+0.0722f*sunLight[2];
+        view.sun.w = sunLuminance;
+        view.sunTint = sunLuminance > 0 ? XMFLOAT4{sunLight[0]/sunLuminance,sunLight[1]/sunLuminance,sunLight[2]/sunLuminance,0}
+                                        : XMFLOAT4{1,1,1,0};
+        view.skyEnvironment = &skyLight_->environment;
+        view.skyRevision = skyRevision_;
         for (std::size_t i = 0; i < 9; ++i)
             view.skyIrradiance[i] = {skyLight_->irradiance[i][0],skyLight_->irradiance[i][1],skyLight_->irradiance[i][2],0};
         view.skyHorizon = parameter(skyLight_->horizon,0);
         view.skyZenith = parameter(skyLight_->zenith,0);
         view.skyGround = parameter(skyLight_->ground,0);
-        for (std::size_t i = 0; i < skyLight_->reflections.size(); ++i) {
-            const auto &entry = skyLight_->reflections[i];
-            view.skyReflections[i] = {entry[0],entry[1],entry[2],0};
-        }
         return view;
     }
 
@@ -767,6 +775,7 @@ private:
     wf::PlayableScene playable_;
     wf::NativeGameplay native_;
     std::optional<wf::color::SkyLight> skyLight_;
+    std::uint64_t skyRevision_ = 0;
     wf::Point3 spawn_;
     std::vector<std::array<std::vector<wf::PlayVertex>,wf::Heightfield::chunks*wf::Heightfield::chunks>> chunks_;
     std::vector<wf::PlayVertex> vertices_;

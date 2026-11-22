@@ -171,20 +171,26 @@ std::vector<Light> sceneLights(const QList<SceneObject> &objects,const WorldAtmo
     return lights;
 }
 
-// Sky light for the shading model, cached because it changes only with the sky colors and the sun.
-const wf::color::SkyLight &cachedSkyLight(const WorldAtmosphere &environment,const Light &sun)
+// Sky light for the shading model, cached because it changes only with the sky model, its colors and the sun.
+// revision changes whenever the sky light does.
+const wf::color::SkyLight &cachedSkyLight(const WorldAtmosphere &environment,const Light &sun,uint64_t &revision)
 {
     static std::optional<wf::color::SkyLight> cached;
-    static std::array<float,10> key{};
+    static std::array<float,11> key{};
+    static uint64_t counter = 0;
     const auto rgb = [](const QColor &color) { return wf::color::Rgb{float(color.redF()),float(color.greenF()),float(color.blueF())}; };
-    const std::array<float,10> next{float(environment.horizon.redF()),float(environment.horizon.greenF()),
+    const std::array<float,11> next{float(environment.horizon.redF()),float(environment.horizon.greenF()),
         float(environment.horizon.blueF()),float(environment.zenith.redF()),float(environment.zenith.greenF()),
-        float(environment.zenith.blueF()),sun.vector.x(),sun.vector.y(),sun.vector.z(),sun.intensity};
+        float(environment.zenith.blueF()),sun.vector.x(),sun.vector.y(),sun.vector.z(),sun.intensity,
+        environment.physicalSky ? 1.0f : 0.0f};
     if (!cached || next != key) {
-        cached = wf::color::skyLight(rgb(environment.horizon),rgb(environment.zenith),
-                                     {sun.vector.x(),sun.vector.y(),sun.vector.z()},sun.intensity);
+        const std::array towardSun{sun.vector.x(),sun.vector.y(),sun.vector.z()};
+        cached = environment.physicalSky ? wf::color::physicalSkyLight(towardSun,sun.intensity)
+            : wf::color::skyLight(rgb(environment.horizon),rgb(environment.zenith),towardSun,sun.intensity);
         key = next;
+        ++counter;
     }
+    revision = counter;
     return *cached;
 }
 
@@ -2349,7 +2355,12 @@ public:
             lights = sceneLights(window_.runtime_ ? window_.runtime_->objects() : project->objects,environment);
         const Light sunlight = lights.front();
         const auto sun = sunlight.vector;
-        const float sunStrength = sunlight.intensity;
+        uint64_t skyRevision = 0;
+        const auto &skyLight = cachedSkyLight(environment,sunlight,skyRevision);
+        // The physical sky's sun reaches the ground dimmer and warmer than overhead (sunLight); the gradient sky's
+        // sun is as authored.
+        const auto &sunLight = skyLight.sunLight;
+        const float sunStrength = 0.2126f*sunLight[0]+0.7152f*sunLight[1]+0.0722f*sunLight[2];
         const float windTime = float(window_.windClock_.elapsed()%1000000)*0.001f;
         const bool shadows = environment.shadows && sunStrength > 0 && !geometry.triangles.empty();
         LightingUniform lighting{};
@@ -2363,16 +2374,16 @@ public:
         lighting.settings[3] = window_.modelOnly_ ? 1.0f : skyAmbient(environment);
         // The shading model (Shading.glsl): the sun, the sky light and up to 16 other lights.
         const auto towardSun = sunlight.vector.normalized();
-        const float sunValues[4]{towardSun.x(),towardSun.y(),towardSun.z(),sunlight.intensity};
+        const float sunValues[4]{towardSun.x(),towardSun.y(),towardSun.z(),sunStrength};
         std::copy_n(sunValues,4,lighting.sun);
-        const auto &skyLight = cachedSkyLight(environment,sunlight);
+        for (int c = 0; c < 3; ++c)
+            lighting.sunTint[c] = sunStrength > 0 ? sunLight[std::size_t(c)]/sunStrength : 1.0f;
+        lighting.skySettings[2] = environment.physicalSky ? 1.0f : 0.0f;
         for (std::size_t i = 0; i < 9; ++i)
             std::copy_n(skyLight.irradiance[i].data(),4,lighting.skyIrradiance[i]);
         std::copy_n(skyLight.horizon.data(),3,lighting.skyHorizon);
         std::copy_n(skyLight.zenith.data(),3,lighting.skyZenith);
         std::copy_n(skyLight.ground.data(),3,lighting.skyGround);
-        for (std::size_t i = 0; i < skyLight.reflections.size(); ++i)
-            std::copy_n(skyLight.reflections[i].data(),4,lighting.skyReflections[i]);
         int lightCount = 0;
         for (std::size_t i = 1; i < lights.size() && lightCount < 16; ++i)
             if (lights[i].intensity > 0) {
@@ -2414,6 +2425,8 @@ public:
         for (int i = 0; i < wf::sky::directionCount; ++i) {
             std::copy_n(skyVisibility.matrices[i].data(),16,lighting.skyMatrices[i]);
             std::copy_n(skyVisibility.directions[i].data(),4,lighting.skyDirections[i]);
+            // w: the sky's luminance in that direction, which weights it in skyOpenness.
+            lighting.skyDirections[i][3] = wf::color::skyLuminance(skyLight,skyVisibility.directions[i].data());
         }
         lighting.skySettings[0] = skyMaps ? 1.0f : 0.0f;
         lighting.skySettings[1] = skyVisibility.metersPerTexel;
@@ -2422,7 +2435,8 @@ public:
         const bool ready = triangles_ && lines_ && sky_ && shadow_
             && (!hasGeometry || upload(frame,geometry,window_.geometryRevision_)) && lighting_.upload(frameIndex,lighting)
             && lighting_.uploadTextures(frameIndex,window_.modelOnly_ ? geometry.texturePixels : window_.worldTexturePixels_,
-                window_.textureRevision_);
+                window_.textureRevision_)
+            && lighting_.uploadEnvironment(frameIndex,skyLight.environment,skyRevision);
         if (ready) {
             recordDepthTiles(command,frame,lighting_.framebuffer(frameIndex),WorldLightingVulkan::shadowSize,wf::shadow::tileSize,
                              shadows,geometry.triangles.size(),cascades.matrices,windTime);

@@ -42,7 +42,7 @@ struct LightingBlock {      // Lighting.glsl
     XMFLOAT4 sun, skyIrradiance[9], skyHorizon, skyZenith, skyGround, lights[16];
     XMFLOAT4X4 skyMatrices[sky::directionCount];
     XMFLOAT4 skyDirections[sky::directionCount], skySettings; // settings: enabled, meters per texel
-    XMFLOAT4 skyReflections[color::reflectionRoughnessLevels*color::reflectionElevations];
+    XMFLOAT4 sunTint; // sunlight color, luminance 1
 };
 struct PlayViewBlock {      // PlayView.glsl
     XMFLOAT4X4 viewProjection;
@@ -55,7 +55,7 @@ struct CameraConstants {    // push constants of Sky and Shadow shaders
 struct MaterialConstants {  // push constants of PlayScene.frag
     XMFLOAT4 emissive, factors;
 };
-static_assert(sizeof(LightingBlock) == 4160 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
+static_assert(sizeof(LightingBlock) == 2128 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
 
 constexpr uint32_t shadowSize = shadow::atlasSize;
 constexpr uint32_t framesInFlight = 2;
@@ -154,7 +154,8 @@ private:
         VkCommandBuffer command{};
         VkFence fence{};
         VkSemaphore acquired{};
-        vk::Buffer vertices, lighting, view;
+        vk::Buffer vertices, lighting, view, environment; // environment: the sky's map (binding 5)
+        std::uint64_t environmentRevision = ~std::uint64_t(0);
         vk::Image shadow;
         VkFramebuffer shadowFramebuffer{};
         VkDescriptorSet set{};
@@ -382,11 +383,12 @@ bool VulkanRenderer::createLayouts()
         {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,both,nullptr},
         {3,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,both,nullptr},
-        {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
+        {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}};
     std::array<VkDescriptorSetLayoutBinding,5> materialBindings{};
     for (uint32_t i = 0; i < materialBindings.size(); ++i)
         materialBindings[i] = {i,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
-    const VkDescriptorSetLayoutCreateInfo frameInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,4,frameBindings};
+    const VkDescriptorSetLayoutCreateInfo frameInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,5,frameBindings};
     const VkDescriptorSetLayoutCreateInfo materialInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,
         uint32_t(materialBindings.size()),materialBindings.data()};
     if (api_.vkCreateDescriptorSetLayout(device,&frameInfo,nullptr,&frameLayout_) != VK_SUCCESS
@@ -522,8 +524,8 @@ bool VulkanRenderer::createPipelines()
 bool VulkanRenderer::createFrames()
 {
     const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2*framesInFlight},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2*framesInFlight}};
-    const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,framesInFlight,2,sizes};
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2*framesInFlight},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,framesInFlight}};
+    const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,framesInFlight,3,sizes};
     if (api_.vkCreateDescriptorPool(device,&pool,nullptr,&framePool_) != VK_SUCCESS)
         return false;
     if (!skyImage_.create(device_,frame_.depthFormat(),{sky::atlasSize,sky::atlasSize},
@@ -545,6 +547,7 @@ bool VulkanRenderer::createFrames()
             || api_.vkCreateSemaphore(device,&semaphore,nullptr,&frame.acquired) != VK_SUCCESS
             || !frame.lighting.create(device_,sizeof(LightingBlock),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
             || !frame.view.create(device_,sizeof(PlayViewBlock),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
+            || !frame.environment.create(device_,color::mapTexels*sizeof(std::array<float,4>),VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
             || !frame.shadow.create(device_,frame_.depthFormat(),{shadowSize,shadowSize},
                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                     VK_IMAGE_ASPECT_DEPTH_BIT)
@@ -558,12 +561,14 @@ bool VulkanRenderer::createFrames()
         const VkDescriptorImageInfo shadow{shadowSampler_,frame.shadow.view,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
         const VkDescriptorBufferInfo lighting{frame.lighting.buffer,0,sizeof(LightingBlock)};
         const VkDescriptorBufferInfo view{frame.view.buffer,0,sizeof(PlayViewBlock)};
+        const VkDescriptorBufferInfo environment{frame.environment.buffer,0,color::mapTexels*sizeof(std::array<float,4>)};
         const VkWriteDescriptorSet writes[]{
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,0,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&shadow,nullptr,nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,1,0,1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,nullptr,&lighting,nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,3,0,1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,nullptr,&view,nullptr},
-            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,4,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&skyMaps,nullptr,nullptr}};
-        api_.vkUpdateDescriptorSets(device,4,writes,0,nullptr);
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,4,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&skyMaps,nullptr,nullptr},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,5,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&environment,nullptr}};
+        api_.vkUpdateDescriptorSets(device,5,writes,0,nullptr);
     }
     return true;
 }
@@ -782,14 +787,26 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     for (int i = 0; i < sky::directionCount; ++i) {
         std::memcpy(&lighting.skyMatrices[i],view.skyVisibility.matrices[i].data(),sizeof(lighting.skyMatrices[i]));
         const auto &direction = view.skyVisibility.directions[i];
-        lighting.skyDirections[i] = {direction[0],direction[1],direction[2],0};
+        // w: the sky's luminance in that direction, which weights it in skyOpenness.
+        float luminance = 0;
+        if (view.skyEnvironment && view.skyEnvironment->size() >= color::mapTexels) {
+            const float d[3]{direction[0],direction[1],direction[2]};
+            const auto value = color::sky::sample(*view.skyEnvironment,0,color::mapWidth,color::mapHeight,d);
+            luminance = 0.2126f*value[0]+0.7152f*value[1]+0.0722f*value[2];
+        }
+        lighting.skyDirections[i] = {direction[0],direction[1],direction[2],luminance};
     }
-    lighting.skySettings = {view.skyMaps && view.sky.z > 0.5f ? 1.0f : 0.0f,view.skyVisibility.metersPerTexel,0,0};
+    lighting.skySettings = {view.skyMaps && view.sky.z > 0.5f ? 1.0f : 0.0f,view.skyVisibility.metersPerTexel,view.sky.w,0};
     std::copy(std::begin(view.skyIrradiance),std::end(view.skyIrradiance),std::begin(lighting.skyIrradiance));
     lighting.skyHorizon = {view.skyHorizon.x,view.skyHorizon.y,view.skyHorizon.z,view.eye.w};
     lighting.skyZenith = view.skyZenith;
     lighting.skyGround = view.skyGround;
-    std::copy(std::begin(view.skyReflections),std::end(view.skyReflections),std::begin(lighting.skyReflections));
+    lighting.sunTint = view.sunTint;
+    if (view.skyEnvironment && frame.environmentRevision != view.skyRevision
+        && view.skyEnvironment->size()*sizeof(std::array<float,4>) <= frame.environment.size) {
+        std::memcpy(frame.environment.mapped,view.skyEnvironment->data(),view.skyEnvironment->size()*sizeof(std::array<float,4>));
+        frame.environmentRevision = view.skyRevision;
+    }
     std::copy(std::begin(view.lights),std::end(view.lights),std::begin(lighting.lights));
     std::memcpy(frame.lighting.mapped,&lighting,sizeof(lighting));
     PlayViewBlock block{vulkanClip(view.viewProjection),view.eye,view.horizon,view.zenith,view.fog,view.sun,{},
@@ -1100,6 +1117,8 @@ void VulkanRenderer::release()
             frame.vertices.destroy(device_);
             frame.lighting.destroy(device_);
             frame.view.destroy(device_);
+            frame.environment.destroy(device_);
+            frame.environmentRevision = ~std::uint64_t(0);
             if (frame.shadowFramebuffer)
                 api_.vkDestroyFramebuffer(device,frame.shadowFramebuffer,nullptr);
             frame.shadow.destroy(device_);

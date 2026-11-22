@@ -1,7 +1,7 @@
 {
-    "aerial": 0.0334,
+    "aerial": 0.0261,
     "note": "Mean LDR-FLIP of the Player against Cycles; written by WorldForgeEditorAudit --realism.",
     "samples": 256,
-    "shop-front": 0.0567,
-    "street-corner": 0.0555
+    "shop-front": 0.0409,
+    "street-corner": 0.0569
 }

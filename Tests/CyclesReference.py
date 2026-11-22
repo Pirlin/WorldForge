@@ -172,7 +172,14 @@ background = nodes["Background"]
 sky = description["sky"]
 sun = description["sun"]
 sun_direction = Vector(sun["direction"]).normalized()
-if sky["visible"]:
+if sky["visible"] and sky.get("physical"):
+    # The physical atmosphere, baked by the Player into an equirectangular radiance map.
+    environment = nodes.new("ShaderNodeTexEnvironment")
+    environment.image = bpy.data.images.load(os.path.join(folder, sky["map"]))
+    environment.image.colorspace_settings.name = "Non-Color"
+    links.new(environment.outputs["Color"], background.inputs["Color"])
+    background.inputs["Strength"].default_value = 1
+elif sky["visible"]:
     horizon, zenith = linear(sky["horizon"]), linear(sky["zenith"])
     coordinates = nodes.new("ShaderNodeTexCoord")
     direction = nodes.new("ShaderNodeVectorMath")
@@ -224,8 +231,9 @@ else:
     background.inputs["Strength"].default_value = 0
 
 
-def add_light(name, kind, intensity, vector, shadows=True):
+def add_light(name, kind, intensity, vector, shadows=True, color=(1, 1, 1)):
     light = bpy.data.lights.new(name, kind)
+    light.color = color
     light.use_shadow = shadows
     item = bpy.data.objects.new(name, light)
     scene.collection.objects.link(item)
@@ -241,7 +249,7 @@ def add_light(name, kind, intensity, vector, shadows=True):
 
 
 if sun["intensity"] > 0:
-    add_light("Sun", "SUN", sun["intensity"], sun["direction"], sun["shadows"])
+    add_light("Sun", "SUN", sun["intensity"], sun["direction"], sun["shadows"], tuple(sun.get("color", (1, 1, 1))))
 for number, light in enumerate(description["lights"]):
     add_light("Light %d" % number, "SUN" if light["directional"] else "POINT", light["intensity"], light["vector"])
 

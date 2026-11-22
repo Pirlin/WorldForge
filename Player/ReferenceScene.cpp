@@ -1,6 +1,9 @@
 #include "Player/ReferenceScene.h"
 
+#include "Engine/Render/Atmosphere.h"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -25,6 +28,44 @@ void write(std::ostream &json,std::initializer_list<float> values)
         first = false;
     }
     json << ']';
+}
+
+// The physical sky as Blender's equirectangular environment (u = 0.5 - atan2(y, x) / 2pi, v = elevation / pi + 0.5,
+// first row at the top), in the Radiance RGBE format Cycles reads.
+bool writeSky(const std::filesystem::path &file,const View &view)
+{
+    constexpr int width = 512, height = 256;
+    constexpr float pi = 3.14159265358979f;
+    const std::array towardSun{view.sun.x,view.sun.y,view.sun.z};
+    // View carries the sunlight that reaches the ground; the atmosphere is built from the authored (overhead) value.
+    const auto unit = atmosphere::Sky(towardSun,1).sunLight();
+    const float reaching = 0.2126f*unit[0]+0.7152f*unit[1]+0.0722f*unit[2];
+    const atmosphere::Sky sky(towardSun,reaching > 0 ? view.sun.w/reaching : 0);
+    std::ofstream out(file,std::ios::binary);
+    out << "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y " << height << " +X " << width << "\n";
+    std::vector<unsigned char> row(std::size_t(width)*4);
+    for (int y = 0; y < height; ++y) {
+        const float elevation = (0.5f-(float(y)+0.5f)/height)*pi;
+        for (int x = 0; x < width; ++x) {
+            const float azimuth = (0.5f-(float(x)+0.5f)/width)*2*pi;
+            const float direction[3]{std::cos(azimuth)*std::cos(elevation),std::sin(azimuth)*std::cos(elevation),
+                                     std::sin(elevation)};
+            const auto radiance = sky.radiance(direction);
+            const float largest = std::max({radiance[0],radiance[1],radiance[2]});
+            auto *texel = &row[std::size_t(x)*4];
+            if (!(largest > 1e-32f)) {
+                texel[0] = texel[1] = texel[2] = texel[3] = 0;
+                continue;
+            }
+            int exponent = 0;
+            const float scale = std::frexp(largest,&exponent)*256.0f/largest;
+            for (int c = 0; c < 3; ++c)
+                texel[c] = static_cast<unsigned char>(std::clamp(radiance[std::size_t(c)]*scale,0.0f,255.0f));
+            texel[3] = static_cast<unsigned char>(exponent+128);
+        }
+        out.write(reinterpret_cast<const char *>(row.data()),std::streamsize(row.size()));
+    }
+    return bool(out);
 }
 
 } // namespace
@@ -66,7 +107,15 @@ bool writeReference(const std::filesystem::path &folder,const std::vector<PlayVe
     json << ", \"verticalFov\": ";
     write(json,camera.verticalFov);
     json << ", \"width\": " << camera.width << ", \"height\": " << camera.height << ", \"near\": 0.05, \"far\": 1800},\n";
-    json << "  \"sky\": {\"visible\": " << (sky ? "true" : "false") << ", \"horizon\": ";
+    const bool physical = view.sky.w > 0.5f;
+    if (physical && !writeSky(folder / "sky.hdr",view)) {
+        error = "Could not write sky.hdr.";
+        return false;
+    }
+    json << "  \"sky\": {\"visible\": " << (sky ? "true" : "false") << ", \"physical\": " << (physical ? "true" : "false");
+    if (physical)
+        json << ", \"map\": \"sky.hdr\"";
+    json << ", \"horizon\": ";
     write(json,{view.horizon.x,view.horizon.y,view.horizon.z});
     json << ", \"zenith\": ";
     write(json,{view.zenith.x,view.zenith.y,view.zenith.z});
@@ -74,6 +123,8 @@ bool writeReference(const std::filesystem::path &folder,const std::vector<PlayVe
     write(json,{view.sun.x,view.sun.y,view.sun.z});
     json << ", \"intensity\": ";
     write(json,view.sun.w);
+    json << ", \"color\": ";
+    write(json,{view.sunTint.x,view.sunTint.y,view.sunTint.z});
     json << ", \"shadows\": " << (view.lighting.y > 0.5f ? "true" : "false") << "},\n  \"lights\": [";
     for (int i = 0; i < int(view.eye.w); ++i) {
         const auto &light = view.lights[i];

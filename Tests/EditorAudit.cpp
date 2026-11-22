@@ -3162,6 +3162,26 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
     const auto offAlike = difference(playedOff,aliased,"rendering-taa-off-editor-player-diff.png");
     audit.check(page,"display","Editor and Player match with TAA off",!playedOff.isNull() && offAlike.mean <= 1 && offAlike.share <= 0.005,
                 playedOff.isNull() ? QStringLiteral("The Player did not capture the view.") : describe(offAlike));
+
+    // The physical atmosphere: a different sky and sunlight from the gradient, the same in the editor and the Player.
+    setDisplay({{"antiAliasing","TAA"}});
+    const auto gradient = settled(shots[0]);
+    setDisplay({{"skyModel","Physical"}});
+    const auto physical = settled(shots[0]);
+    physical.save(output.filePath("rendering-physical-sky.png"));
+    std::ostringstream physicalPlayable;
+    QFile physicalFile(playablePath);
+    const bool physicalExported = WorldRuntime::exportScene(store,physicalPlayable) && physicalFile.open(QIODevice::WriteOnly)
+        && physicalFile.write(physicalPlayable.str().data(),qint64(physicalPlayable.str().size()))
+            == qint64(physicalPlayable.str().size());
+    physicalFile.close();
+    const auto playedPhysical = physicalExported ? playerCapture(shots[0],physical.size()) : QImage();
+    const auto physicalAlike = difference(playedPhysical,physical,"rendering-physical-editor-player-diff.png");
+    const auto gradientSky = difference(physical,gradient,"rendering-physical-gradient-diff.png");
+    audit.check(page,"display","Editor and Player match with the physical sky",
+                !playedPhysical.isNull() && physicalAlike.mean <= 1 && physicalAlike.share <= 0.005 && gradientSky.mean > 2,
+                playedPhysical.isNull() ? QStringLiteral("The Player did not capture the view.")
+                    : QString("%1; differs from the gradient sky by %2").arg(describe(physicalAlike)).arg(describe(gradientSky)));
     while (store.history().index() > historyStart && store.history().canUndo())
         store.history().undo();
     audit.check(page,"display","Undo restores the street after the exposure and light unit checks",
@@ -3179,8 +3199,10 @@ void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
     QTemporaryDir directory;
     ProjectStore store;
     QString error;
+    // The comparison uses the physical atmosphere, which Cycles receives as the same sky (Player/ReferenceScene.cpp).
     if (!directory.isValid() || !store.createStarterProject("Realism QA",
-        {{"location",directory.filePath("Realism QA")},{"starter","street"}},error)) {
+        {{"location",directory.filePath("Realism QA")},{"starter","street"},
+         {"worldDefaults",QJsonObject{{"skyModel","Physical"}}}},error)) {
         audit.check(page,"workflow","Create the Playable Street starter",false,error);
         return;
     }
