@@ -126,19 +126,6 @@ vec3 materialLighting(vec3 albedo,float visibility)
 }
 void main()
 {
-    float falloff = camera.horizon.w;
-    float base = camera.zenith.w;
-    float eyeDensity = clamp(-(camera.eye.z - base) * falloff, -15.0, 10.0);
-    float surfaceDensity = clamp(-(worldPosition.z - base) * falloff, -15.0, 10.0);
-    float difference = eyeDensity - surfaceDensity;
-    float meanDensity = abs(difference) < 0.001 ? exp((eyeDensity + surfaceDensity) * 0.5)
-        : (exp(eyeDensity) - exp(surfaceDensity)) / difference;
-    vec3 ray = worldPosition - camera.eye.xyz;
-    float rayLength = length(ray);
-    float amount = 1.0 - exp(-min(40.0, camera.fog.w * meanDensity * rayLength));
-    float towardSun = max(0.0, dot(ray / max(rayLength, 0.0001), camera.horizon.xyz));
-    float scattering = min(1.0, camera.zenith.x) * pow(towardSun, 12.0) * 0.22;
-    vec3 inscatter = mix(working(camera.fog.rgb), working(vec3(1.0, 0.83, 0.64)), scattering);
     float visibility = sunVisibility(worldPosition,materialNormal,true);
     vec3 surface = shade * materialImage(0,vec3(1.0));
     vec3 indirect = vec3(0.0);
@@ -158,10 +145,14 @@ void main()
         surface = materialLighting(surface,visibility);
     else
         surface *= (1.0 - directSun*(1.0-visibility));
-    vec3 haze = mix(surface,inscatter,amount);
-    vec4 local = localMist(camera.eye.xyz,ray/max(rayLength,0.0001),rayLength,working(camera.fog.rgb),camera.zenith.x);
-    color = vec4(haze*(1.0-local.a)+local.rgb,1.0);
-    float transmission = (1.0-amount)*(1.0-local.a);
+    vec3 ray = worldPosition-camera.eye.xyz;
+    float rayLength = length(ray);
+    vec3 direction = ray/max(rayLength,0.0001);
+    vec3 tint = working(camera.fog.rgb);
+    vec4 fog = heightFog(camera.eye.xyz,direction,rayLength,tint,camera.fog.w,camera.horizon.w,camera.zenith.w);
+    vec4 local = localMist(camera.eye.xyz,direction,rayLength,tint,camera.zenith.x);
+    color = vec4((surface*fog.a+fog.rgb)*(1.0-local.a)+local.rgb,1.0);
+    float transmission = fog.a*(1.0-local.a);
     indirectLight = vec4(indirect*transmission,1.0);
     surfaceAlbedo = vec4(diffuseAlbedo,transmission);
 }

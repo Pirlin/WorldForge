@@ -2514,27 +2514,15 @@ public:
             uniforms.eye[1] = eye.y();
             uniforms.eye[2] = eye.z();
             writeColor(uniforms.fog,environment.fogColor,environment.fogDensity);
-            writeColor(uniforms.horizon,environment.horizon,environment.fogFalloff);
-            writeColor(uniforms.zenith,environment.zenith,environment.fogHeight);
-            if (environment.sky) {
-                uniforms.eye[3] = sun.x()*sunStrength;
-                uniforms.horizon[3] = sun.y()*sunStrength;
-                uniforms.zenith[3] = sun.z()*sunStrength;
-                const auto inverse = sceneCamera.inverted();
-                std::copy_n(inverse.constData(),16,uniforms.matrix);
-                vk_->vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_);
-                vk_->vkCmdPushConstants(command, layout_, shaderStages, 0, sizeof(uniforms), &uniforms);
-                vk_->vkCmdDraw(command,3,1,0,0);
-                uniforms.horizon[3] = environment.fogFalloff;
-                uniforms.zenith[3] = environment.fogHeight;
-            }
             // Mesh shading uses the sky color slots for the sun's direction and intensity.
             uniforms.horizon[0] = sun.x();
             uniforms.horizon[1] = sun.y();
             uniforms.horizon[2] = sun.z();
+            uniforms.horizon[3] = environment.fogFalloff;
             uniforms.zenith[0] = sunStrength;
             // World views shade every surface with the shared physically based model; modeling views keep their studio light.
             uniforms.zenith[1] = window_.modelOnly_ ? 0.0f : 1.0f;
+            uniforms.zenith[3] = environment.fogHeight;
             uniforms.eye[3] = windTime;
             std::copy_n(sceneCamera.constData(),16,uniforms.matrix);
             vk_->vkCmdPushConstants(command, layout_, shaderStages, 0, sizeof(uniforms), &uniforms);
@@ -2545,10 +2533,20 @@ public:
                 vk_->vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, triangles_);
                 vk_->vkCmdDraw(command, uint32_t(geometry.triangles.size()), 1, 0, 0);
             }
+            const auto toWorld = sceneCamera.inverted();
+            // Draw the sky at the far plane to skip fog shading behind opaque surfaces.
+            if (environment.sky) {
+                auto skyUniforms = uniforms;
+                writeColor(skyUniforms.horizon,environment.horizon,environment.fogFalloff);
+                writeColor(skyUniforms.zenith,environment.zenith,environment.fogHeight);
+                std::copy_n(toWorld.constData(),16,skyUniforms.matrix);
+                vk_->vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_);
+                vk_->vkCmdPushConstants(command, layout_, shaderStages, 0, sizeof(skyUniforms), &skyUniforms);
+                vk_->vkCmdDraw(command,3,1,0,0);
+            }
             // Display subpass: tone map the HDR scene, then draw editor lines in display colors.
             ViewportFrameVulkan::Occlusion occlusion;
             occlusion.enabled = environment.ambientOcclusion;
-            const auto toWorld = sceneCamera.inverted();
             std::copy_n(toWorld.constData(),16,occlusion.inverseViewProjection.begin());
             frame_.display(command,exposure,environment.viewTransform,environment.autoExposure ? int(frameIndex) : -1,temporal,
                            occlusion,environment.bloom && !window_.modelOnly_ ? wf::color::bloomStrength : 0.0f,
@@ -2842,7 +2840,7 @@ private:
             VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
             samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
             VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-            depth.depthTestEnable = sky || pass == Pass::Overlay ? VK_FALSE : VK_TRUE;
+            depth.depthTestEnable = pass == Pass::Overlay ? VK_FALSE : VK_TRUE;
             depth.depthWriteEnable = depthWrite ? VK_TRUE : VK_FALSE;
             depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
             VkPipelineColorBlendAttachmentState blend{};

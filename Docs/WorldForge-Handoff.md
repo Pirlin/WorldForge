@@ -59,9 +59,9 @@ Settings flow through these files:
 - Player `View`: `Player/PlayerRender.h`, which must stay a multiple of 16 bytes for D3D11
 
 ## Status (2026-11-22)
-**Realism** is 94.9 over 4 views (mean FLIP 0.0508), measured on the commit that adds depth of field and motion blur.
+**Realism** is 94.9 over 4 views (mean FLIP 0.0508). The Cycles comparison runs with fog disabled.
 
-**Street frame time** is 6.9–7.1 ms on average.
+**Street frame time** with volumetric height fog is 9.97-10.23 ms on average (12.02-13.19 ms at p95 on the GTX 1650).
 
 **R1 done:**
 - HDR, EV100 exposure and AgX tonemapping
@@ -74,16 +74,16 @@ Settings flow through these files:
 - Bloom and specular occlusion
 - TAA split into its own pass
 - Depth of field and motion blur
+- Volumetric height fog
 
 ## Next, in order
-1. **Volumetric fog.** Plan: a shadowed height-fog ray march with 16 jittered steps, in the shared `Lighting.glsl` used by `Scene.frag`, `PlayScene.frag` and `Sky.frag`.
-2. **Screen-space reflections.**
-3. **Contact shadows.**
-4. **Per-object motion vectors.**
-5. **R2 materials:**
+1. **Screen-space reflections.**
+2. **Contact shadows.**
+3. **Per-object motion vectors.**
+4. **R2 materials:**
    - clear coat, sheen, transmission and glass
    - subsurface and anisotropy
    - glTF material extensions
    - wet and puddle layers
    - decals and parallax occlusion
-6. **R3 GI.** Bounce light from beyond the screen is the largest remaining gap against Cycles.
+5. **R3 GI.** Bounce light from beyond the screen is the largest remaining gap against Cycles.

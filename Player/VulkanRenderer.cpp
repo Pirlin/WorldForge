@@ -517,7 +517,8 @@ VkPipeline VulkanRenderer::pipeline(std::span<const uint32_t> vertexCode,std::sp
         VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-        depth.depthTestEnable = depth.depthWriteEnable = geometry ? VK_TRUE : VK_FALSE;
+        depth.depthTestEnable = VK_TRUE;
+        depth.depthWriteEnable = geometry ? VK_TRUE : VK_FALSE;
         depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
         VkPipelineColorBlendAttachmentState blend{};
         blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT
@@ -839,7 +840,9 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     }
     lighting.fogCenterRadius = view.fogCenterRadius;
     lighting.settings = {view.lighting.x,view.lighting.y,float(view.temporalSample),view.sky.x};
-    lighting.sun = view.sun;
+    XMFLOAT3 sunDirection;
+    XMStoreFloat3(&sunDirection,XMVector3Normalize(XMVectorSet(view.sun.x,view.sun.y,view.sun.z,0)));
+    lighting.sun = {sunDirection.x,sunDirection.y,sunDirection.z,view.sun.w};
     for (int i = 0; i < sky::directionCount; ++i) {
         std::memcpy(&lighting.skyMatrices[i],view.skyVisibility.matrices[i].data(),sizeof(lighting.skyMatrices[i]));
         const auto &direction = view.skyVisibility.directions[i];
@@ -1029,22 +1032,6 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
 
     const auto background = color::srgbToLinear({0.05f,0.06f,0.07f});
     target.begin(command,output,background.data());
-    if (sky) {
-        // Sky.frag packs the sun direction times its intensity into the w components.
-        XMFLOAT4X4 inverse;
-        const auto clip = vulkanClip(view.viewProjection);
-        XMStoreFloat4x4(&inverse,XMMatrixInverse(nullptr,XMLoadFloat4x4(&clip)));
-        const auto sun = XMVector3Normalize(XMVectorSet(view.sun.x,view.sun.y,view.sun.z,0));
-        XMFLOAT3 direction;
-        XMStoreFloat3(&direction,XMVectorScale(sun,view.sun.w));
-        const CameraConstants camera{inverse,{view.eye.x,view.eye.y,view.eye.z,direction.x},view.fog,
-            {view.horizon.x,view.horizon.y,view.horizon.z,direction.y},{view.zenith.x,view.zenith.y,view.zenith.z,direction.z}};
-        api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,sky_);
-        api_.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,skyLayout_,0,1,&frame.set,0,nullptr);
-        api_.vkCmdPushConstants(command,skyLayout_,VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,0,
-                                sizeof(camera),&camera);
-        api_.vkCmdDraw(command,3,1,0,0);
-    }
     if (vertexCount) {
         api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,scene_);
         api_.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,sceneLayout_,0,1,&frame.set,0,nullptr);
@@ -1060,6 +1047,18 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
             api_.vkCmdPushConstants(command,sceneLayout_,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(constants),&constants);
             api_.vkCmdDraw(command,range.count,1,range.start,0);
         }
+    }
+    // The far-plane sky shades only pixels left uncovered by geometry.
+    if (sky) {
+        XMFLOAT4X4 inverse;
+        const auto clip = vulkanClip(view.viewProjection);
+        XMStoreFloat4x4(&inverse,XMMatrixInverse(nullptr,XMLoadFloat4x4(&clip)));
+        const CameraConstants camera{inverse,view.eye,view.fog,view.horizon,view.zenith};
+        api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,sky_);
+        api_.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,skyLayout_,0,1,&frame.set,0,nullptr);
+        api_.vkCmdPushConstants(command,skyLayout_,VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,0,
+                                sizeof(camera),&camera);
+        api_.vkCmdDraw(command,3,1,0,0);
     }
     target.display(command,exposureStops,view.display.y > 0.5f ? color::ViewTransform::AgX : color::ViewTransform::Standard,
                    meterSlot,temporal,occlusion,view.bloom,cameraEffects(view));

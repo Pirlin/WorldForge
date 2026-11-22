@@ -3081,6 +3081,51 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
         }
         return previous;
     };
+
+    // An overhead slab casts a shadow into the fog while the center of the view sees only sky.
+    const Shot fogShot{"volumetric-fog",{-50,-50,3},{-50,-40,5}};
+    store.addCube();
+    if (const auto *selected = store.selectedObject()) {
+        auto slab = *selected;
+        slab.position = fogShot.eye+QVector3D(0,0,10);
+        slab.scale = {25,25,1};
+        store.updateObject(slab,"Fog shadow caster");
+    }
+    store.select({});
+    setDisplay({{"fogDensity",0.04},{"fogFalloff",0.06},{"localFogRadius",0},{"sunElevation",90},
+                {"bloom",false},{"shadows",true}});
+    const auto shadowedFog = settled(fogShot);
+    const auto skyPatch = [](const QImage &image) {
+        return image.copy(image.width()*3/8,image.height()*3/8,image.width()/4,image.height()/4);
+    };
+    {
+        std::ostringstream fogPlayable;
+        QFile fogFile(playablePath);
+        const bool fogExported = WorldRuntime::exportScene(store,fogPlayable) && fogFile.open(QIODevice::WriteOnly);
+        const auto bytes = fogPlayable.str();
+        const bool written = fogExported && fogFile.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+        fogFile.close();
+        const auto playedFog = written ? playerCapture(fogShot,shadowedFog.size()) : QImage();
+        const auto fogAlike = difference(playedFog,shadowedFog,"rendering-volumetric-fog-editor-player-diff.png");
+        audit.check(page,"fog","Editor and Player match with volumetric fog",
+                    !playedFog.isNull() && fogAlike.mean <= 1 && fogAlike.share <= 0.005,describe(fogAlike));
+    }
+    setDisplay({{"shadows",false}});
+    const auto litFog = settled(fogShot);
+    setDisplay({{"fogDensity",0}});
+    const auto clearSky = settled(fogShot);
+    setDisplay({{"shadows",true}});
+    const auto clearShadowed = settled(fogShot);
+    const double scatter = luminance(skyPatch(litFog))-luminance(skyPatch(shadowedFog));
+    const auto clearAlike = difference(skyPatch(clearSky),skyPatch(clearShadowed),"rendering-clear-sky-shadow-diff.png");
+    shadowedFog.save(output.filePath("rendering-volumetric-fog.png"));
+    audit.check(page,"fog","Sun shadows darken height fog in front of the sky",
+                !litFog.isNull() && !shadowedFog.isNull() && scatter > 0.01 && clearAlike.mean < 0.5,
+                QString("Fog brightens by %1 display levels without shadows. Clear sky: %2")
+                    .arg(scatter*255,0,'f',2).arg(describe(clearAlike)));
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+
     setDisplay({{"ev100",22},{"exposureMode","Manual"}});
     const auto tooDark = capture(shots[0].eye,shots[0].target);
     setDisplay({{"exposureMode","Auto"}});

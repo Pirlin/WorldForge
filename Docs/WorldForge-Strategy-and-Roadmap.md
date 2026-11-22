@@ -47,7 +47,7 @@ The project already works this way. Studio is a Blender fork that runs inside th
 | Lighting | One sun. GGX specular with Lambert diffuse. | `Components/Shaders/Scene.frag` |
 | Shadows | One 3×3 PCF shadow map covering the whole scene. | `Components/Shaders/Lighting.glsl` |
 | Ambient | A flat constant times ambient occlusion. No image-based lighting and no global illumination. | `Scene.frag` |
-| Sky and fog | Gradient sky, analytic height fog, and one raymarched mist sphere. | `Sky.frag`, `Lighting.glsl` |
+| Sky and fog | Gradient and physical skies, shadowed height fog, and one local mist sphere. | `Sky.frag`, `Lighting.glsl` |
 | Color | No HDR target, exposure or tone mapping. The Player presents to an 8-bit swap chain. | `Player/main.cpp` |
 | Post-processing | None: no anti-aliasing resolve, bloom, depth of field or motion blur. | n/a |
 | Renderers | Two hand-maintained copies: Vulkan in the editor and Direct3D 11 in the Player. | `LiveViewport.cpp`, `Player/WorldShaders.h` |
@@ -173,10 +173,10 @@ The default fog (0.024 per meter) is far denser than real air. Linear blending m
 - **Shadows.** Four cascaded shadow maps with soft contact hardening (PCSS) and contact shadows.
 - **Many lights.** Clustered lighting for hundreds of street lights, signs and car lights.
 - **Occlusion and reflections.** Ground-truth ambient occlusion (GTAO), specular occlusion and screen-space reflections.
-- **Volumetrics.** Volumetric fog in a froxel grid, replacing the single mist sphere.
+- **Volumetrics.** Shadowed height fog, with a froxel grid planned for more local volumes.
 - **Camera effects.** Bloom, physically based depth of field, motion blur and lens effects.
 
-**R1 status (2026-11-21).**
+**R1 status (2026-11-22).**
 
 | Item | State |
 | --- | --- |
@@ -198,7 +198,8 @@ The default fog (0.024 per meter) is far denser than real air. Linear blending m
 | Specular occlusion | Done (committed with spot lights in 97e2373, verified after). Sky reflections lose more light in creases than diffuse sky light does, since they come from a narrower cone: `SO = saturate((N·V + AO)^exp2(−16·roughness − 1) − 1 + AO)` (Lagarde and de Rousiers 2014). AO is the material's occlusion times the large-scale sky openness. Diffuse sky light keeps plain AO. For rough surfaces (the street's are all 0.65) it equals AO, so the street's images and scores are unchanged; it matters for glossy materials. |
 | Frame passes split | Done. TAA now resolves in its own pass instead of a subpass of the display pass, so later steps can sample the finished frame. Order: scene, occlusion, bloom (from the previous frame), TAA, camera effects, display; the editor draws its overlays in the display pass. The images are unchanged (0.00 levels against the goldens). |
 | Depth of field and motion blur | Done for Vulkan (**Sky & Fog → Depth of field**, with **Focus distance** and **Aperture**; **Motion blur**, with **Shutter**; both off by default; Player format 18). Depth of field models a thin lens with the focal length of the field of view on a 24 mm sensor. It gathers 32 samples in a spiral over each pixel's circle of confusion, counting a sample only if its own circle reaches back, so sharp subjects don't bleed into the blur behind them (`DepthOfField.frag`). Motion blur smears each pixel along the camera's screen motion since the last frame (from its depth and the two frames' cameras) for the shutter's share of the frame, in 12 samples (`MotionBlur.frag`). Moving objects are blurred only by camera motion, since there are no per-object motion vectors yet. The rendering audit checks that depth of field blurs the street beyond a 4 m focus at f/1.4, alike in editor and Player (0.03 levels), and that motion blur leaves a still view unchanged. |
-| Contact shadows, SSR, volumetric fog, per-object motion vectors | Not started. |
+| Volumetric height fog | Implemented for Vulkan. `Lighting.glsl` integrates exponential height fog along each view ray to the visible surface or sky. Up to 16 jittered samples of the sun shadow atlas darken the in-scattered sunlight where geometry blocks it. Fog beyond the atlas still attenuates the background and scatters light. The rendering audit checks that an overhead slab darkens fog against open sky and that the editor and Player match. |
+| Contact shadows, SSR, per-object motion vectors | Not started. |
 
 What the comparison shows next, in order:
 

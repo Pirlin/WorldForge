@@ -46,17 +46,6 @@ vec3 mappedNormal()
 
 void main()
 {
-    float a = clamp(-view.horizon.w*(view.eye.z-view.zenith.w),-15.0,10.0);
-    float b = clamp(-view.horizon.w*(worldPosition.z-view.zenith.w),-15.0,10.0);
-    float delta = abs(a-b);
-    float density = delta < 0.001 ? exp((a+b)*0.5) : (exp(max(a,b))-exp(min(a,b)))/delta;
-    vec3 ray = worldPosition-view.eye.xyz;
-    float rayLength = length(ray);
-    vec3 direction = ray/max(rayLength,0.0001);
-    float amount = 1.0-exp(-min(40.0,view.fog.w*density*rayLength));
-    float towardSun = max(0.0,dot(direction,normalize(view.sun.xyz)));
-    float scattering = min(1.0,view.sun.w)*pow(towardSun,12.0)*0.22;
-
     vec3 packed = texture(metallicRoughnessMap,surfaceUv).rgb;
     Surface surface;
     surface.albedo = albedo*srgbToLinear(texture(baseColorMap,surfaceUv).rgb);
@@ -68,11 +57,14 @@ void main()
     vec3 lit = shadeSurface(surface,worldPosition,view.eye.xyz,sunVisibility(worldPosition,surfaceNormal,true),indirect)
         +material.emissive.rgb*srgbToLinear(texture(emissiveMap,surfaceUv).rgb);
 
-    vec3 fogColor = srgbToLinear(view.fog.rgb);
-    vec3 haze = mix(lit,mix(fogColor,srgbToLinear(vec3(1.0,0.83,0.64)),scattering),amount);
-    vec4 mist = localMist(view.eye.xyz,direction,rayLength,fogColor,view.sun.w);
-    color = vec4(haze*(1.0-mist.a)+mist.rgb,1.0);
-    float transmission = (1.0-amount)*(1.0-mist.a);
+    vec3 ray = worldPosition-view.eye.xyz;
+    float rayLength = length(ray);
+    vec3 direction = ray/max(rayLength,0.0001);
+    vec3 tint = srgbToLinear(view.fog.rgb);
+    vec4 fog = heightFog(view.eye.xyz,direction,rayLength,tint,view.fog.w,view.horizon.w,view.zenith.w);
+    vec4 mist = localMist(view.eye.xyz,direction,rayLength,tint,view.sun.w);
+    color = vec4((lit*fog.a+fog.rgb)*(1.0-mist.a)+mist.rgb,1.0);
+    float transmission = fog.a*(1.0-mist.a);
     indirectLight = vec4(indirect*transmission,1.0);
     surfaceAlbedo = vec4(surface.albedo*(1.0-surface.metallic),transmission);
 }

@@ -193,6 +193,65 @@ float sunVisibility(vec3 position,vec3 normal,bool soft)
     return visibility/16.0;
 }
 
+// Integrate the clamped exponential height profile over a ray segment. Outside the exponential part the
+// density is constant, including below the height at which the density reaches its upper bound.
+float heightFogTransmission(float distance,float logAtEye,float logSlope,float density)
+{
+    const float lower = -15.0, upper = 10.0;
+    float change = logSlope*distance;
+    float low = logAtEye+min(change,0.0), high = logAtEye+max(change,0.0);
+    float a = clamp(low,lower,upper), b = clamp(high,lower,upper);
+    if (a == b || abs(change) < 0.001)
+        return exp(-min(40.0,density*distance*exp(0.5*(a+b))));
+    float integral = exp(b)-exp(a) + max(0.0,a-low)*exp(lower) + max(0.0,high-b)*exp(upper);
+    return exp(-min(40.0,density*distance*integral/abs(change)));
+}
+
+// RGB is in-scattered light and alpha is the fraction of the background that reaches the eye.
+vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,float falloff,float base)
+{
+    if (density <= 0.0 || distance <= 0.0)
+        return vec4(0.0,0.0,0.0,1.0);
+
+    float logAtEye = (base-eye.z)*falloff;
+    float logSlope = -direction.z*falloff;
+    float transmission = heightFogTransmission(distance,logAtEye,logSlope,density);
+    float opacity = 1.0-transmission;
+    float towardSun = max(0.0,dot(direction,lighting.sun.xyz));
+    float sunShare = clamp(lighting.sun.w,0.0,1.0)*(0.30+0.22*pow(towardSun,12.0));
+    vec3 scatter = tint*(1.0-sunShare);
+    if (lighting.skySettings.z > 0.5)
+        scatter = tint*lighting.skyIrradiance[0].rgb*0.282095; // mean sky radiance from the constant SH term
+    vec3 sunlight = tint*lighting.sunTint.rgb*sunShare;
+    float blocked = 0.0;
+    if (lighting.settings.y > 0.5 && sunShare > 0.0 && opacity > 0.0001) {
+        // Spend the samples within shadow map range. Fog beyond it still attenuates and scatters light.
+        float shadowRange = lighting.cascadeScales[3].z/max(0.2,dot(direction,lighting.clusterForward.xyz));
+        float marchEnd = min(distance,shadowRange);
+        vec2 pixel = gl_FragCoord.xy+5.588238*lighting.settings.z;
+        float jitter = fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
+        const int steps = 16;
+        float start = 0.0, before = 1.0;
+        for (int i = 0; i < steps; ++i) {
+            float fraction = float(i+1)/float(steps);
+            float end = marchEnd*fraction*fraction;
+            float after = heightFogTransmission(end,logAtEye,logSlope,density);
+            float weight = before-after;
+            if (weight > 0.00001) {
+                float sampleAt = mix(start,end,jitter);
+                float shadow = 1.0-sunVisibility(eye+direction*sampleAt,vec3(0.0),false);
+                shadow *= 1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt);
+                blocked += weight*shadow;
+            }
+            if (after < 0.001)
+                break;
+            start = end;
+            before = after;
+        }
+    }
+    return vec4(scatter*opacity+sunlight*max(0.0,opacity-blocked),transmission);
+}
+
 vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, float sunlight)
 {
     const int steps = 10;
