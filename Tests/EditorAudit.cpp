@@ -3222,6 +3222,31 @@ void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
     audit.check(page,"workflow","Export the street for the Player",exported,error);
     if (!exported)
         return;
+    // Night: the same street after sunset (twilight under the physical sky), lit by a row of street lamps of 2000 cd on
+    // 5 m posts and photographed at EV100 5, as a camera would for street lighting.
+    auto nightAtmosphere = store.environment() ? store.environment()->details : QJsonObject{};
+    nightAtmosphere.insert("skyModel","Physical");
+    nightAtmosphere.insert("sunElevation",-6);
+    nightAtmosphere.insert("ev100",5);
+    store.setAtmosphere(nightAtmosphere);
+    bool lampsPlaced = true;
+    for (const float x : {-20.0f,0.0f,20.0f})
+        for (const float y : {-8.0f,8.0f}) {
+            store.addObject("Point Light","Lighting");
+            auto lamp = *store.selectedObject();
+            lamp.position = {x,y,5};
+            setLightPhotometric(lamp.details,lamp.type,2000);
+            lampsPlaced &= store.updateObjects({lamp},"Place street lamp",error);
+        }
+    const auto nightPath = output.filePath("realism-night.wfplay");
+    std::ostringstream nightPlayable;
+    bool nightExported = lampsPlaced && WorldRuntime::exportScene(store,nightPlayable,&error);
+    if (nightExported) {
+        const auto bytes = nightPlayable.str();
+        QFile file(nightPath);
+        nightExported = file.open(QIODevice::WriteOnly) && file.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+    }
+    audit.check(page,"workflow","Export the street at night with street lamps",nightExported,error);
 
     const QDir golden(root.filePath("Tests/Golden"));
     const bool update = qEnvironmentVariableIntValue("WORLDFORGE_UPDATE_GOLDEN") == 1;
@@ -3242,9 +3267,9 @@ void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
         return bytes;
     };
 
-    struct Shot { const char *name; QVector3D eye, target; };
-    const Shot shots[]{{"shop-front",{-6,-14,2.2f},{0,3,1.6f}},{"street-corner",{24,-20,7},{6,0,1}},
-                       {"aerial",{-34,-34,26},{0,0,0}}};
+    struct Shot { const char *name; QVector3D eye, target; QString scene; };
+    const Shot shots[]{{"shop-front",{-6,-14,2.2f},{0,3,1.6f},playablePath},{"street-corner",{24,-20,7},{6,0,1},playablePath},
+                       {"aerial",{-34,-34,26},{0,0,0},playablePath},{"night",{-6,-14,2.2f},{0,3,1.6f},nightPath}};
     QJsonObject scores;
     double total = 0;
     int scored = 0;
@@ -3252,7 +3277,9 @@ void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
         const QString name = shot.name;
         QDir folder(output.filePath("realism-"+name));
         folder.removeRecursively();
-        QStringList arguments{"--reference",playablePath,QDir::toNativeSeparators(folder.absolutePath()),"800","450"};
+        if (!QFileInfo(shot.scene).isFile())
+            continue;
+        QStringList arguments{"--reference",shot.scene,QDir::toNativeSeparators(folder.absolutePath()),"800","450"};
         for (const float value : {shot.eye.x(),shot.eye.y(),shot.eye.z(),shot.target.x(),shot.target.y(),shot.target.z()})
             arguments << QString::number(value,'g',9);
         QProcess player;

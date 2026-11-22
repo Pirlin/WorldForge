@@ -37,10 +37,8 @@ bool writeSky(const std::filesystem::path &file,const View &view)
     constexpr int width = 512, height = 256;
     constexpr float pi = 3.14159265358979f;
     const std::array towardSun{view.sun.x,view.sun.y,view.sun.z};
-    // View carries the sunlight that reaches the ground; the atmosphere is built from the authored (overhead) value.
-    const auto unit = atmosphere::Sky(towardSun,1).sunLight();
-    const float reaching = 0.2126f*unit[0]+0.7152f*unit[1]+0.0722f*unit[2];
-    const atmosphere::Sky sky(towardSun,reaching > 0 ? view.sun.w/reaching : 0);
+    // The atmosphere is built from the authored sun (with the sun overhead), as the Player built it.
+    const atmosphere::Sky sky(towardSun,view.authoredSun);
     std::ofstream out(file,std::ios::binary);
     out << "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y " << height << " +X " << width << "\n";
     std::vector<unsigned char> row(std::size_t(width)*4);

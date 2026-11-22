@@ -42,7 +42,8 @@ WorldAtmosphere readAtmosphere(const QJsonObject &details)
     environment.fogFalloff = float(std::clamp(details.value("fogFalloff").toDouble(environment.fogFalloff), 0.0, 2.0));
     environment.fogHeight = float(std::clamp(details.value("fogHeight").toDouble(), -1000.0, 1000.0));
     environment.sunAzimuth = float(std::clamp(details.value("sunAzimuth").toDouble(environment.sunAzimuth),-180.0,180.0));
-    environment.sunElevation = float(std::clamp(details.value("sunElevation").toDouble(environment.sunElevation),0.0,90.0));
+    // Below 0 the sun has set: no direct sunlight, and the physical sky shows twilight.
+    environment.sunElevation = float(std::clamp(details.value("sunElevation").toDouble(environment.sunElevation),-20.0,90.0));
     environment.shadows = details.value("shadows").toBool(true);
     const auto center = details.value("localFogCenter").toArray();
     if (center.size() == 3)

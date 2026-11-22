@@ -2384,15 +2384,25 @@ public:
         std::copy_n(skyLight.horizon.data(),3,lighting.skyHorizon);
         std::copy_n(skyLight.zenith.data(),3,lighting.skyZenith);
         std::copy_n(skyLight.ground.data(),3,lighting.skyGround);
-        int lightCount = 0;
-        for (std::size_t i = 1; i < lights.size() && lightCount < 16; ++i)
-            if (lights[i].intensity > 0) {
-                const auto &light = lights[i];
-                const float values[4]{light.vector.x(),light.vector.y(),light.vector.z(),
-                    light.directional ? -light.intensity : light.intensity};
-                std::copy_n(values,4,lighting.lights[lightCount++]);
-            }
-        lighting.skyHorizon[3] = float(lightCount);
+        // Clustered lights (LightClusters.h): every light but the sun, binned by the clusters of the steady camera.
+        std::vector<wf::lights::Light> clusterLights;
+        for (std::size_t i = 1; i < lights.size(); ++i)
+            if (lights[i].intensity > 0)
+                clusterLights.push_back({{lights[i].vector.x(),lights[i].vector.y(),lights[i].vector.z()},lights[i].intensity,
+                                         {1,1,1},lights[i].directional});
+        const auto steady = window_.camera(size);
+        const auto toWorldMatrix = steady.inverted();
+        const auto eyePoint = toWorldMatrix.map(QVector4D(0,0,0,1)), farPoint = toWorldMatrix.map(QVector4D(0,0,1,1));
+        const auto forward = (farPoint.toVector3DAffine()-eyePoint.toVector3DAffine()).normalized();
+        std::array<float,16> clusterMatrix;
+        std::copy_n(steady.constData(),16,clusterMatrix.begin());
+        const auto viewer = window_.viewPose().first;
+        const auto lightClusters = wf::lights::build(clusterLights,clusterMatrix,{viewer.x(),viewer.y(),viewer.z()},
+                                                     {forward.x(),forward.y(),forward.z()});
+        const float clusterForward[4]{forward.x(),forward.y(),forward.z(),0};
+        const float clusterViewport[4]{float(size.width()),float(size.height()),0,0};
+        std::copy_n(clusterForward,4,lighting.clusterForward);
+        std::copy_n(clusterViewport,4,lighting.clusterViewport);
         const auto cascades = shadowCascades(geometry,sun,window_.camera(size));
         for (int i = 0; i < wf::shadow::cascadeCount; ++i) {
             std::copy_n(cascades.matrices[i].data(),16,lighting.cascadeMatrices[i]);
@@ -2436,7 +2446,8 @@ public:
             && (!hasGeometry || upload(frame,geometry,window_.geometryRevision_)) && lighting_.upload(frameIndex,lighting)
             && lighting_.uploadTextures(frameIndex,window_.modelOnly_ ? geometry.texturePixels : window_.worldTexturePixels_,
                 window_.textureRevision_)
-            && lighting_.uploadEnvironment(frameIndex,skyLight.environment,skyRevision);
+            && lighting_.uploadEnvironment(frameIndex,skyLight.environment,skyRevision)
+            && lighting_.uploadClusters(frameIndex,lightClusters);
         if (ready) {
             recordDepthTiles(command,frame,lighting_.framebuffer(frameIndex),WorldLightingVulkan::shadowSize,wf::shadow::tileSize,
                              shadows,geometry.triangles.size(),cascades.matrices,windTime);

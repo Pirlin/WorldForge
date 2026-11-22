@@ -620,12 +620,15 @@ public:
         view.fog = parameter(playable_.fog,playable_.fogDensity);
         view.sun = parameter(point(XMVector3Normalize(XMVectorSet(-0.45f,-0.7f,1,0))),1);
         bool sunSet = false;
+        sceneLights_.clear();
         for (const auto &light : playable_.lights) {
             if (light.directional && !sunSet) {
                 view.sun = parameter(light.vector,light.intensity);
                 sunSet = true;
                 continue;
             }
+            if (light.intensity > 0)
+                sceneLights_.push_back({{light.vector[0],light.vector[1],light.vector[2]},light.intensity,{1,1,1},light.directional});
             if (view.eye.w < 16 && light.intensity > 0) {
                 view.lights[int(view.eye.w)] = parameter(light.vector,light.directional ? -light.intensity : light.intensity);
                 ++view.eye.w;
@@ -651,6 +654,7 @@ public:
                                               : wf::color::skyLight(playable_.horizon,playable_.zenith,towardSun,view.sun.w);
             ++skyRevision_;
         }
+        view.authoredSun = view.sun.w;
         // The physical sky's sun reaches the ground dimmer and warmer than overhead.
         const auto &sunLight = skyLight_->sunLight;
         const float sunLuminance = 0.2126f*sunLight[0]+0.7152f*sunLight[1]+0.0722f*sunLight[2];
@@ -659,6 +663,7 @@ public:
                                         : XMFLOAT4{1,1,1,0};
         view.skyEnvironment = &skyLight_->environment;
         view.skyRevision = skyRevision_;
+        view.sceneLights = &sceneLights_;
         for (std::size_t i = 0; i < 9; ++i)
             view.skyIrradiance[i] = {skyLight_->irradiance[i][0],skyLight_->irradiance[i][1],skyLight_->irradiance[i][2],0};
         view.skyHorizon = parameter(skyLight_->horizon,0);
@@ -776,6 +781,7 @@ private:
     wf::NativeGameplay native_;
     std::optional<wf::color::SkyLight> skyLight_;
     std::uint64_t skyRevision_ = 0;
+    std::vector<wf::lights::Light> sceneLights_;
     wf::Point3 spawn_;
     std::vector<std::array<std::vector<wf::PlayVertex>,wf::Heightfield::chunks*wf::Heightfield::chunks>> chunks_;
     std::vector<wf::PlayVertex> vertices_;

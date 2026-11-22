@@ -13,10 +13,13 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     vec4 settings;         // local density, shadows enabled, TAA frame index, ambient light scale from the sky
     vec4 sun;              // direction toward the sun, intensity in scene units
     vec4 skyIrradiance[9]; // spherical-harmonic coefficients of sky irradiance / pi (Engine/Render/SkyLight.h)
-    vec4 skyHorizon;       // linear sky radiance at the horizon; w: number of lights
+    vec4 skyHorizon;       // linear sky radiance at the horizon
     vec4 skyZenith;        // linear sky radiance at the zenith
     vec4 skyGround;        // linear radiance of the ground below the horizon
-    vec4 lights[16];       // position or direction, intensity in scene units (negative for directional)
+    // Clustered lights (Engine/Render/LightClusters.h): the camera's forward axis (xyz), and the viewport size in
+    // pixels (xy).
+    vec4 clusterForward;
+    vec4 clusterViewport;
     // Large-scale sky occlusion (Engine/Render/SkyVisibility.h): world space to each sky direction's depth map, and
     // the directions toward the sky with the sky's luminance in each (w).
     mat4 skyMatrices[16];
@@ -28,6 +31,14 @@ layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles,
 // The sky's environment (Engine/Render/SkyLight.h): a 128 x 64 radiance map with rows closer near the horizon, then
 // the map prefiltered for roughness 1/3, 2/3 and 1 at 64 x 32.
 layout(std430, set = 0, binding = 5) readonly buffer SkyEnvironment { vec4 skyMap[]; };
+// The lights and the clusters that list them (Engine/Render/LightClusters.h): a header (light count, directional
+// count); per light, position or direction with range, then color times intensity; each cluster's offset and count.
+layout(std430, set = 0, binding = 6) readonly buffer Clusters {
+    uvec4 clusterHeader;
+    vec4 lightData[2048];
+    uvec2 clusterRanges[16*9*24];
+    uint lightIndices[];
+};
 
 const float skyPi = 3.14159265359;
 

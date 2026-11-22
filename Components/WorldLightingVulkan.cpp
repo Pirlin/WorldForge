@@ -43,14 +43,15 @@ bool WorldLightingVulkan::create(QVulkanWindow &window,QVulkanDeviceFunctions *v
         {1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
+        {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
     };
-    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,5,bindings};
+    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,6,bindings};
     if (vk_->vkCreateDescriptorSetLayout(device_,&layout,nullptr,&layout_) != VK_SUCCESS)
         return false;
     const auto count = uint32_t(window.concurrentFrameCount());
     const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2*count},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,2*count}};
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,3*count}};
     const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,count,3,sizes};
     if (vk_->vkCreateDescriptorPool(device_,&pool,nullptr,&pool_) != VK_SUCCESS)
         return false;
@@ -135,6 +136,14 @@ bool WorldLightingVulkan::createFrame(Frame &frame,VkFormat format)
     if (!allocate(frame.environmentMemory,requirements,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
         || vk_->vkBindBufferMemory(device_,frame.environment,frame.environmentMemory,0) != VK_SUCCESS)
         return false;
+    const VkBufferCreateInfo clusterBuffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,nullptr,0,
+        worldforge::lights::Clusters::bufferBytes,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,VK_SHARING_MODE_EXCLUSIVE,0,nullptr};
+    if (vk_->vkCreateBuffer(device_,&clusterBuffer,nullptr,&frame.clusters) != VK_SUCCESS)
+        return false;
+    vk_->vkGetBufferMemoryRequirements(device_,frame.clusters,&requirements);
+    if (!allocate(frame.clusterMemory,requirements,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        || vk_->vkBindBufferMemory(device_,frame.clusters,frame.clusterMemory,0) != VK_SUCCESS)
+        return false;
     const VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,nullptr,pool_,1,&layout_};
     if (vk_->vkAllocateDescriptorSets(device_,&allocation,&frame.set) != VK_SUCCESS)
         return false;
@@ -143,14 +152,16 @@ bool WorldLightingVulkan::createFrame(Frame &frame,VkFormat format)
     const VkDescriptorBufferInfo uniform{frame.uniform,0,sizeof(LightingUniform)};
     const VkDescriptorBufferInfo textures{frame.textures,0,textureBytes_};
     const VkDescriptorBufferInfo environment{frame.environment,0,environmentBytes};
+    const VkDescriptorBufferInfo clusters{frame.clusters,0,worldforge::lights::Clusters::bufferBytes};
     const VkWriteDescriptorSet writes[]{
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,0,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&depth,nullptr,nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,1,0,1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,nullptr,&uniform,nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,2,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&textures,nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,4,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&skyMaps,nullptr,nullptr},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,5,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&environment,nullptr}
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,5,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&environment,nullptr},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,6,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&clusters,nullptr}
     };
-    vk_->vkUpdateDescriptorSets(device_,5,writes,0,nullptr);
+    vk_->vkUpdateDescriptorSets(device_,6,writes,0,nullptr);
     return true;
 }
 
@@ -207,6 +218,17 @@ bool WorldLightingVulkan::uploadEnvironment(int index,std::span<const std::array
     return true;
 }
 
+bool WorldLightingVulkan::uploadClusters(int index,const worldforge::lights::Clusters &clusters)
+{
+    auto &frame = frames_[index];
+    void *destination = nullptr;
+    if (vk_->vkMapMemory(device_,frame.clusterMemory,0,worldforge::lights::Clusters::bufferBytes,0,&destination) != VK_SUCCESS)
+        return false;
+    clusters.write(destination);
+    vk_->vkUnmapMemory(device_,frame.clusterMemory);
+    return true;
+}
+
 void WorldLightingVulkan::destroy()
 {
     if (!vk_)
@@ -221,6 +243,8 @@ void WorldLightingVulkan::destroy()
         if (frame.textureMemory) vk_->vkFreeMemory(device_,frame.textureMemory,nullptr);
         if (frame.environment) vk_->vkDestroyBuffer(device_,frame.environment,nullptr);
         if (frame.environmentMemory) vk_->vkFreeMemory(device_,frame.environmentMemory,nullptr);
+        if (frame.clusters) vk_->vkDestroyBuffer(device_,frame.clusters,nullptr);
+        if (frame.clusterMemory) vk_->vkFreeMemory(device_,frame.clusterMemory,nullptr);
     }
     destroyDepthTarget(sky_);
     if (sampler_) vk_->vkDestroySampler(device_,sampler_,nullptr);

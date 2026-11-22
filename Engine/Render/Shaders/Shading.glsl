@@ -128,16 +128,24 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,float sunVisibility,out
     // perfect mirror material; the rest bounces again and leaves tinted by f0.
     vec3 energy = 1.0+f0*(1.0/max(brdf.x+brdf.y,1e-3)-1.0);
     vec3 result = directLight(surface,v,normalize(lighting.sun.xyz),lighting.sun.w*sunVisibility,energy)*lighting.sunTint.rgb;
-    int count = int(lighting.skyHorizon.w);
-    for (int i = 0; i < count && i < 16; ++i) {
-        vec4 light = lighting.lights[i];
-        if (light.w < 0.0) {
-            result += directLight(surface,v,normalize(light.xyz),-light.w,energy);
-        } else {
-            vec3 offset = light.xyz-position;
-            float distanceSquared = max(dot(offset,offset),0.01);
-            result += directLight(surface,v,offset*inversesqrt(distanceSquared),light.w/distanceSquared,energy);
-        }
+    // Directional lights reach every pixel; point lights come from this pixel's cluster (LightClusters.h).
+    uint directionalCount = clusterHeader.y;
+    for (uint i = 0; i < directionalCount; ++i)
+        result += directLight(surface,v,normalize(lightData[2u*i].xyz),1.0,energy)*lightData[2u*i+1u].rgb;
+    const float nearDepth = 0.1, farDepth = 1000.0;
+    float depth = dot(position-eye,lighting.clusterForward.xyz);
+    int slice = depth <= nearDepth ? 0 : clamp(int(log(depth/nearDepth)/log(farDepth/nearDepth)*24.0),0,23);
+    ivec2 tile = clamp(ivec2(gl_FragCoord.xy/max(lighting.clusterViewport.xy,vec2(1.0))*vec2(16.0,9.0)),ivec2(0),ivec2(15,8));
+    uvec2 range = clusterRanges[(slice*9+tile.y)*16+tile.x];
+    for (uint k = 0u; k < range.y; ++k) {
+        uint i = lightIndices[range.x+k];
+        vec4 place = lightData[2u*i];
+        vec3 offset = place.xyz-position;
+        float distanceSquared = max(dot(offset,offset),0.01);
+        // Inverse-square falloff, faded to zero over the last part of the light's range.
+        float fade = clamp(1.0-pow(distanceSquared/(place.w*place.w),2.0),0.0,1.0);
+        result += directLight(surface,v,offset*inversesqrt(distanceSquared),1.0,energy)*lightData[2u*i+1u].rgb
+            *(fade*fade/distanceSquared);
     }
     vec3 specularColor = (f0*brdf.x+brdf.y)*energy;
     vec3 r = reflect(-v,surface.normal);

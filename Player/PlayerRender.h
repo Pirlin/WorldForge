@@ -6,6 +6,7 @@
 #include "Engine/Render/ShadowCascades.h"
 #include "Engine/Render/SkyLight.h"
 #include "Engine/Render/SkyVisibility.h"
+#include "Engine/Render/LightClusters.h"
 #include "Engine/World/PlayableScene.h"
 
 #include <windows.h>
@@ -37,6 +38,13 @@ struct View {
     // Direct3D 11 does not use them.
     const std::vector<std::array<float,4>> *skyEnvironment = nullptr;
     std::uint64_t skyRevision = 0;
+    // Every light except the sun, for clustered lighting (Engine/Render/LightClusters.h). Direct3D 11 uses the first 16
+    // in lights instead.
+    const std::vector<lights::Light> *sceneLights = nullptr;
+    // The authored sun intensity (sunlight with the sun overhead), from which the physical sky is built; sun.w is what
+    // reaches the ground, 0 once the sun has set.
+    float authoredSun = 0;
+    float padding2 = 0; // keeps View a multiple of 16 bytes
     // Sun shadow cascades (Engine/Render/ShadowCascades.h), fitted to the view without TAA jitter. Direct3D 11 uses
     // lightProjection instead.
     shadow::Cascades cascades;

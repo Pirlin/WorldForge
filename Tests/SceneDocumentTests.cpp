@@ -13,6 +13,7 @@
 #include "Engine/Render/ShadowCascades.h"
 #include "Engine/Render/SkyVisibility.h"
 #include "Engine/Render/Atmosphere.h"
+#include "Engine/Render/LightClusters.h"
 #include "Tests/AgxReference.h"
 #include <algorithm>
 #include <sstream>
@@ -268,6 +269,38 @@ void checkAtmosphere()
     require(lum(zenith)/lum(high) > 0.05f && lum(zenith)/lum(high) < 0.5f, "The blue sky's radiance is a realistic fraction of sunlight");
 }
 
+void checkLightClusters()
+{
+    // A camera at (0, -30, 1.7) looking along +y; Vulkan clip space (y down), 16:9, 45 degrees.
+    const float f = 1/std::tan(0.3927f), aspect = 16.0f/9;
+    const std::array<float,16> camera{f/aspect,0,0,0, 0,0,0.999f,1, 0,-f,0,0, 0,f*1.7f,29.9f,30};
+    const std::vector<lights::Light> scene{
+        {{2,0,3},0.02f},                                   // a street lamp 30 m ahead
+        {{0,-45,2},1e-5f},                                 // a dim one behind the camera (range about 2 m)
+        {{0.3f,0.2f,0.9f},0.5f,{1,1,1},true}};             // a directional light
+    const auto clusters = lights::build(scene,camera,{0,-30,1.7f},{0,1,0});
+    require(clusters.header[0] == 3 && clusters.header[1] == 1 && clusters.lights[1][3] == 1.0f,
+            "Clustered lights list directional lights first");
+    const auto listed = [&](uint32_t light) {
+        int clustersHolding = 0;
+        for (const auto &range : clusters.ranges)
+            for (uint32_t k = 0; k < range[1]; ++k)
+                clustersHolding += clusters.indices[range[0]+k] == light;
+        return clustersHolding;
+    };
+    // The lamp's own pixel: project it and find its cluster.
+    const float ndcX = (f/aspect*2)/30, ndcY = (-f*(3-1.7f))/30;
+    const int tileX = int((ndcX*0.5f+0.5f)*lights::tilesX), tileY = int((ndcY*0.5f+0.5f)*lights::tilesY);
+    const auto &own = clusters.ranges[std::size_t((lights::slice(30)*lights::tilesY+tileY)*lights::tilesX+tileX)];
+    bool found = false;
+    for (uint32_t k = 0; k < own[1]; ++k)
+        found |= clusters.indices[own[0]+k] == 1;
+    require(found, "A lamp is listed in the cluster of the pixel it lights");
+    require(listed(1) > 0 && listed(2) == 0, "A lamp whose light ends behind the camera is listed in no cluster");
+    require(std::abs(lights::range(0.02f)-100) < 1 && lights::range(1e-9f) == lights::minimumRange,
+            "A lamp's range follows its intensity");
+}
+
 int main(int argc,char *argv[])
 {
     if (argc == 2) {
@@ -296,6 +329,7 @@ int main(int argc,char *argv[])
     checkShadowCascades();
     checkSkyVisibility();
     checkAtmosphere();
+    checkLightClusters();
     const auto example = Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAC");
     require(example && example->toString() == "a1723291-8a22-47dc-b098-1f6718cffaac", "GUID canonicalizes");
     require(!Guid::parse("A1723291-8A22-47DC-B098-1F6718CFFAAX"), "Invalid GUID rejected");

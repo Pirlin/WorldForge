@@ -924,7 +924,7 @@ void MainWindow::editAtmosphere()
         return field;
     };
     auto *sunAzimuth = scalar(tr("Default sun azimuth"),-180,180,initial.sunAzimuth);
-    auto *sunElevation = scalar(tr("Default sun elevation"),0,90,initial.sunElevation);
+    auto *sunElevation = scalar(tr("Default sun elevation"),-20,90,initial.sunElevation);
     sunAzimuth->setSuffix("°");
     sunElevation->setSuffix("°");
     auto *shadows = new QCheckBox(tr("Cast sun shadows"),&dialog);

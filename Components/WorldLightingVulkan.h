@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Engine/Render/ShadowCascades.h"
+#include "Engine/Render/LightClusters.h"
 #include "Engine/Render/SkyLight.h"
 #include "Engine/Render/SkyVisibility.h"
 
@@ -17,16 +18,17 @@ struct LightingUniform {
     float settings[4];
     float sun[4];               // direction toward the sun, intensity
     float skyIrradiance[9][4];  // spherical harmonics of irradiance / pi
-    float skyHorizon[4];        // w: number of lights
+    float skyHorizon[4];
     float skyZenith[4];
     float skyGround[4];
-    float lights[16][4];        // position or direction, intensity (negative for directional)
+    float clusterForward[4];    // clustered lights (LightClusters.h): the camera's forward axis
+    float clusterViewport[4];   // viewport size in pixels
     float skyMatrices[worldforge::sky::directionCount][16]; // Engine/Render/SkyVisibility.h
     float skyDirections[worldforge::sky::directionCount][4];
     float skySettings[4];       // sky visibility maps on, meters per texel, physical sky on
     float sunTint[4];           // sunlight color at the ground, luminance 1
 };
-static_assert(sizeof(LightingUniform) == 2128);
+static_assert(sizeof(LightingUniform) == 1904);
 
 class WorldLightingVulkan {
 public:
@@ -41,6 +43,8 @@ public:
     bool uploadTextures(int frame,std::span<const uint32_t> pixels,uint64_t revision);
     // The sky's environment map (color::SkyLight::environment) for binding 5, copied when revision changes.
     bool uploadEnvironment(int frame,std::span<const std::array<float,4>> environment,uint64_t revision);
+    // The lights and their clusters for binding 6 (worldforge::lights::Clusters).
+    bool uploadClusters(int frame,const worldforge::lights::Clusters &clusters);
     VkDescriptorSet descriptor(int frame) const { return frames_[frame].set; }
     VkFramebuffer framebuffer(int frame) const { return frames_[frame].shadow.framebuffer; }
     // The sky visibility maps (Engine/Render/SkyVisibility.h), rendered with pass() like the shadow atlas.
@@ -66,6 +70,8 @@ private:
         VkBuffer environment{};
         VkDeviceMemory environmentMemory{};
         uint64_t environmentRevision = ~uint64_t(0);
+        VkBuffer clusters{};
+        VkDeviceMemory clusterMemory{};
         VkDescriptorSet set{};
     };
     bool createFrame(Frame &frame,VkFormat format);
