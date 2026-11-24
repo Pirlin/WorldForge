@@ -351,6 +351,8 @@ private:
     std::size_t ring_ = 0;
     bool vertexMotion_ = true;
     RenderStats stats_; // what the last recorded frame submitted (stats)
+    // This frame's exposure scale, which sizes lamp ranges in the light clusters (LightClusters.h).
+    float clusterExposure_ = 0;
     // GPU timing (RenderStats::gpuMs): a timestamp before the frame and after each pass, per frame slot, read back once
     // the slot's fence has signaled so timing never waits on the GPU.
     static constexpr uint32_t timestampsPerFrame = RenderStats::passCount+1;
@@ -1283,7 +1285,7 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
         const std::array eye{view.eye.x,view.eye.y,view.eye.z};
         clusters_ = lights::build(view.sceneLights ? std::span<const lights::Light>(*view.sceneLights)
                                                    : std::span<const lights::Light>{},
-                                  matrix,eye,{forward.x,forward.y,forward.z},pointShadowsRendered_);
+                                  matrix,eye,{forward.x,forward.y,forward.z},pointShadowsRendered_,clusterExposure_);
         clusters_.write(frame.clusters.mapped);
         lighting.clusterForward = {forward.x,forward.y,forward.z,0};
         lighting.clusterViewport = {float(width),float(height),0,0};
@@ -1759,6 +1761,9 @@ bool VulkanRenderer::draw(const std::vector<PlayVertex> &vertices,const std::vec
     auto shown = withShadows(temporal.enabled ? jittered(view,frame_.jitter(),width,height) : view,view,vertices,
                              frame_.sampleIndex());
     updateSky(shown);
+    // Auto exposure once per frame (it consumes the slot's histogram); the light clusters size lamp ranges by it.
+    const float exposureStops = exposureFor(view,frameIndex_);
+    clusterExposure_ = color::exposureScale(exposureStops);
     if (!prepare(frame,vertices,shown,width,height))
         return false;
     prepareMeshlets(frame,vertices,ranges,shown);
@@ -1767,7 +1772,7 @@ bool VulkanRenderer::draw(const std::vector<PlayVertex> &vertices,const std::vec
     api_.vkResetCommandBuffer(frame.command,0);
     api_.vkBeginCommandBuffer(frame.command,&begin);
     const auto meterSlot = view.display.z > 0.5f ? int(frameIndex_) : -1;
-    record(frame,frame_,image,ranges,shown,sky,vertices,exposureFor(view,frameIndex_),meterSlot,temporal,
+    record(frame,frame_,image,ranges,shown,sky,vertices,exposureStops,meterSlot,temporal,
            occlusionFor(shown));
     const bool readPixel = verify && swapchainCopies_
         && (readback_.size >= 4 || readback_.create(device_,4096,VK_BUFFER_USAGE_TRANSFER_DST_BIT));
@@ -1846,6 +1851,7 @@ bool VulkanRenderer::capture(const std::vector<PlayVertex> &vertices,const std::
                                  target.sampleIndex());
         updateSky(shown);
         reflectionReady_ = target.previousFrameReady();
+        clusterExposure_ = color::exposureScale(stops);
         if (!prepare(frame,vertices,shown,width,height)) {
             ok = false;
             break;

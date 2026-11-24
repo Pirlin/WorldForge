@@ -88,9 +88,19 @@ struct Clusters {
     }
 };
 
-inline float range(float intensity)
+// Display-linear brightness of a white diffuse surface below which a lamp's light cannot be seen: about half of the
+// darkest 8-bit sRGB step. With the frame's exposure scale, a lamp's range ends where its light on a white surface falls
+// below it, so by day a street lamp reaches a few meters instead of tens: in the sun's exposure its farther light
+// cannot show, and every pixel it reaches pays for it. Night exposures keep the absolute invisibleRadiance limit.
+constexpr float invisibleDisplay = 0.0012f;
+
+// The range of a light of the given intensity (scene units). exposureScale is the frame's scene-to-display scale
+// (color::exposureScale), or 0 for the absolute limit alone.
+inline float range(float intensity,float exposureScale = 0)
 {
-    return std::clamp(std::sqrt(std::max(intensity,0.0f)/invisibleRadiance),minimumRange,maximumRange);
+    const float threshold = exposureScale > 0 ? std::max(invisibleRadiance,invisibleDisplay/exposureScale)
+                                              : invisibleRadiance;
+    return std::clamp(std::sqrt(std::max(intensity,0.0f)/threshold),minimumRange,maximumRange);
 }
 
 // The depth slice of a distance along the camera's forward axis (Shading.glsl mirrors this).
@@ -138,7 +148,8 @@ inline std::array<std::array<float,16>,6> cubeFaces(const std::array<float,3> &p
 // jitter); eye and forward give depth along the view.
 inline Clusters build(std::span<const Light> input,const std::array<float,16> &viewProjection,
                       const std::array<float,3> &eye,const std::array<float,3> &forward,
-                      std::span<const std::array<float,4>> previousShadows = {})
+                      std::span<const std::array<float,4>> previousShadows = {},
+                      float exposureScale = 0)
 {
     Clusters result;
     // Directional lights first, then point lights.
@@ -154,7 +165,7 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
         ordered.resize(std::size_t(maximumLights));
     result.header = {uint32_t(ordered.size()),uint32_t(std::min<std::size_t>(directional,ordered.size())),0,0};
     for (const auto *light : ordered) {
-        const float reach = light->directional ? 0 : range(light->intensity);
+        const float reach = light->directional ? 0 : range(light->intensity,exposureScale);
         result.lights.push_back({light->vector[0],light->vector[1],light->vector[2],reach});
         result.lights.push_back({light->color[0]*light->intensity,light->color[1]*light->intensity,
                                  light->color[2]*light->intensity,light->directional ? 1.0f : 0.0f});

@@ -307,6 +307,12 @@ void checkAtmosphere()
 
 void checkLightClusters()
 {
+    // Lamp ranges follow the exposure: an 1800 cd street lamp reaches tens of meters at night but only a few in the
+    // sun's exposure, where its farther light cannot show; without an exposure the absolute limit applies.
+    const float lamp = color::unitsFromCandela(1800);
+    const float night = lights::range(lamp,color::exposureScale(10)), day = lights::range(lamp,color::exposureScale(-0.5f));
+    require(lights::range(lamp) > 80 && std::abs(night-lights::range(lamp)) < 0.01f && day < 8 && day > lights::minimumRange,
+            "Lamp ranges keep their night reach and shrink to where their light can show by day");
     // A camera at (0, -30, 1.7) looking along +y; Vulkan clip space (y down), 16:9, 45 degrees.
     const float f = 1/std::tan(0.3927f), aspect = 16.0f/9;
     const std::array<float,16> camera{f/aspect,0,0,0, 0,0,0.999f,1, 0,-f,0,0, 0,f*1.7f,29.9f,30};

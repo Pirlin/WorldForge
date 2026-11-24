@@ -2527,8 +2527,12 @@ public:
         std::array<float,16> clusterMatrix;
         std::copy_n(steady.constData(),16,clusterMatrix.begin());
         const auto viewer = window_.viewPose().first;
+        const auto frameIndex = window_.currentFrame();
+        const auto exposure = exposureFor(environment,frameIndex);
+        // Lamp ranges end where their light can no longer show at this exposure (LightClusters.h).
         const auto lightClusters = wf::lights::build(clusterLights,clusterMatrix,{viewer.x(),viewer.y(),viewer.z()},
-                                                     {forward.x(),forward.y(),forward.z()},pointShadowsRendered_);
+                                                     {forward.x(),forward.y(),forward.z()},pointShadowsRendered_,
+                                                     wf::color::exposureScale(exposure));
         const float clusterForward[4]{forward.x(),forward.y(),forward.z(),0};
         const float clusterViewport[4]{float(size.width()),float(size.height()),0,0};
         std::copy_n(clusterForward,4,lighting.clusterForward);
@@ -2570,8 +2574,6 @@ public:
         }
         lighting.skySettings[0] = skyMaps ? 1.0f : 0.0f;
         lighting.skySettings[1] = skyVisibility.metersPerTexel;
-        const auto frameIndex = window_.currentFrame();
-        const auto exposure = exposureFor(environment,frameIndex);
         const std::span<const wf::vk::TriangleRange> transparent = glassTransmission_ && glassRadiance_
             ? std::span<const wf::vk::TriangleRange>(geometry.transparent) : std::span<const wf::vk::TriangleRange>{};
         const auto focus = viewer+forward*6;
