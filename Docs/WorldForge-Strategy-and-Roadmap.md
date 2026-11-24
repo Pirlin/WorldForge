@@ -248,7 +248,8 @@ Use the Playable Street for fixed clear-day, low-sun, twilight, and lamp-lit nig
 
 - [x] Improve atmospheric transmittance near the horizon and antialias the physical sun disc at the angular size used for shadows. Check grazing light in the core tests and review a fixed low-sun view.
 - [x] Match height fog and local mist to the physical sky and sunlight. Verify shadowed fog, dusk brightness, and editor and Player parity.
-- [ ] Verify the sun crossing the horizon, twilight colors, and exposure during moving sunrise and sunset shots.
+- [x] Verify the sun crossing the horizon, twilight colors, and exposure during moving sunrise and sunset shots.
+  - **Result** (2026-11-25): `--sunrise` and `--sunset` animate the sun from −6° to 12° and back in both renderers. No step between consecutive frames exceeds 0.5 stops of auto-exposure, the zenith stays bluer than the horizon, and the editor and Player match (3/3 checks each).
 - [ ] Refine evening and night lighting. Verify warm and cool lamps, shadow falloff, light in mist, and exposure transitions from the street into lit interiors.
 - [ ] Add distance-dependent aerial perspective for streets, rooftops, and the far skyline. Verify that clear air, haze, and dense fog retain depth as the camera moves.
 - [ ] Add cloud cover and weather transitions that change both the visible sky and the light reaching the scene. Check the transitions at street and rooftop height.

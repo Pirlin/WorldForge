@@ -923,6 +923,8 @@ struct StreetRun {
     bool missionHud = false, gameplayVerified = true;
     wf::GameplayTrace trace;
     std::vector<std::string> objectives;
+    // GPU time per pass (RenderStats::gpuMs), summed over the measured frames.
+    std::array<double,RenderStats::passCount> gpuMs{};
 
     static double percentile(std::vector<double> values,double fraction)
     {
@@ -969,6 +971,11 @@ struct StreetRun {
             << "  \"frames\": " << frameMs.size() << ",\n"
             << "  \"frameMs\": {\"average\": " << average(frameMs) << ", \"p95\": " << percentile(frameMs,0.95)
             << ", \"p99\": " << percentile(frameMs,0.99) << ", \"max\": " << percentile(frameMs,1) << "},\n"
+            << "  \"gpuMs\": {";
+        const char *passNames[RenderStats::passCount]{"sunShadows","skyMaps","pointShadows","scene","postProcess"};
+        for (std::size_t pass = 0; pass < gpuMs.size(); ++pass)
+            out << (pass ? ", " : "") << '"' << passNames[pass] << "\": " << gpuMs[pass]/double(std::max<std::size_t>(frameMs.size(),1));
+        out << "},\n"
             << "  \"cpuMs\": {\"average\": " << average(cpuMs) << ", \"p95\": " << percentile(cpuMs,0.95)
             << ", \"max\": " << percentile(cpuMs,1) << "},\n"
             << "  \"workingSetMiB\": " << double(memory.WorkingSetSize)/1048576
@@ -1447,6 +1454,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
             if (++frames > 30) {
                 run.frameMs.push_back(std::chrono::duration<double,std::milli>(end-frameStart).count());
                 run.cpuMs.push_back(std::chrono::duration<double,std::milli>(beforePresent-frameStart).count());
+                const auto stats = renderer->stats();
+                for (std::size_t pass = 0; pass < run.gpuMs.size(); ++pass)
+                    run.gpuMs[pass] += stats.gpuMs[pass];
             }
             const auto &position = scene.player().position;
             for (const auto &mission : gameplay.missions)

@@ -183,7 +183,12 @@ float skyOpenness(vec3 position,vec3 normal)
     float noise = fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
     vec2 jitter = (vec2(noise,fract(noise*7.31+0.37))-0.5)/texels;
     float open = 0.0, total = 0.0;
-    for (int i = 0; i < 16; ++i) {
+    // With TAA (a nonzero sample index) each pixel tests every other direction, alternating in a checkerboard that
+    // flips each frame, and the resolve averages the halves: each half of the spiral covers the whole sky. Without
+    // TAA the sample index stays 0 and every direction is tested.
+    int stride = lighting.settings.z > 0.5 ? 2 : 1;
+    int first = stride == 2 ? (int(gl_FragCoord.x)+int(gl_FragCoord.y)+int(lighting.settings.z)) & 1 : 0;
+    for (int i = first; i < 16; i += stride) {
         vec3 direction = lighting.skyDirections[i].xyz;
         // w: the sky's luminance in that direction, the same for every pixel, so the renderer computes it once.
         float weight = lighting.skyDirections[i].w*(max(dot(normal,direction),0.0)+0.05);

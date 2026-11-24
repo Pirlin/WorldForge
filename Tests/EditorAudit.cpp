@@ -2732,13 +2732,10 @@ struct PlayerRun {
     QJsonObject report;
 };
 
-PlayerRun runStreetPlayer(const ProjectStore &store,const QDir &output,const QString &name)
+// Runs the Player's street mission on these playable bytes, saved as <name>.wfplay.
+PlayerRun runStreetBytes(const std::string &bytes,const QDir &output,const QString &name)
 {
     PlayerRun run;
-    std::ostringstream playable;
-    if (!WorldRuntime::exportScene(store,playable))
-        return run;
-    const auto bytes = playable.str();
     QFile scene(output.filePath(name + ".wfplay"));
     if (!scene.open(QIODevice::WriteOnly) || scene.write(bytes.data(),qint64(bytes.size())) != qint64(bytes.size()))
         return run;
@@ -2759,6 +2756,14 @@ PlayerRun runStreetPlayer(const ProjectStore &store,const QDir &output,const QSt
     return run;
 }
 
+PlayerRun runStreetPlayer(const ProjectStore &store,const QDir &output,const QString &name)
+{
+    std::ostringstream playable;
+    if (!WorldRuntime::exportScene(store,playable))
+        return {};
+    return runStreetBytes(playable.str(),output,name);
+}
+
 QString playerSummary(const PlayerRun &run)
 {
     const auto frame = run.report.value("frameMs").toObject();
@@ -2771,10 +2776,18 @@ QString playerSummary(const PlayerRun &run)
         .arg(frame.value("p99").toDouble(),0,'f',2).arg(frame.value("max").toDouble(),0,'f',2)
         .arg(cpu.value("average").toDouble(),0,'f',2).arg(cpu.value("p95").toDouble(),0,'f',2)
         .arg(run.report.value("workingSetMiB").toDouble(),0,'f',0).arg(run.report.value("peakWorkingSetMiB").toDouble(),0,'f',0)
-        .arg(run.report.value("privateMiB").toDouble(),0,'f',0).arg(run.report.value("texturedMeshes").toInt());
+        .arg(run.report.value("privateMiB").toDouble(),0,'f',0).arg(run.report.value("texturedMeshes").toInt())
+        + [&] {
+              const auto gpu = run.report.value("gpuMs").toObject();
+              if (gpu.isEmpty())
+                  return QString();
+              return QString(" · GPU sun shadows %1, point shadows %2, scene %3, post-process %4 ms")
+                  .arg(gpu.value("sunShadows").toDouble(),0,'f',2).arg(gpu.value("pointShadows").toDouble(),0,'f',2)
+                  .arg(gpu.value("scene").toDouble(),0,'f',2).arg(gpu.value("postProcess").toDouble(),0,'f',2);
+          }();
 }
 
-void r3PerformanceWorkflow(const QDir &output,Audit &audit)
+void r3PerformanceWorkflow(const QDir &output,Audit &audit,bool profile = false)
 {
     const QString page = "R3 lighting";
     QTemporaryDir directory;
@@ -2795,7 +2808,7 @@ void r3PerformanceWorkflow(const QDir &output,Audit &audit)
     atmosphere.insert("screenSpaceGi",true);
     atmosphere.insert("reflectionProbes",true);
     store.setAtmosphere(atmosphere);
-    const auto enabled = runStreetPlayer(store,output,"r3-lighting-on");
+    const auto enabled = profile ? PlayerRun{} : runStreetPlayer(store,output,"r3-lighting-on");
     const auto completed = [](const PlayerRun &run) {
         return run.exitCode == 0 && run.report.value("renderer").toString() == "Vulkan"
             && run.report.value("missionComplete").toBool() && run.report.value("trafficLooped").toBool();
@@ -2803,12 +2816,75 @@ void r3PerformanceWorkflow(const QDir &output,Audit &audit)
     const auto p95 = [](const PlayerRun &run) { return run.report.value("frameMs").toObject().value("p95").toDouble(); };
     audit.check(page,"performance","The baseline mission renders with Vulkan",
                 completed(baseline) && p95(baseline) > 0,playerSummary(baseline));
+    if (profile) {
+        // --street-profile: the baseline mission (R3 lighting off) once per disabled feature, to find what the
+        // street's GPU time goes to.
+        QFile saved(output.filePath("r3-lighting-off.wfplay"));
+        const auto baselineBytes = saved.open(QIODevice::ReadOnly) ? saved.readAll().toStdString() : std::string{};
+        std::istringstream input(baselineBytes);
+        const auto scene = worldforge::readPlayable(input);
+        audit.check(page,"profile","Load the exported street for single-feature comparisons",scene.has_value());
+        if (!scene)
+            return;
+        struct Variant {
+            const char *name;
+            void (*apply)(worldforge::PlayableScene &);
+        };
+        const Variant variants[]{
+            {"without-height-fog",[](auto &copy) { copy.fogDensity = 0; }},
+            {"without-contact-shadows",[](auto &copy) { copy.contactShadows = false; }},
+            {"without-reflections",[](auto &copy) { copy.reflections = false; }},
+            {"without-sun-shadows",[](auto &copy) { copy.shadows = false; }},
+            {"without-ambient-occlusion",[](auto &copy) { copy.ambientOcclusion = false; }},
+            {"without-lamps",[](auto &copy) { std::erase_if(copy.lights,[](const auto &light) { return !light.directional; }); }},
+            {"without-surface-layers",[](auto &copy) {
+                for (auto &mesh : copy.meshes) {
+                    mesh.layers = {};
+                    mesh.clearCoat = 0;
+                    mesh.surfaceMaps = {};
+                }
+            }},
+            {"without-bloom-and-taa",[](auto &copy) { copy.bloom = false; copy.temporalAntiAliasing = false; }},
+        };
+        const auto gpu = [](const PlayerRun &run,const char *pass) {
+            return run.report.value("gpuMs").toObject().value(pass).toDouble();
+        };
+        for (const auto &variant : variants) {
+            std::istringstream copyInput(baselineBytes);
+            auto copy = worldforge::readPlayable(copyInput);
+            if (copy)
+                variant.apply(*copy);
+            std::ostringstream bytes;
+            const auto result = copy && worldforge::writePlayable(bytes,*copy)
+                ? runStreetBytes(bytes.str(),output,QString("street-%1").arg(variant.name)) : PlayerRun{};
+            const bool profiled = completed(result) && gpu(result,"scene") > 0;
+            audit.check(page,"profile",QString("Profile the street %1").arg(variant.name),profiled,
+                profiled ? QString("Scene GPU time %1 ms (%2 ms with all effects), post-process %3 ms (%4 ms), frame p95 %5 ms (%6 ms)")
+                    .arg(gpu(result,"scene"),0,'f',2).arg(gpu(baseline,"scene"),0,'f',2)
+                    .arg(gpu(result,"postProcess"),0,'f',2).arg(gpu(baseline,"postProcess"),0,'f',2)
+                    .arg(p95(result),0,'f',2).arg(p95(baseline),0,'f',2)
+                    : QStringLiteral("The export or the timestamped Vulkan mission did not complete."));
+        }
+        return;
+    }
     audit.check(page,"performance","The mission completes with all R3 lighting enabled",
                 completed(enabled) && p95(enabled) > 0,playerSummary(enabled));
     audit.check(page,"performance","All R3 lighting fits the street frame and memory budget",
                 p95(enabled) > 0 && p95(enabled) < 16.7 && enabled.report.value("peakWorkingSetMiB").toDouble() < 1024,
                 QString("p95 %1 ms with R3 off, %2 ms on. Budget: p95 under 16.7 ms and peak working set under 1 GiB.")
                     .arg(p95(baseline),0,'f',2).arg(p95(enabled),0,'f',2));
+    // Realism pass item 5: the same mission with height fog and a 9 m local mist volume over the street, which the
+    // camera passes through.
+    atmosphere.insert("fogDensity",0.003);
+    atmosphere.insert("localFogCenter",QJsonArray{-3,-2,1.5});
+    atmosphere.insert("localFogRadius",9);
+    atmosphere.insert("localFogDensity",0.035);
+    store.setAtmosphere(atmosphere);
+    const auto misty = runStreetPlayer(store,output,"r3-lighting-mist");
+    audit.check(page,"performance","Height fog and local mist fit the street frame budget",
+                completed(misty) && p95(misty) > 0 && p95(misty) < 16.7,
+                QString("p95 %1 ms with R3 lighting, %2 ms with height fog and local mist as well. %3")
+                    .arg(p95(enabled),0,'f',2).arg(p95(misty),0,'f',2).arg(playerSummary(misty)));
 }
 
 // The city-scale benchmark (R4): a generated district flown along a fixed route in the packaged Player
@@ -7743,6 +7819,7 @@ int main(int argc, char **argv)
     const bool forgeAi = app.arguments().size() == 4 && app.arguments().last() == "--forge-ai";
     const bool streetAudit = app.arguments().size() == 4 && app.arguments().last() == "--street";
     const bool r3Performance = app.arguments().size() == 4 && app.arguments().last() == "--r3-performance";
+    const bool streetProfile = app.arguments().size() == 4 && app.arguments().last() == "--street-profile";
     const bool districtProfile = app.arguments().size() == 4 && app.arguments().last() == "--district-profile";
     const bool districtLarge = app.arguments().size() == 4 && app.arguments().last() == "--district-large";
     const bool districtTextured = app.arguments().size() == 4 && app.arguments().last() == "--district-textured";
@@ -7764,7 +7841,7 @@ int main(int argc, char **argv)
     const bool surfaceLibrary = app.arguments().size() == 4 && app.arguments().last() == "--surface-library";
     const bool studioUv = app.arguments().size() == 4 && app.arguments().last() == "--studio-uv";
     const bool studioCharacter = app.arguments().size() == 4 && app.arguments().last() == "--studio-character";
-    if (!authoring && !benchmark && !studio && !forgeAi && !streetAudit && !r3Performance && !districtAudit && !rendering && !sunrise && !sunset && !realism && !engineSession
+    if (!authoring && !benchmark && !studio && !forgeAi && !streetAudit && !r3Performance && !streetProfile && !districtAudit && !rendering && !sunrise && !sunset && !realism && !engineSession
         && !surfaceLibrary && !studioUv && !studioCharacter && !programming && !nativeGameplay && app.arguments().size() != 3)
         return 2;
     const QDir output(app.arguments().at(1));
@@ -7827,8 +7904,8 @@ int main(int argc, char **argv)
         controls.flush();
         return audit.failures ? 1 : 0;
     }
-    if (r3Performance) {
-        r3PerformanceWorkflow(output,audit);
+    if (r3Performance || streetProfile) {
+        r3PerformanceWorkflow(output,audit,streetProfile);
         controls.flush();
         return audit.failures ? 1 : 0;
     }
