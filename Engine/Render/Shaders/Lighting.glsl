@@ -34,7 +34,7 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     mat4 previousViewProjection;
     vec4 reflectionSettings;
     vec4 probeGrid;        // origin in world meters, spacing (0 when disabled)
-    vec4 probeSettings;    // diffuse GI on, reflection probes on
+    vec4 probeSettings;    // diffuse GI on, reflection probes on, TAA on (split lookups average over its frames)
 } lighting;
 layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles, one per sky direction, nearest
 // The sky's environment (Engine/Render/SkyLight.h): a 128 x 64 radiance map with rows closer near the horizon, then
@@ -227,9 +227,9 @@ float sunVisibility(vec3 position,vec3 normal,bool soft)
     mat2 rotation = mat2(cos(angle),sin(angle),-sin(angle),cos(angle));
     // Blocker search: occluders up to 40 m toward the sun can widen the penumbra over this point.
     float searchTexels = clamp(0.5*sunAngularDiameter*40.0/scale.x,1.5,16.0);
-    // With TAA (a nonzero sample index) each pixel takes every other tap of both disks, alternating in a
+    // With TAA each pixel takes every other tap of both disks, alternating in a
     // checkerboard that flips each frame, and the resolve averages the halves. Without TAA every tap is taken.
-    int stride = lighting.settings.z > 0.5 ? 2 : 1;
+    int stride = lighting.probeSettings.z > 0.5 ? 2 : 1;
     int first = stride == 2 ? (int(gl_FragCoord.x)+int(gl_FragCoord.y)+int(lighting.settings.z)) & 1 : 0;
     float blockers = 0.0, count = 0.0;
     for (int i = first; i < 16; i += stride) {
@@ -309,9 +309,9 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
         vec2 pixel = gl_FragCoord.xy+5.588238*lighting.settings.z;
         float jitter = physical ? fogShadowJitter() : fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
         const int steps = 8; // TAA turns the jitter each frame, so a still view averages 128 samples
-        // With TAA (a nonzero sample index), neighboring segments share one shadow lookup, placed in either by its
+        // With TAA, neighboring segments share one shadow lookup, placed in either by its
         // share of their extinction, as the local mist does. Without TAA each segment takes its own.
-        bool paired = lighting.settings.z > 0.5;
+        bool paired = lighting.probeSettings.z > 0.5;
         float start = 0.0, before = 1.0;
         for (int i = 0; i < steps; i += 2) {
             float middle = marchEnd*float((i+1)*(i+1))/float(steps*steps);

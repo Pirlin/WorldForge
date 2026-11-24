@@ -17,12 +17,12 @@ layout(set = 0, binding = 0) uniform sampler2D depth; // nearest
 layout(set = 0, binding = 1) uniform sampler2D scene; // this frame's lit scene, nearest
 layout(push_constant) uniform Occlusion {
     mat4 inverseViewProjection; // clip space (with this frame's jitter) to world space
-    vec4 settings;              // radius, 1 for AO + 2 for screen GI, frame index, probe GI on
+    vec4 settings;              // radius, 1 for AO + 2 for screen GI + 4 with TAA, frame index, probe GI on
 } occlusionSettings;
 layout(location = 0) out vec4 occlusion; // bounce light, sky visibility
 
 const float pi = 3.14159265359;
-const int slices = 2, steps = 6;
+const int steps = 6;
 const float angleBias = 0.06; // radians
 
 vec3 worldAt(vec2 uv,float z)
@@ -60,10 +60,12 @@ void main()
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     int mode = int(occlusionSettings.settings.y);
     bool useAo = (mode&1) != 0, useGi = (mode&2) != 0;
+    // With TAA one slice a frame: its angle turns each frame, so a still view still averages 16 directions.
+    int slices = (mode&4) != 0 ? 1 : 2;
     if (useGi)
         pixel = min(2*pixel+ivec2(1),size-1);
     float z = texelFetch(depth,pixel,0).r;
-    if (occlusionSettings.settings.y < 0.5 || z >= 1.0) {
+    if (!(useAo || useGi) || z >= 1.0) {
         occlusion = vec4(0.0,0.0,0.0,1.0);
         return;
     }

@@ -2608,6 +2608,7 @@ public:
         lighting.probeGrid = probeField_.grid();
         lighting.probeSettings[0] = environment.probeGi ? 1.0f : 0.0f;
         lighting.probeSettings[1] = environment.reflectionProbes ? 1.0f : 0.0f;
+        lighting.probeSettings[2] = environment.temporalAntiAliasing ? 1.0f : 0.0f; // TAA averages split lookups
         auto &probeFrame = probeFrames_[std::size_t(frameIndex)];
         probeFrame = probeField_.trace();
         lighting_.bindProbes(frameIndex,probeFrame ? probeFrame->output().buffer : VK_NULL_HANDLE,

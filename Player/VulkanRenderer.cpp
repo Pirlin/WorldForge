@@ -1375,7 +1375,7 @@ void VulkanRenderer::updateProbes(Frame &frame,std::span<const PlayVertex> verti
     }
     frame.probes = probeField_.trace();
     const auto grid = probeField_.grid();
-    const std::array settings{view.probeGi ? 1.f : 0.f,view.reflectionProbes ? 1.f : 0.f,0.f,0.f};
+    const std::array settings{view.probeGi ? 1.f : 0.f,view.reflectionProbes ? 1.f : 0.f,view.sky.y > 0.5f ? 1.f : 0.f,0.f};
     std::memcpy(data+offsetof(LightingBlock,probeGrid),grid.data(),sizeof(grid));
     std::memcpy(data+offsetof(LightingBlock,probeSettings),settings.data(),sizeof(settings));
     const VkDescriptorBufferInfo info{frame.probes ? frame.probes->output().buffer : frame.clusters.buffer,0,
