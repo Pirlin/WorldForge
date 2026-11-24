@@ -58,6 +58,7 @@ struct LightingBlock {      // Lighting.glsl
     XMFLOAT4X4 previousViewProjection;
     XMFLOAT4 reflectionSettings;
     std::array<float,4> probeGrid{}, probeSettings{};
+    XMFLOAT4 skyIrradianceBand4[9]; // band-4 sky irradiance coefficients
 };
 struct PlayViewBlock {      // PlayView.glsl
     XMFLOAT4X4 viewProjection;
@@ -75,7 +76,7 @@ struct MaterialConstants {  // push constants of PlayScene.frag
     uint32_t padding;
     XMFLOAT4 streetLayers;
 };
-static_assert(sizeof(LightingBlock) == 2016 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
+static_assert(sizeof(LightingBlock) == 2160 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
 static_assert(offsetof(MaterialConstants,streetLayers) == 96 && sizeof(MaterialConstants) == 112);
 
 constexpr uint32_t shadowSize = shadow::atlasSize;
@@ -1254,6 +1255,7 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     }
     lighting.skySettings = {view.skyMaps && view.sky.z > 0.5f ? 1.0f : 0.0f,view.skyVisibility.metersPerTexel,view.sky.w,view.weather.x};
     std::copy(std::begin(view.skyIrradiance),std::end(view.skyIrradiance),std::begin(lighting.skyIrradiance));
+    std::copy(std::begin(view.skyIrradianceBand4),std::end(view.skyIrradianceBand4),std::begin(lighting.skyIrradianceBand4));
     lighting.skyHorizon = view.skyHorizon;
     lighting.skyZenith = view.skyZenith;
     lighting.skyGround = view.skyGround;

@@ -30,6 +30,13 @@ vec3 skyIrradiance(vec3 n)
     vec3 result = vec3(0.0);
     for (int i = 0; i < 9; ++i)
         result += lighting.skyIrradiance[i].rgb*basis[i];
+    float xx = n.x*n.x, yy = n.y*n.y, zz = n.z*n.z;
+    float band4[9] = float[9](2.503343*n.x*n.y*(xx-yy),-1.770131*n.y*n.z*(3.0*xx-yy),0.946175*n.x*n.y*(7.0*zz-1.0),
+                              -0.669047*n.y*n.z*(7.0*zz-3.0),0.105786*(35.0*zz*zz-30.0*zz+3.0),
+                              -0.669047*n.x*n.z*(7.0*zz-3.0),0.473087*(xx-yy)*(7.0*zz-1.0),
+                              -1.770131*n.x*n.z*(xx-3.0*yy),0.625836*(xx*(xx-3.0*yy)-yy*(3.0*xx-yy)));
+    for (int i = 0; i < 9; ++i)
+        result += lighting.skyIrradianceBand4[i].rgb*band4[i];
     return max(result,vec3(0.0));
 }
 

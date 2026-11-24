@@ -160,6 +160,34 @@ void checkColorPipeline()
     const auto physicalFloor = color::skyIrradiance(physical,0,0,1);
     require(physical.environment.size() == color::mapTexels && physicalFloor[2] > physicalFloor[0] && physical.sunLight[0] > physical.sunLight[2],
             "The physical sky gives blue sky light and warm sunlight");
+    // The spherical harmonics match the irradiance integrated from the radiance map, also at twilight, when a bright
+    // band along the horizon makes bands 0-2 alone overstate the light on the ground by 11%.
+    {
+        const float pi = 3.14159265f, below = -6*pi/180;
+        const auto twilight = color::physicalSkyLight({std::cos(below),0,std::sin(below)},1);
+        const auto exact = [&](const float n[3]) {
+            double sum = 0;
+            constexpr int width = 256, height = 128;
+            for (int y = 0; y < height; ++y) {
+                const double polar = (y+0.5)/height*pi, solidAngle = std::sin(polar)*(pi/height)*(2*pi/width);
+                for (int x = 0; x < width; ++x) {
+                    const double around = (x+0.5)/width*2*pi;
+                    const float d[3]{float(std::sin(polar)*std::cos(around)),float(std::sin(polar)*std::sin(around)),
+                                     float(std::cos(polar))};
+                    const double cosine = n[0]*d[0]+n[1]*d[1]+n[2]*d[2];
+                    if (cosine > 0)
+                        sum += color::sky::sample(twilight.environment,0,color::mapWidth,color::mapHeight,d)[1]*cosine*solidAngle;
+                }
+            }
+            return sum/pi;
+        };
+        double worst = 0;
+        for (const auto &n : {std::array<float,3>{0,0,1},{1,0,0},{-1,0,0},{0,1,0},{0.7071f,0,0.7071f}}) {
+            const double reference = exact(n.data());
+            worst = std::max(worst,std::abs(color::skyIrradiance(twilight,n[0],n[1],n[2])[1]/reference-1));
+        }
+        require(worst < 0.06,"Sky irradiance stays within 6% of the integrated twilight sky in every direction");
+    }
     require(color::skyAmbientScale({166/255.0f,197/255.0f,219/255.0f},{65/255.0f,119/255.0f,177/255.0f}) == 1,
             "The default sky keeps the ambient light unchanged");
     require(color::skyAmbientScale({0.03f,0.03f,0.06f},{0.01f,0.01f,0.03f}) < 0.01f, "A night sky gives almost no ambient light");

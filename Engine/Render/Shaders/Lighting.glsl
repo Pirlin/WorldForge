@@ -35,6 +35,7 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     vec4 reflectionSettings;
     vec4 probeGrid;        // origin in world meters, spacing (0 when disabled)
     vec4 probeSettings;    // diffuse GI on, reflection probes on, TAA on (split lookups average over its frames)
+    vec4 skyIrradianceBand4[9]; // band-4 coefficients of sky irradiance / pi (SkyLight.h shBasis4)
 } lighting;
 layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles, one per sky direction, nearest
 // The sky's environment (Engine/Render/SkyLight.h): a 128 x 64 radiance map with rows closer near the horizon, then

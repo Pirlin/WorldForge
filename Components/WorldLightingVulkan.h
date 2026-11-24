@@ -32,8 +32,9 @@ struct LightingUniform {
     float previousViewProjection[16];
     float reflectionSettings[4];
     std::array<float,4> probeGrid{}, probeSettings{};
+    float skyIrradianceBand4[9][4]{}; // band-4 coefficients of irradiance / pi (SkyLight.h)
 };
-static_assert(sizeof(LightingUniform) == 2016);
+static_assert(sizeof(LightingUniform) == 2160);
 
 class WorldLightingVulkan {
 public:

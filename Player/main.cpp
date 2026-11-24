@@ -721,6 +721,9 @@ public:
         view.sceneLights = &sceneLights_;
         for (std::size_t i = 0; i < 9; ++i) {
             const float scale = wf::cloudSkyScale(clouds,i == 0);
+            const float directional = wf::cloudSkyScale(clouds,false);
+            view.skyIrradianceBand4[i] = {directional*skyLight_->irradianceBand4[i][0],directional*skyLight_->irradianceBand4[i][1],
+                                          directional*skyLight_->irradianceBand4[i][2],0};
             view.skyIrradiance[i] = {scale*skyLight_->irradiance[i][0],scale*skyLight_->irradiance[i][1],
                                     scale*skyLight_->irradiance[i][2],0};
         }

@@ -44,6 +44,10 @@ struct SkyLight {
     // Coefficients of irradiance / pi (the radiance a white diffuse surface reflects) for the SH basis in
     // Shading.glsl, RGB in xyz.
     std::array<std::array<float,4>,9> irradiance{};
+    // The band-4 coefficients (shBasis4). Bands 0-2 alone overstate the light on upward surfaces under a sky with a
+    // bright horizon band (by 11% at twilight, 5% at midday); band 4 brings that to 4.5% and 2% (band 3 of the cosine
+    // lobe is zero).
+    std::array<std::array<float,4>,9> irradianceBand4{};
     Rgb horizon{}, zenith{}, ground{}; // linear radiance, for reference
     // The radiance map and its prefiltered levels, RGB in xyz (mapTexels entries).
     std::vector<std::array<float,4>> environment;
@@ -120,6 +124,15 @@ inline std::array<float,9> shBasis(float x,float y,float z)
             0.315392f*(3*z*z-1),1.092548f*x*z,0.546274f*(x*x-y*y)};
 }
 
+// The real spherical-harmonic basis of band 4, in the order the shader uses.
+inline std::array<float,9> shBasis4(float x,float y,float z)
+{
+    const float xx = x*x, yy = y*y, zz = z*z;
+    return {2.503343f*x*y*(xx-yy),-1.770131f*y*z*(3*xx-yy),0.946175f*x*y*(7*zz-1),-0.669047f*y*z*(7*zz-3),
+            0.105786f*(35*zz*zz-30*zz+3),-0.669047f*x*z*(7*zz-3),0.473087f*(xx-yy)*(7*zz-1),-1.770131f*x*z*(xx-3*yy),
+            0.625836f*(xx*(xx-3*yy)-yy*(3*xx-yy))};
+}
+
 // The sky light of any sky: radiance(const float direction[3]) gives its radiance in scene units.
 template<class Radiance>
 SkyLight skyLightFrom(Radiance &&radiance)
@@ -134,25 +147,29 @@ SkyLight skyLightFrom(Radiance &&radiance)
             light.environment[std::size_t(y*mapWidth+x)] = {value[0],value[1],value[2],0};
         }
     // Irradiance: project the map, weighting each texel by its solid angle, then convolve with the cosine lobe
-    // (Ramamoorthi and Hanrahan): band l scales by A_l / pi = 1, 2/3, 1/4, which gives irradiance / pi.
-    std::array<Rgb,9> projected{};
+    // (Ramamoorthi and Hanrahan): band l scales by A_l / pi = 1, 2/3, 1/4, 0, -1/24, which gives irradiance / pi.
+    std::array<Rgb,9> projected{}, projected4{};
     for (int y = 0; y < mapHeight; ++y) {
         const float t = 2*(float(y)+0.5f)/mapHeight-1;
         const float elevation = (t < 0 ? -1.0f : 1.0f)*t*t*pi/2;
         const float solidAngle = std::cos(elevation)*(2*pi/mapWidth)*(2*pi*std::abs(t)/mapHeight);
         for (int x = 0; x < mapWidth; ++x) {
             const auto d = sky::direction((float(x)+0.5f)/mapWidth,(float(y)+0.5f)/mapHeight);
-            const auto basis = shBasis(d[0],d[1],d[2]);
+            const auto basis = shBasis(d[0],d[1],d[2]), basis4 = shBasis4(d[0],d[1],d[2]);
             const auto &value = light.environment[std::size_t(y*mapWidth+x)];
             for (std::size_t i = 0; i < 9; ++i)
-                for (int c = 0; c < 3; ++c)
+                for (int c = 0; c < 3; ++c) {
                     projected[i][std::size_t(c)] += value[std::size_t(c)]*basis[i]*solidAngle;
+                    projected4[i][std::size_t(c)] += value[std::size_t(c)]*basis4[i]*solidAngle;
+                }
         }
     }
     constexpr float band[9]{1,2/3.0f,2/3.0f,2/3.0f,0.25f,0.25f,0.25f,0.25f,0.25f};
     for (std::size_t i = 0; i < 9; ++i)
-        for (int c = 0; c < 3; ++c)
+        for (int c = 0; c < 3; ++c) {
             light.irradiance[i][std::size_t(c)] = band[i]*projected[i][std::size_t(c)];
+            light.irradianceBand4[i][std::size_t(c)] = -projected4[i][std::size_t(c)]/24;
+        }
     // Prefiltered levels: GGX importance samples around the reflected direction, weighted by the cosine to it
     // (the split-sum approximation takes the normal and the view along it).
     constexpr int samples = 256;
@@ -273,11 +290,14 @@ inline SkyLight physicalSkyLight(std::array<float,3> sun,float sunIntensity)
 // Irradiance / pi in direction (x, y, z) from the coefficients, as Shading.glsl evaluates it.
 inline Rgb skyIrradiance(const SkyLight &light,float x,float y,float z)
 {
-    const auto basis = shBasis(x,y,z);
+    const auto basis = shBasis(x,y,z), basis4 = shBasis4(x,y,z);
     Rgb result{};
     for (std::size_t i = 0; i < 9; ++i)
         for (int c = 0; c < 3; ++c)
-            result[std::size_t(c)] += light.irradiance[i][std::size_t(c)]*basis[i];
+            result[std::size_t(c)] += light.irradiance[i][std::size_t(c)]*basis[i]
+                +light.irradianceBand4[i][std::size_t(c)]*basis4[i];
+    for (auto &channel : result)
+        channel = std::max(channel,0.0f);
     return result;
 }
 

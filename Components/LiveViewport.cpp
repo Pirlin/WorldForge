@@ -2504,8 +2504,10 @@ public:
         previousWindValid_ = true;
         for (std::size_t i = 0; i < 9; ++i) {
             const float scale = wf::cloudSkyScale(clouds,i == 0);
-            for (std::size_t c = 0; c < 3; ++c)
+            for (std::size_t c = 0; c < 3; ++c) {
                 lighting.skyIrradiance[i][c] = skyLight.irradiance[i][c]*scale;
+                lighting.skyIrradianceBand4[i][c] = skyLight.irradianceBand4[i][c]*wf::cloudSkyScale(clouds,false);
+            }
         }
         std::copy_n(skyLight.horizon.data(),3,lighting.skyHorizon);
         std::copy_n(skyLight.zenith.data(),3,lighting.skyZenith);
