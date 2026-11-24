@@ -3708,7 +3708,8 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
     // Under TAA the costly lookups (sky openness, PCSS, ambient occlusion, fog and mist shadows) are split across
     // frames and the resolve averages them. They must not flicker: a slow pan through the misty sunset street is
     // captured with the lookups split and with every lookup taken, and the split may add little frame-to-frame change.
-    const auto panChange = [&](bool full) {
+    // everyFrame moves the camera before each rendered frame, as gameplay does; otherwise each step waits 100 ms.
+    const auto panChange = [&](bool full,bool everyFrame) {
         if (full)
             qputenv("WORLDFORGE_FULL_LOOKUPS","1");
         settled(sunsetShot);
@@ -3716,11 +3717,17 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
         QImage previous;
         double total = 0, worst = 0;
         int count = 0;
-        for (int step = 0; step <= 12; ++step) {
-            const auto offset = side*(0.03f*float(step));
-            const auto frame = capture(sunsetShot.eye+offset,sunsetShot.target+offset);
+        for (int step = 0; step <= (everyFrame ? 24 : 12); ++step) {
+            const auto offset = side*((everyFrame ? 0.01f : 0.03f)*float(step));
+            QImage frame;
+            if (everyFrame) {
+                view.setCameraPreview(sunsetShot.eye+offset,sunsetShot.target+offset);
+                frame = view.captureFrame().convertToFormat(QImage::Format_RGB32);
+            } else {
+                frame = capture(sunsetShot.eye+offset,sunsetShot.target+offset);
+            }
             if (!previous.isNull() && !frame.isNull()) {
-                const auto change = difference(frame,previous,QString("rendering-pan-%1-diff.png").arg(full ? "full" : "split"));
+                const auto change = difference(frame,previous,QString("rendering-pan-%1%2-diff.png").arg(full ? "full" : "split",everyFrame ? "-moving" : ""));
                 total += change.mean;
                 worst = std::max(worst,change.share);
                 ++count;
@@ -3730,13 +3737,20 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
         qunsetenv("WORLDFORGE_FULL_LOOKUPS");
         return std::pair{count ? total/count : 255.0,worst};
     };
-    const auto [splitChange,splitShare] = panChange(false);
-    const auto [fullChange,fullShare] = panChange(true);
+    const auto [splitChange,splitShare] = panChange(false,false);
+    const auto [fullChange,fullShare] = panChange(true,false);
     audit.check(page,"temporal","Lookups split across TAA frames do not flicker during a slow pan",
                 splitChange < fullChange+0.5 && splitShare <= fullShare+0.002,
                 QString("Mean change between pan frames: %1 levels split, %2 with every lookup; worst share over 24 levels "
                         "%3% split, %4% with every lookup")
                     .arg(splitChange,0,'f',2).arg(fullChange,0,'f',2).arg(splitShare*100,0,'f',3).arg(fullShare*100,0,'f',3));
+    const auto [movingSplit,movingSplitShare] = panChange(false,true);
+    const auto [movingFull,movingFullShare] = panChange(true,true);
+    audit.check(page,"temporal","Lookups split across TAA frames do not flicker while the camera moves every frame",
+                movingSplit < movingFull+0.5 && movingSplitShare <= movingFullShare+0.002,
+                QString("Mean change between frames: %1 levels split, %2 with every lookup; worst share over 24 levels "
+                        "%3% split, %4% with every lookup")
+                    .arg(movingSplit,0,'f',2).arg(movingFull,0,'f',2).arg(movingSplitShare*100,0,'f',3).arg(movingFullShare*100,0,'f',3));
 
     const auto captureWeatherPlayer = [&](const Shot &shot,const QImage &editor) {
         std::ostringstream weatherBytes;

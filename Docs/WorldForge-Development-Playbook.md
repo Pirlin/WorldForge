@@ -356,7 +356,7 @@ The user is asleep. Work through these blocks in order without asking. Each bloc
 
 In order. The same rules as section 10.0: each block ends with its checks passing and a pushed commit.
 
-1. **Temporal stability check (about 1.5 h).** **Started 2026-11-25:** the rendering audit now pans slowly through the misty sunset street with the lookups split and with every lookup taken (`WORLDFORGE_FULL_LOOKUPS=1`). The split adds 0.02 levels of frame-to-frame change (0.34 versus 0.32), which passes. Its captures are 100 ms apart, so TAA gathers several frames per camera step; still to add is a pan that moves every frame, as gameplay does, and the criteria below.
+1. **Temporal stability check (about 1.5 h).** **Done 2026-11-25:** the rendering audit pans through the misty sunset street with the lookups split and with every lookup taken (`WORLDFORGE_FULL_LOOKUPS=1`): once with 100 ms between steps, once moving the camera before every rendered frame. The split adds 0.02 and 0.01 levels of frame-to-frame change (0.34 versus 0.32; 0.14 versus 0.13), and no more pixels change by over 24 levels. Rendering 52/52. The criteria below were the plan; the audit uses the split-versus-full comparison instead, which separates flicker from motion.
    - Add a rendering-audit case that captures 16 consecutive frames of a still view with shadowed height fog and local mist, and one of a slow pan.
    - Measure the per-pixel standard deviation over the frames, in display levels.
    - Accept when the still view's mean deviation is under 1 level and the pan shows no pixel band brighter than 4 levels between frames. If it fails, lower the split (for example, keep two fog lookups per frame) and remeasure.

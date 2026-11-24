@@ -80,7 +80,7 @@ Settings flow through these files:
 
 **Checks:** realism is 95.0 (FLIP 0.0498), rendering 50/50, the full audit 1375 PASS, and `--street-profile` breaks the street's GPU time down by feature.
 
-**Still to check:** how the split lookups look in motion. This is playbook 10.0.1, item 1.
+**Flicker:** the rendering audit compares pans with the split lookups and with every lookup taken (`WORLDFORGE_FULL_LOOKUPS=1`). The split adds at most 0.02 levels of change between frames.
 
 ## Status (2026-11-22)
 **Realism** is 94.9 over 4 views (mean FLIP 0.0508). The Cycles comparison runs with fog disabled.
@@ -115,7 +115,7 @@ The GTX 1650 passed the GPU probe test and all 45 rendering checks. Editor and P
 **Atmosphere before R4:** The physical sky uses a more precise lookup for grazing sunlight. The visible sun disc matches the angular size used by the shadow filter. Height fog and local mist now receive the same physical sunlight and skylight, and fog shadow samples vary across pixels and frames to reduce visible bands.
 
 ## Next, in order
-The detailed, step-by-step version of this list, with files, methods, tests and acceptance criteria, is section 10 of the [development playbook](WorldForge-Development-Playbook.md#10-the-plan-what-to-do-next). Start with its next 8-hour plan (10.0.1): a temporal stability check for the split lookups, then a half-resolution volumetric pass. The paragraphs below are history.
+The detailed, step-by-step version of this list, with files, methods, tests and acceptance criteria, is section 10 of the [development playbook](WorldForge-Development-Playbook.md#10-the-plan-what-to-do-next). Continue its next 8-hour plan (10.0.1); the temporal stability check is done, so the next item is the half-resolution volumetric pass. The paragraphs below are history.
 
 The district profiling audit will reuse the same exported starter and camera route for the original settings and five single-feature variations. The Player's timestamps will give street and rooftop scene-pass times for each. Each run must complete on Vulkan. Compare the variations in the same session before changing the scene shaders. The street-level target is 16.7 ms p95.
 
