@@ -402,6 +402,10 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
     vec3 lamplight = vec3(0.0);
     float radialOffset = max(0.0,dot(origin,origin)-b*b)/(radius*radius);
     float densityStep = lighting.settings.x*stepSize;
+    // With TAA each segment takes its lookups on alternate frames at twice the weight, the same segments across the
+    // screen so neighboring pixels branch alike; the resolve averages them. Without TAA every segment takes them.
+    bool alternate = lighting.probeSettings.z > 0.5;
+    int parity = int(lighting.settings.z) & 1;
     for (int i = 0; i < segments; ++i) {
         float start = nearHit+float(i)*stepSize;
         float fraction = physical ? 0.25 : 0.5;
@@ -415,7 +419,8 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
         }
         float after = transmission*exp(-densityStep*density);
         float weight = transmission-after;
-        if ((shadowed || lamps) && weight > 0.00001) {
+        if ((shadowed || lamps) && weight > 0.00001 && (!alternate || ((i+parity) & 1) == 0)) {
+            float share = alternate ? 2.0*weight : weight;
             float sampleAt = 0.5;
             if (physical) {
                 // Pick the subsegment by its extinction weight, including attenuation by the first half.
@@ -427,9 +432,9 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
             float distance = start+sampleAt*stepSize;
             vec3 point = eye+direction*distance;
             if (shadowed)
-                blocked += weight*(1.0-sunVisibility(point,vec3(0.0),false));
+                blocked += share*(1.0-sunVisibility(point,vec3(0.0),false));
             if (lamps)
-                lamplight += weight*lampMistLight(point,direction,distance*dot(direction,lighting.clusterForward.xyz));
+                lamplight += share*lampMistLight(point,direction,distance*dot(direction,lighting.clusterForward.xyz));
         }
         transmission = after;
         if (physical)
