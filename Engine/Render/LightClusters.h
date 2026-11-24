@@ -15,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -136,7 +137,8 @@ inline std::array<std::array<float,16>,6> cubeFaces(const std::array<float,3> &p
 // viewProjection maps world space to the camera's clip space (column-major, Vulkan: y down, depth 0 to 1, no TAA
 // jitter); eye and forward give depth along the view.
 inline Clusters build(std::span<const Light> input,const std::array<float,16> &viewProjection,
-                      const std::array<float,3> &eye,const std::array<float,3> &forward)
+                      const std::array<float,3> &eye,const std::array<float,3> &forward,
+                      std::span<const std::array<float,4>> previousShadows = {})
 {
     Clusters result;
     // Directional lights first, then point lights.
@@ -176,6 +178,8 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
         ndcY = cy/w;
         return true;
     };
+    constexpr float screenMargin = 0.01f; // covers the scene shaders' subpixel jitter
+    constexpr float infinity = std::numeric_limits<float>::infinity();
     for (std::size_t i = directional; i < ordered.size(); ++i) {
         const auto &light = *ordered[i];
         const float r = result.lights[i*4][3];
@@ -183,7 +187,7 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
         const float depth = (c[0]-eye[0])*forward[0]+(c[1]-eye[1])*forward[1]+(c[2]-eye[2])*forward[2];
         if (depth+r < 0)
             continue; // entirely behind the camera
-        float minX = 1, minY = 1, maxX = -1, maxY = -1;
+        float minX = infinity, minY = infinity, maxX = -infinity, maxY = -infinity;
         bool whole = depth-r <= nearDepth;
         for (int corner = 0; corner < 8 && !whole; ++corner) {
             float x = 0, y = 0;
@@ -200,7 +204,7 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
             minX = minY = -1;
             maxX = maxY = 1;
         }
-        if (maxX < -1 || minX > 1 || maxY < -1 || minY > 1)
+        if (maxX < -1-screenMargin || minX > 1+screenMargin || maxY < -1-screenMargin || minY > 1+screenMargin)
             continue; // off screen
         const auto tile = [](float ndc,int count) {
             return std::clamp(int(std::floor((std::clamp(ndc,-1.0f,1.0f)*0.5f+0.5f)*float(count))),0,count-1);
@@ -220,8 +224,26 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
     std::ranges::stable_sort(candidates,[&](std::size_t a,std::size_t b) { return distance(a) < distance(b); });
     if (candidates.size() > std::size_t(shadowSlots))
         candidates.resize(std::size_t(shadowSlots));
-    for (std::size_t slot = 0; slot < candidates.size(); ++slot) {
-        const auto i = candidates[slot];
+    // Keep a cubemap in the same atlas slot while its lamp stays selected. Moving or newly selected lamps
+    // take remaining slots, so only those faces need a refresh when the camera crosses a lamp boundary.
+    std::ranges::sort(candidates);
+    const auto unassigned = ordered.size();
+    std::array<std::size_t,shadowSlots> assigned;
+    assigned.fill(unassigned);
+    auto occupied = std::span(assigned).first(candidates.size());
+    const auto old = previousShadows.first(std::min(previousShadows.size(),occupied.size()));
+    for (auto &index : candidates)
+        for (std::size_t slot = 0; slot < old.size(); ++slot)
+            if (occupied[slot] == unassigned && result.lights[index*4] == old[slot]) {
+                occupied[slot] = index;
+                index = unassigned;
+                break;
+            }
+    for (const auto index : candidates)
+        if (index != unassigned)
+            *std::ranges::find(occupied,unassigned) = index;
+    for (std::size_t slot = 0; slot < occupied.size(); ++slot) {
+        const auto i = occupied[slot];
         const auto &place = result.lights[i*4];
         const auto faces = cubeFaces(ordered[i]->vector,place[3]);
         std::copy(faces.begin(),faces.end(),result.shadowFaces.begin()+std::ptrdiff_t(slot*6));
@@ -230,16 +252,80 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
     }
     result.header[2] = uint32_t(candidates.size());
 
+    // A light's projected cube is only a first bound. Within a depth slice, its sphere fits a cylinder
+    // whose radius is the widest cross-section in that slice. Intersect the cylinder with the tile sides
+    // so rooftop pixels skip lamps that can reach the broad projected box only at another depth.
+    struct Plane { std::array<float,4> equation; float axial, radial; };
+    const auto side = [&](int axis,float cut,float sign) {
+        Plane plane{};
+        float normalSquared = 0;
+        for (int i = 0; i < 4; ++i) {
+            plane.equation[i] = sign*(viewProjection[i*4+axis]-cut*viewProjection[i*4+3]);
+            if (i < 3) {
+                plane.axial += plane.equation[i]*forward[i];
+                normalSquared += plane.equation[i]*plane.equation[i];
+            }
+        }
+        plane.radial = std::sqrt(std::max(0.0f,normalSquared-plane.axial*plane.axial));
+        return plane;
+    };
+    const auto sides = [&](auto &lower,auto &upper,int axis) {
+        for (std::size_t i = 0; i < lower.size(); ++i) {
+            // Leave room for the subpixel camera jitter used by the fragment shader.
+            lower[i] = side(axis,2*float(i)/float(lower.size())-1-screenMargin,1);
+            upper[i] = side(axis,2*float(i+1)/float(lower.size())-1+screenMargin,-1);
+        }
+    };
+    std::array<Plane,tilesX> left{}, right{};
+    std::array<Plane,tilesY> top{}, bottom{};
+    sides(left,right,0);
+    sides(top,bottom,1);
+    std::array<float,slices> starts{};
+    for (int z = 1; z < slices; ++z)
+        starts[z] = nearDepth*std::pow(farDepth/nearDepth,float(z)/slices);
+    struct TileBounds { int x0 = 1,x1 = 0,y0 = 1,y1 = 0; };
+    std::vector<std::array<TileBounds,slices>> footprints(ordered.size());
+    for (std::size_t i = directional; i < ordered.size(); ++i) {
+        const auto &box = boxes[i];
+        if (box.x0 > box.x1)
+            continue;
+        const auto &center = ordered[i]->vector;
+        const float radius = result.lights[4*i][3];
+        const float depth = (center[0]-eye[0])*forward[0]+(center[1]-eye[1])*forward[1]+(center[2]-eye[2])*forward[2];
+        for (int z = box.z0; z <= box.z1; ++z) {
+            const float low = z == 0 ? -radius : std::max(-radius,starts[z]-depth-0.001f);
+            const float high = z == slices-1 ? radius : std::min(radius,starts[z+1]-depth+0.001f);
+            if (high < low)
+                continue;
+            const float gap = std::clamp(0.0f,low,high);
+            const float cross = std::sqrt(std::max(0.0f,radius*radius-gap*gap));
+            const auto misses = [&](const Plane &plane) {
+                const auto &p = plane.equation;
+                const float base = p[0]*center[0]+p[1]*center[1]+p[2]*center[2]+p[3];
+                return base+std::max(plane.axial*low,plane.axial*high)+plane.radial*cross < -0.001f;
+            };
+            auto &tile = footprints[i][z];
+            tile = {std::max(0,box.x0-1),std::min(tilesX-1,box.x1+1),
+                    std::max(0,box.y0-1),std::min(tilesY-1,box.y1+1)};
+            while (tile.x0 <= tile.x1 && misses(left[tile.x0])) ++tile.x0;
+            while (tile.x0 <= tile.x1 && misses(right[tile.x1])) --tile.x1;
+            while (tile.y0 <= tile.y1 && misses(top[tile.y0])) ++tile.y0;
+            while (tile.y0 <= tile.y1 && misses(bottom[tile.y1])) --tile.y1;
+        }
+    }
+
     // Count, then lay out the lists, then fill them.
     std::vector<uint32_t> counts(std::size_t(clusterCount),0);
-    const auto visit = [&](const Box &box,auto &&action) {
-        for (int z = box.z0; z <= box.z1; ++z)
-            for (int y = box.y0; y <= box.y1; ++y)
-                for (int x = box.x0; x <= box.x1; ++x)
+    const auto visit = [&](std::size_t light,auto &&action) {
+        for (int z = boxes[light].z0; z <= boxes[light].z1; ++z) {
+            const auto &tile = footprints[light][z];
+            for (int y = tile.y0; y <= tile.y1; ++y)
+                for (int x = tile.x0; x <= tile.x1; ++x)
                     action(std::size_t((z*tilesY+y)*tilesX+x));
+        }
     };
     for (std::size_t i = directional; i < ordered.size(); ++i)
-        visit(boxes[i],[&](std::size_t cluster) { ++counts[cluster]; });
+        visit(i,[&](std::size_t cluster) { ++counts[cluster]; });
     result.ranges.assign(std::size_t(clusterCount),{0,0});
     uint32_t offset = 0;
     for (std::size_t cluster = 0; cluster < counts.size(); ++cluster) {
@@ -250,12 +336,21 @@ inline Clusters build(std::span<const Light> input,const std::array<float,16> &v
     }
     result.indices.assign(offset,0);
     for (std::size_t i = directional; i < ordered.size(); ++i)
-        visit(boxes[i],[&](std::size_t cluster) {
+        visit(i,[&](std::size_t cluster) {
             auto &entry = result.ranges[cluster];
             if (entry[1] < counts[cluster])
                 result.indices[entry[0]+entry[1]++] = uint32_t(i);
         });
     return result;
+}
+
+inline std::array<bool,shadowSlots> shadowUpdates(std::span<const std::array<float,4>> active,
+                                                  std::span<const std::array<float,4>> rendered,bool all)
+{
+    std::array<bool,shadowSlots> update{};
+    for (std::size_t slot = 0; slot < std::min(active.size(),update.size()); ++slot)
+        update[slot] = all || slot >= rendered.size() || active[slot] != rendered[slot];
+    return update;
 }
 
 } // namespace worldforge::lights

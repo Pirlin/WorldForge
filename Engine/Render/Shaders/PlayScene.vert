@@ -25,5 +25,5 @@ void main()
     currentClip = motion.previousViewProjection*vec4(p,1.0);
     albedo = srgbToLinear(color);
     surfaceNormal = normal;
-    surfaceUv = uv;
+    surfaceUv = vec2(uv.x,1.0-uv.y); // package UVs go up; image rows go down
 }

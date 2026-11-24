@@ -218,17 +218,66 @@ What the comparison shows next, in order:
 - **Import.** Bring these properties in through the glTF material extensions Blender exports.
 - **Streets.** Wet-surface and puddle layers, decals, and parallax occlusion.
 
+| R2 item | State |
+| --- | --- |
+| Clear coat | An independent GGX reflection layer over the base material, with Fresnel attenuation, roughness, weight, and its own normal maps. Playable format 21 introduces the factors. |
+| Sheen and thin glass | A Charlie sheen lobe with integrated base attenuation. Thin glass filters the scene by the pane's base color and the index of refraction controls Fresnel reflection. Transparent surfaces draw behind-to-front over the opaque geometry. Playable formats 22 and 23 introduce these factors. |
+| Subsurface and anisotropy | Local subsurface scattering uses thickness and scattering distance to shape backlighting. Anisotropic GGX controls brushed-metal reflections with a direction. Playable format 24 introduces these factors. |
+| glTF and texture maps | GLB interchange supports the Khronos clear coat, sheen, transmission, IOR, and anisotropy extensions and seven embedded layer maps. The Vulkan editor and Player sample the maps using mesh UVs. Playable format 25 introduces the maps and coat normal scale. |
+| Street materials | Wet surfaces and masked puddles use the reflective coating. Parallax occlusion marches through the packed height map. Alpha-masked mesh decals composite over the scene. Playable format 26 introduces these parameters. |
+
 ### R3: Global illumination on GPUs without ray tracing
 
 - **Probe GI.** Dynamic probe GI (DDGI-style) using compute-shader ray tracing against distance fields or a GPU BVH. This runs on the GTX 1650 at a reduced update rate.
 - **Fine detail.** Screen-space GI.
 - **Reflections.** Parallax-corrected reflection probes.
 
+#### R3 implementation checklist
+
+- [x] Build a world-space triangle BVH and verify Vulkan probe tracing on the GTX 1650.
+- [x] Integrate a bounded, visibility-weighted probe field in the editor and Player. Verify off-screen diffuse bounce and scene export.
+- [x] Add short-range screen-space GI and verify visible color transfer independently of ambient occlusion.
+- [x] Add parallax-corrected reflection probes and verify an off-screen reflection in both renderers.
+- [x] Run combined lighting, compatibility, rendering, and performance checks.
+
+The final rendering audit passed 45 checks. With all R3 lighting enabled, the GTX 1650 completed the Playable Street mission at 15.74 ms p95 and a peak working set of 201 MiB. The same benchmark measured 15.42 ms p95 with R3 off.
+
+### Realism pass before city scaling
+
+Use the Playable Street for fixed clear-day, low-sun, twilight, and lamp-lit night views. Use the same camera and exposure in the editor and Player. Judge the atmosphere across those views and while moving through the scene. Keep the existing Cycles comparisons for clear-air lighting and add reference checks for haze and fog as those features develop.
+
+- [x] Improve atmospheric transmittance near the horizon and antialias the physical sun disc at the angular size used for shadows. Check grazing light in the core tests and review a fixed low-sun view.
+- [x] Match height fog and local mist to the physical sky and sunlight. Verify shadowed fog, dusk brightness, and editor and Player parity.
+- [ ] Verify the sun crossing the horizon, twilight colors, and exposure during moving sunrise and sunset shots.
+- [ ] Refine evening and night lighting. Verify warm and cool lamps, shadow falloff, light in mist, and exposure transitions from the street into lit interiors.
+- [ ] Add distance-dependent aerial perspective for streets, rooftops, and the far skyline. Verify that clear air, haze, and dense fog retain depth as the camera moves.
+- [ ] Add cloud cover and weather transitions that change both the visible sky and the light reaching the scene. Check the transitions at street and rooftop height.
+- [ ] Profile and reduce the cost of local mist when the camera looks through the volume. Repeat the mission with both fog types enabled against the 16.7 ms p95 street budget.
+- [ ] Review stills and moving shots on the GTX 1650. Record scene settings, reference comparisons, editor and Player differences, frame-time percentiles, worst frames, and peak memory before starting city-scale rendering.
+
+The Vulkan rendering audit passed all 47 checks. In the fixed Playable Street sunset view, height fog and local mist changed the image by 32.49 display levels on average. The editor and Player differed by 0.25 levels. The dusk fixture confirmed that local mist dims with the physical sky, and the updated shadow sampling reduced visible bands in the sunset view.
+
+All four clear-air views passed the existing Cycles comparison thresholds at 256 samples. Mean LDR-FLIP was 0.0505 across the four views.
+
+On the GTX 1650, the 5.5-second street mission with R3 lighting and physical height fog measured 16.04 ms p95. With a 9 m local mist volume at density 0.035, two runs measured 19.50 and 20.54 ms p95, with worst frames of 51.63 and 32.13 ms. The gradient sky with that same volume measured 18.52 ms p95. The combined fog setup needs further profiling against the street budget.
+
 ### R4: Scale for a whole city
 
-- **GPU-driven drawing.** Culling and indirect draws on the GPU.
-- **Virtualized geometry.** Meshlet rendering through `VK_EXT_mesh_shader`, which this GPU supports, with cluster LOD.
-- **Streaming.** Texture streaming and virtual textures, impostors, and world-partition streaming.
+#### R4 implementation checklist
+
+- [x] Establish a repeatable district test scene and camera route. Record visible instances, draw count, CPU and GPU frame times, memory, and streaming stalls with the approved lighting settings.
+  - **Scene:** the City District starter (`State/CityDistrict.*`, deterministic from a seed) lays out blocks with sidewalks, buildings of varied height, roads and a lamp at every intersection.
+  - **Route:** the Player's `--verify-district` flies a ring-road lap at eye height, then a rooftop orbit.
+  - **Report:** frame, CPU and per-pass GPU times (Vulkan timestamps), draw calls, triangles and memory. The editor audit's `--district` mode runs it.
+  - **Baseline** (6 × 6 blocks, 2026-11-24, "Power saver"): 24.7 ms average, 43.6 ms p95, with the scene pass at 12.4 ms (street) and 32.5 ms (rooftops) of GPU time. It is per-pixel shading cost; geometry is only 4,500 triangles.
+  - **Not yet measured:** streaming stalls, which wait for streaming to exist.
+  - **Next step:** see the [development playbook](WorldForge-Development-Playbook.md#101-immediately).
+- [ ] Move instance frustum culling and indirect drawing to Vulkan. Compare visible geometry and shadows with the current draw path in the editor and Player.
+- [ ] Add occlusion culling and test it during camera turns, fast movement, and across district boundaries.
+- [ ] Add meshlets and cluster LOD. Enable the mesh shader path on supported devices and verify the indexed draw path on devices that lack it.
+- [ ] Stream texture mip levels and evaluate virtual textures against the district's residency and upload budgets. Verify quality when textures enter view.
+- [ ] Add distant impostors and stream world partitions in the editor and Player. Test transitions, long traversals, and repeated boundary crossings for visual pops and memory growth.
+- [ ] Run combined district rendering, lighting, streaming, and performance checks on the GTX 1650. Record sustained frame times and memory alongside the Playable Street regression results.
 
 The Living City can't be built without this stage.
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Engine/Render/MaterialLayers.h"
+
 #include <QImage>
 #include <QSharedPointer>
 #include <QWidget>
@@ -9,6 +11,7 @@
 namespace worldforge { struct Mesh; }
 class ProjectStore;
 class LiveViewport;
+class MaterialLayerControls;
 class TextureUvView;
 class QComboBox;
 class QDoubleSpinBox;
@@ -49,7 +52,8 @@ private:
     QComboBox *object_, *slot_, *uvSet_;
     QLabel *message_, *imageInfo_, *sharedInfo_;
     QLineEdit *name_;
-    QDoubleSpinBox *metallic_, *roughness_, *emission_;
+    QDoubleSpinBox *metallic_, *roughness_, *emission_, *clearCoat_, *coatRoughness_;
+    MaterialLayerControls *layers_;
     QPushButton *color_, *import_, *remove_, *apply_, *link_, *unlink_, *assign_, *exportUvs_;
     QPushButton *inspectUvs_, *exportMap_;
     QCheckBox *showUvs_;
@@ -59,8 +63,8 @@ private:
     QSpinBox *brushSize_ = nullptr, *brushOpacity_ = nullptr;
     QTimer *paintPreviewTimer_ = nullptr;
     QSplitter *split_;
-    std::array<QToolButton *,5> channels_{};
-    std::array<QImage,5> images_;
+    std::array<QToolButton *,worldforge::materialTextureCount> channels_{};
+    std::array<QImage,worldforge::materialTextureCount> images_;
     int channel_ = 0;
     QColor tint_;
     QColor paintColor_{"#a56bff"};

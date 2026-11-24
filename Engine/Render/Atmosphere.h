@@ -14,6 +14,7 @@
 // brightness follows from the same light above the atmosphere.
 
 #include "Engine/Render/ColorPipeline.h"
+#include "Engine/Render/ShadowCascades.h"
 
 #include <algorithm>
 #include <array>
@@ -66,15 +67,20 @@ inline Medium medium(float height)
 // it misses. nearest picks the first hit (for the ground), otherwise the far one (for the top of the atmosphere).
 inline float sphereDistance(float r,float mu,float radius,bool nearest)
 {
-    const float discriminant = r*r*(mu*mu-1)+radius*radius;
+    const float along = -r*mu;
+    const float radialDifference = (r-radius)*(r+radius);
+    const float discriminant = along*along-radialDifference;
     if (discriminant < 0)
         return -1;
     const float root = std::sqrt(discriminant);
-    const float near = -r*mu-root, far = -r*mu+root;
-    if (nearest)
-        return near >= 0 ? near : -1;
-    return far;
+    const float far = along+root;
+    if (!nearest)
+        return along < 0 ? -radialDifference/(root-along) : far;
+    // Use the product of the roots to retain precision for rays starting just above the ground.
+    return along > 0 ? radialDifference/far : -1;
 }
+
+inline float horizonDistance(float r) { return std::sqrt(std::max(0.0f,(r-bottomRadius)*(r+bottomRadius))); }
 
 inline float rayleighPhase(float cosine) { return 3/(16*pi)*(1+cosine*cosine); }
 
@@ -87,7 +93,7 @@ inline float miePhase(float cosine)
 
 } // namespace detail
 
-// The tables for one sun direction, and what the sky and the sun look like with them.
+// The sky for one sun direction. The tables span all sun angles and are shared across instances.
 class Sky {
 public:
     static constexpr int transmittanceHeights = 32, transmittanceAngles = 128;
@@ -99,20 +105,47 @@ public:
         const float length = std::sqrt(towardSun[0]*towardSun[0]+towardSun[1]*towardSun[1]+towardSun[2]*towardSun[2]);
         sun_ = length > 1e-6f ? std::array<float,3>{towardSun[0]/length,towardSun[1]/length,towardSun[2]/length}
                               : std::array<float,3>{0,0,1};
-        buildTransmittance();
-        sunTransmittance_ = transmittance(bottomRadius+viewerHeight,sun_[2]);
+        const float elevation = std::asin(std::clamp(sun_[2],-1.0f,1.0f));
+        constexpr float radius = shadow::sunAngularDiameter*0.5f;
+        const float edge = std::clamp((elevation-std::asin(horizonCosine()))/radius,-1.0f,1.0f);
+        const float chord = std::sqrt(std::max(0.0f,1-edge*edge));
+        const float visible = (std::acos(-edge)+edge*chord)/detail::pi;
+        // Use the mean elevation of the visible part of the disc for its atmospheric extinction.
+        const float meanOffset = visible > 1e-6f ? radius*(2.0f/3.0f)*chord*chord*chord/(detail::pi*visible) : 0;
+        sunTransmittance_ = visible > 1e-6f ? transmittance(bottomRadius+viewerHeight,std::sin(elevation+meanOffset)) : color::Rgb{};
         // Sunlight above the atmosphere (irradiance), chosen so an overhead sun gives the authored intensity.
         const float overhead = std::max(detail::luminance(transmittance(bottomRadius+viewerHeight,1)),1e-4f);
         const float irradiance = detail::pi*std::max(sunIntensity,0.0f)/overhead;
         solar_ = {irradiance,irradiance,irradiance};
-        sunLight_ = {sunTransmittance_[0]*irradiance/detail::pi,sunTransmittance_[1]*irradiance/detail::pi,
-                     sunTransmittance_[2]*irradiance/detail::pi};
-        buildMultipleScattering();
+        const color::Rgb disc{sunTransmittance_[0]*irradiance/detail::pi,sunTransmittance_[1]*irradiance/detail::pi,
+                              sunTransmittance_[2]*irradiance/detail::pi};
+        sunDiscStrength_ = detail::luminance(disc);
+        sunLight_ = {disc[0]*visible,disc[1]*visible,disc[2]*visible};
+
+        // A distant ground ray reflects the upper sky even before the sun is visible. Sample
+        // that hemisphere with cosine weighting once for this sun position.
+        using namespace detail;
+        constexpr int bands = 12, azimuths = 16;
+        for (int band = 0; band < bands; ++band) {
+            const float z = std::sqrt((float(band)+0.5f)/bands);
+            const float radiusInPlane = std::sqrt(1-z*z);
+            for (int azimuth = 0; azimuth < azimuths; ++azimuth) {
+                const float phi = 2*pi*(float(azimuth)+0.5f*float(band%2))/azimuths;
+                const float direction[]{radiusInPlane*std::cos(phi),radiusInPlane*std::sin(phi),z};
+                groundSky_ = groundSky_+radiance(direction)*(groundAlbedo/(bands*azimuths));
+            }
+        }
     }
 
     const std::array<float,3> &towardSun() const { return sun_; }
     // Sunlight at the ground in scene units per channel: what a white surface facing the sun reflects.
     color::Rgb sunLight() const { return sunLight_; }
+    float sunDiscStrength() const { return sunDiscStrength_; }
+    static float horizonCosine()
+    {
+        const float r = bottomRadius+viewerHeight;
+        return -detail::horizonDistance(r)/r;
+    }
     // How much sunlight reaches the ground, per channel (0 to 1).
     color::Rgb sunTransmittance() const { return sunTransmittance_; }
 
@@ -145,7 +178,7 @@ public:
             const float pr = std::sqrt(px*px+py*py+pz*pz);
             const float sunMu = (px*sun_[0]+py*sun_[1]+pz*sun_[2])/pr;
             const auto m = medium(pr-bottomRadius);
-            const auto toSun = transmittance(pr,sunMu);
+            const auto toSun = solarTransmission(pr,sunMu);
             const auto scattered = (m.rayleigh*rayleigh+color::Rgb{m.mie*mie,m.mie*mie,m.mie*mie})*toSun
                 +m.scattering*multipleScattering(pr,sunMu);
             // Integrate the scattering over this step analytically (Hillaire, eq. 6).
@@ -156,27 +189,54 @@ public:
             }
             through = through*stepThrough;
         }
+        light = light*solar_;
         if (ground) {
-            // The ground: lit by the sun through the air and by the sky (approximated by the multiple scattering
-            // table's isotropic light), reflecting groundAlbedo.
+            // The virtual ground reflects direct light at the hit and the diffuse upper sky.
             const float px = direction[0]*distance, py = direction[1]*distance, pz = r+direction[2]*distance;
             const float pr = std::sqrt(px*px+py*py+pz*pz);
             const float sunMu = (px*sun_[0]+py*sun_[1]+pz*sun_[2])/pr;
             const auto onGround = transmittance(pr,sunMu)*std::max(sunMu,0.0f)*(1/pi);
-            light = light+through*onGround*groundAlbedo;
+            light = light+through*(groundSky_+onGround*solar_*groundAlbedo);
         }
-        return light*solar_;
+        return light;
     }
 
     // The fraction of light that passes from radius r along cosine mu to space (0 where the Earth blocks it).
-    color::Rgb transmittance(float r,float mu) const
+    static color::Rgb transmittance(float r,float mu)
     {
-        const float h = std::clamp((r-bottomRadius)/(topRadius-bottomRadius),0.0f,1.0f);
-        const float a = std::clamp(mu*0.5f+0.5f,0.0f,1.0f);
-        return lookup(transmittance_,transmittanceAngles,transmittanceHeights,a,std::sqrt(h));
+        using namespace detail;
+        r = std::clamp(r,bottomRadius,topRadius);
+        mu = std::clamp(mu,-1.0f,1.0f);
+        const float rho = horizonDistance(r), horizon = horizonDistance(topRadius);
+        if (mu < 0 && -r*mu >= rho)
+            return {};
+        const float minimum = topRadius-r, maximum = rho+horizon;
+        const float distance = sphereDistance(r,mu,topRadius,false);
+        const float u = std::clamp((distance-minimum)/(maximum-minimum),0.0f,1.0f);
+        static const auto table = buildTransmittance();
+        return lookup(table,transmittanceAngles,transmittanceHeights,u,rho/horizon);
     }
 
 private:
+    static color::Rgb solarTransmission(float radius,float cosine)
+    {
+        using namespace detail;
+        constexpr float discRadius = shadow::sunAngularDiameter*0.5f;
+        const float horizon = -horizonDistance(radius)/radius;
+        // In the narrow band around the terminator, integrate the visible part of the finite solar disc.
+        if (cosine >= horizon+discRadius)
+            return transmittance(radius,cosine);
+        if (cosine <= horizon-discRadius)
+            return {};
+        const float edge = std::clamp((std::asin(std::clamp(cosine,-1.0f,1.0f))-std::asin(horizon))/discRadius,-1.0f,1.0f);
+        const float chord = std::sqrt(std::max(0.0f,1-edge*edge));
+        const float visible = (std::acos(-edge)+edge*chord)/pi;
+        if (visible <= 1e-6f)
+            return {};
+        const float offset = discRadius*(2.0f/3.0f)*chord*chord*chord/(pi*visible);
+        return transmittance(radius,std::sin(std::asin(std::clamp(cosine,-1.0f,1.0f))+offset))*visible;
+    }
+
     static color::Rgb lookup(const std::vector<color::Rgb> &table,int columns,int rows,float x,float y)
     {
         const float fx = x*float(columns-1), fy = y*float(rows-1);
@@ -187,46 +247,52 @@ private:
         return (at(x0,y0)*(1-sx)+at(x0+1,y0)*sx)*(1-sy)+(at(x0,y0+1)*(1-sx)+at(x0+1,y0+1)*sx)*sy;
     }
 
-    color::Rgb multipleScattering(float r,float mu) const
+    static color::Rgb multipleScattering(float r,float mu)
     {
         const float h = std::clamp((r-bottomRadius)/(topRadius-bottomRadius),0.0f,1.0f);
-        return lookup(multiple_,multipleAngles,multipleHeights,std::clamp(mu*0.5f+0.5f,0.0f,1.0f),std::sqrt(h));
+        static const auto table = buildMultipleScattering();
+        return lookup(table,multipleAngles,multipleHeights,std::clamp(mu*0.5f+0.5f,0.0f,1.0f),std::sqrt(h));
     }
 
-    // Transmittance to the top of the atmosphere, by height (square-root spaced) and the cosine to the vertical.
-    void buildTransmittance()
+    // Map altitude by distance to the ground horizon and angle by distance to the top of the atmosphere.
+    // This spends the table on paths that reach space and resolves long grazing paths near sunset.
+    static std::vector<color::Rgb> buildTransmittance()
     {
         using namespace detail;
-        transmittance_.assign(std::size_t(transmittanceHeights*transmittanceAngles),{});
+        std::vector<Rgb> table(std::size_t(transmittanceHeights*transmittanceAngles));
+        const float horizon = horizonDistance(topRadius);
         for (int row = 0; row < transmittanceHeights; ++row) {
-            const float h = std::pow(float(row)/float(transmittanceHeights-1),2.0f)*(topRadius-bottomRadius);
-            const float r = bottomRadius+h;
+            const float rho = horizon*float(row)/float(transmittanceHeights-1);
+            const float r = std::sqrt(bottomRadius*bottomRadius+rho*rho);
+            const float minimum = topRadius-r, maximum = rho+horizon;
             for (int column = 0; column < transmittanceAngles; ++column) {
-                const float mu = float(column)/float(transmittanceAngles-1)*2-1;
-                auto &result = transmittance_[std::size_t(row*transmittanceAngles+column)];
-                if (sphereDistance(r,mu,bottomRadius,true) > 0) {
-                    result = {0,0,0};
-                    continue;
-                }
-                const float distance = sphereDistance(r,mu,topRadius,false);
+                const float distance = std::lerp(minimum,maximum,float(column)/float(transmittanceAngles-1));
+                auto &result = table[std::size_t(row*transmittanceAngles+column)];
+                const float radiusDifference = (topRadius-r)*(topRadius+r);
+                const float radial = distance > 0 ? (radiusDifference-distance*distance)/(2*distance) : r;
                 constexpr int steps = 40;
                 Rgb depth{};
+                float start = 0;
                 for (int i = 0; i < steps; ++i) {
-                    const float t = (float(i)+0.5f)/steps*distance;
-                    const float pr = std::sqrt(r*r+2*r*mu*t+t*t);
-                    depth = depth+medium(pr-bottomRadius).extinction*(distance/steps);
+                    const float fraction = float(i+1)/steps;
+                    const float end = distance*fraction*fraction;
+                    const float t = (start+end)*0.5f;
+                    const float pr = std::sqrt(r*r+2*radial*t+t*t);
+                    depth = depth+medium(pr-bottomRadius).extinction*(end-start);
+                    start = end;
                 }
                 result = exp(depth*-1.0f);
             }
         }
+        return table;
     }
 
     // Hillaire's multiple scattering table: for each height and sun cosine, the light scattered isotropically after
     // two or more bounces (psi_ms = L2 / (1 - f_ms)), per unit of sunlight.
-    void buildMultipleScattering()
+    static std::vector<color::Rgb> buildMultipleScattering()
     {
         using namespace detail;
-        multiple_.assign(std::size_t(multipleHeights*multipleAngles),{});
+        std::vector<Rgb> table(std::size_t(multipleHeights*multipleAngles));
         constexpr int directions = 8, steps = 20;
         const float isotropic = 1/(4*pi);
         for (int row = 0; row < multipleHeights; ++row) {
@@ -274,16 +340,17 @@ private:
                         second = second+light*weight;
                         transfer = transfer+scattered*(weight*isotropic*4*pi);
                     }
-                auto &result = multiple_[std::size_t(row*multipleAngles+column)];
+                auto &result = table[std::size_t(row*multipleAngles+column)];
                 for (int c = 0; c < 3; ++c)
                     result[std::size_t(c)] = second[std::size_t(c)]/std::max(1-transfer[std::size_t(c)],1e-3f);
             }
         }
+        return table;
     }
 
     std::array<float,3> sun_{};
-    color::Rgb sunTransmittance_{1,1,1}, solar_{}, sunLight_{};
-    std::vector<color::Rgb> transmittance_, multiple_;
+    color::Rgb sunTransmittance_{1,1,1}, solar_{}, sunLight_{}, groundSky_{};
+    float sunDiscStrength_ = 0;
 };
 
 } // namespace worldforge::atmosphere

@@ -27,6 +27,7 @@ public:
     void setAssetPreview(QSharedPointer<const worldforge::Mesh> mesh,bool frame = true);
     void setPlacementPreview(const SceneObject &placement,QSharedPointer<const worldforge::Mesh> mesh);
     void setCameraPreview(QVector3D eye,QVector3D target);
+    void setDrawCullingEnabled(bool enabled);
     void setBaseColorPreview(int slot,QImage image);
     void setObjectPreview(bool enabled,const SceneObject *object = nullptr);
     void setModelOrthographic(bool enabled);
@@ -44,6 +45,7 @@ public:
     std::optional<QVector3D> conformToReference(const QVector3D &position);
     bool hasRenderedFrame() const;
     QImage captureFrame();
+    std::optional<float> captureMeteredLuminance();
     bool start(RunMode mode);
     void stop();
     void pause(bool paused);

@@ -13,12 +13,13 @@
 namespace worldforge::vk {
 
 #define WF_VK_GLOBAL_FUNCTIONS(X) \
-    X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties) X(vkEnumerateInstanceLayerProperties)
+    X(vkCreateInstance) X(vkEnumerateInstanceVersion) X(vkEnumerateInstanceExtensionProperties) X(vkEnumerateInstanceLayerProperties)
 
 #define WF_VK_INSTANCE_FUNCTIONS(X) \
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceMemoryProperties) \
-    X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) \
+    X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceFeatures2) \
+    X(vkGetPhysicalDeviceProperties2) X(vkCreateDevice) \
     X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties) X(vkDestroySurfaceKHR) \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)
@@ -35,12 +36,15 @@ namespace worldforge::vk {
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCreateRenderPass) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
-    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateDescriptorSetLayout) \
+    X(vkCreateGraphicsPipelines) X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCreateDescriptorSetLayout) \
     X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) \
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) \
-    X(vkCmdNextSubpass) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) \
-    X(vkCmdPushConstants) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdPipelineBarrier) \
-    X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage)
+    X(vkCmdNextSubpass) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) \
+    X(vkCmdClearAttachments) \
+    X(vkCmdPushConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawIndirect) X(vkCmdDrawIndirectCountKHR) X(vkCmdDispatch) \
+    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdPipelineBarrier) \
+    X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 struct Api {
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
@@ -72,6 +76,7 @@ struct Device {
     // Returns memoryTypeCount when no type fits.
     uint32_t memoryType(uint32_t allowed,VkMemoryPropertyFlags flags) const;
     bool supports(VkFormat format,VkFormatFeatureFlags features) const;
+    bool supportsCompute(uint32_t family) const;
     VkShaderModule shader(std::span<const uint32_t> spirv) const;
 };
 

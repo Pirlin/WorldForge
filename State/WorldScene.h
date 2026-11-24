@@ -2,6 +2,7 @@
 
 #include "Engine/World/WorldSimulation.h"
 #include "Engine/Render/ColorPipeline.h"
+#include "Engine/Render/Weather.h"
 #include <QColor>
 #include <QJsonObject>
 #include <QVector3D>
@@ -31,9 +32,11 @@ struct WorldAtmosphere {
     bool temporalAntiAliasing = true;
     // Ground-truth ambient occlusion darkens sky light in creases, corners and openings.
     bool ambientOcclusion = true;
+    bool probeGi = false, screenSpaceGi = false, reflectionProbes = false;
     // The physically based atmosphere (Engine/Render/Atmosphere.h) sets the sky and the sunlight's color from the
     // sun's position, instead of the horizon and zenith colors.
     bool physicalSky = false;
+    worldforge::Weather weather;
     // Bloom: light scattered around bright areas, as a camera lens does.
     bool bloom = true;
     // Screen-space reflections: glossy surfaces reflect what the previous frame shows, where it shows it.
@@ -62,6 +65,8 @@ float lightUnits(const SceneObject &object);
 double lightPhotometric(const SceneObject &object);
 // Stores an authored lux or candela value in details for a light of the given type.
 void setLightPhotometric(QJsonObject &details,const QString &type,double value);
+QColor lampColor(const SceneObject &object);
+worldforge::color::Rgb linearLampColor(const SceneObject &object);
 // A spot light's cone: the full angle in degrees ("coneAngle", default 45, as Blender's Spot Size), how much of its edge
 // fades out ("coneBlend", 0 to 1, default 0.15), and the direction it points (its rotation applied to straight down).
 constexpr double defaultConeAngle = 45, defaultConeBlend = 0.15;

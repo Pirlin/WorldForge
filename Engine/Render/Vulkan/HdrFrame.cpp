@@ -656,15 +656,21 @@ void HdrFrame::display(VkCommandBuffer command,float exposureStops,color::ViewTr
     const VkRect2D area{{0,0},extent_};
     const VkViewport viewport{0,0,float(extent_.width),float(extent_.height),0,1};
 
-    // Ambient occlusion. Its noise follows the TAA sample so a still view averages 16 patterns.
+    // Trace the more expensive screen-space GI at half resolution. Temporal.frag reconstructs it
+    // with depth rejection. Ambient occlusion alone retains its full-resolution path.
     {
+        const VkExtent2D ambientSize = occlusion.screenSpaceGi
+            ? VkExtent2D{(extent_.width+1)/2,(extent_.height+1)/2} : extent_;
+        const VkRect2D ambientArea{{0,0},ambientSize};
+        const VkViewport ambientViewport{0,0,float(ambientSize.width),float(ambientSize.height),0,1};
         const VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,occlusionPass_,occlusionFramebuffer_,
-            area,0,nullptr};
+            ambientArea,0,nullptr};
         vk.vkCmdBeginRenderPass(command,&info,VK_SUBPASS_CONTENTS_INLINE);
-        vk.vkCmdSetViewport(command,0,1,&viewport);
-        vk.vkCmdSetScissor(command,0,1,&area);
+        vk.vkCmdSetViewport(command,0,1,&ambientViewport);
+        vk.vkCmdSetScissor(command,0,1,&ambientArea);
         struct { std::array<float,16> inverseViewProjection; float settings[4]; } constants{occlusion.inverseViewProjection,
-            {occlusion.radius,occlusion.enabled ? 1.0f : 0.0f,float(sample_%temporalSamples),0}};
+            {occlusion.radius,(occlusion.enabled ? 1.0f : 0.0f)+(occlusion.screenSpaceGi ? 2.0f : 0.0f),
+             float(sample_%temporalSamples),occlusion.probeGi ? 1.0f : 0.0f}};
         vk.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,ambient_);
         vk.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,occlusionLayout_,0,1,&occlusionSet_,0,nullptr);
         vk.vkCmdPushConstants(command,occlusionLayout_,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(constants),&constants);
@@ -688,7 +694,8 @@ void HdrFrame::display(VkCommandBuffer command,float exposureStops,color::ViewTr
         if (blend)
             weight = accumulated_ < temporalSamples ? 1.0f/float(accumulated_+1) : temporal.still ? 0.0f : 1.0f/temporalSamples;
         struct { std::array<float,16> reprojection; float settings[4]; } constants{temporal.reprojection,
-            {weight,blend ? 1.0f : 0.0f,temporal.still ? 0.0f : 1.0f,occlusion.enabled ? 1.0f : 0.0f}};
+            {weight,blend ? 1.0f : 0.0f,temporal.still ? 0.0f : 1.0f,
+             occlusion.screenSpaceGi ? 2.0f : occlusion.enabled ? 1.0f : 0.0f}};
         vk.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,temporal_);
         vk.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,temporalLayout_,0,1,&temporalSets_[parity_],0,nullptr);
         vk.vkCmdPushConstants(command,temporalLayout_,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof(constants),&constants);
@@ -737,7 +744,8 @@ void HdrFrame::display(VkCommandBuffer command,float exposureStops,color::ViewTr
     vk.vkCmdSetScissor(command,0,1,&area);
     const bool metering = meterSlot >= 0 && uint32_t(meterSlot) < meterSlots_;
     const float settings[8]{color::exposureScale(exposureStops),transform == color::ViewTransform::AgX ? 1.0f : 0.0f,
-        srgbOutput_ ? 1.0f : 0.0f,metering ? 1.0f : 0.0f,bloomShown ? bloom : 0.0f,float(bloomLevels),0,0};
+        srgbOutput_ ? 1.0f : 0.0f,metering ? 1.0f : 0.0f,bloomShown ? bloom : 0.0f,float(bloomLevels),
+        color::meterLowStops,color::meterHighStops};
     const uint32_t offset = metering ? uint32_t(meterSlot)*meterBytes : 0;
     vk.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,display_);
     vk.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,displayLayout_,0,1,&displaySets_[source],1,&offset);

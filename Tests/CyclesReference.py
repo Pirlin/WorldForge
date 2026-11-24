@@ -98,6 +98,16 @@ def make_material(name, range_):
     metallic, roughness = range_["metallic"], max(0.045, range_["roughness"])
     shader.inputs["Metallic"].default_value = metallic
     shader.inputs["Roughness"].default_value = roughness
+    shader.inputs["Coat Weight"].default_value = range_.get("clearCoat", 0)
+    shader.inputs["Coat Roughness"].default_value = range_.get("clearCoatRoughness", 0)
+    sheen = range_.get("sheenColor", (0, 0, 0))
+    sheen_weight = max(sheen)
+    shader.inputs["Sheen Weight"].default_value = sheen_weight
+    shader.inputs["Sheen Roughness"].default_value = range_.get("sheenRoughness", 0)
+    shader.inputs["Transmission Weight"].default_value = range_.get("transmission", 0)
+    shader.inputs["IOR"].default_value = range_.get("ior", 1.5)
+    if sheen_weight > 0:
+        shader.inputs["Sheen Tint"].default_value = (*[channel / sheen_weight for channel in sheen], 1)
     if textures[2] >= 0:
         packed = nodes.new("ShaderNodeTexImage")
         packed.image = texture(textures[2], "Non-Color")
@@ -254,6 +264,7 @@ for number, light in enumerate(description["lights"]):
     spot = light.get("spot")
     kind = "SUN" if light["directional"] else "SPOT" if spot else "POINT"
     item = add_light("Light %d" % number, kind, light["intensity"], light["vector"])
+    item.data.color = light.get("color", (1, 1, 1))
     if spot:
         # Blender's spot light has the point light's intensity on its axis, inside a cone along its -Z axis.
         item.data.spot_size = spot["angle"]

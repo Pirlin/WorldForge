@@ -54,7 +54,7 @@ bool Api::loadDevice(VkDevice device)
         return false;
     bool complete = true;
 #define WF_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device,#name)); \
-    complete &= name != nullptr || std::string_view(#name).ends_with("KHR");
+    complete &= name != nullptr || std::string_view(#name).ends_with("KHR") || std::string_view(#name).ends_with("EXT");
     WF_VK_DEVICE_FUNCTIONS(WF_VK_LOAD)
 #undef WF_VK_LOAD
     return complete;
@@ -81,6 +81,15 @@ bool Device::supports(VkFormat format,VkFormatFeatureFlags features) const
     VkFormatProperties properties{};
     api->vkGetPhysicalDeviceFormatProperties(physical,format,&properties);
     return (properties.optimalTilingFeatures & features) == features;
+}
+
+bool Device::supportsCompute(uint32_t family) const
+{
+    uint32_t count = 0;
+    api->vkGetPhysicalDeviceQueueFamilyProperties(physical,&count,nullptr);
+    std::vector<VkQueueFamilyProperties> queues(count);
+    api->vkGetPhysicalDeviceQueueFamilyProperties(physical,&count,queues.data());
+    return family < count && (queues[family].queueFlags & VK_QUEUE_COMPUTE_BIT);
 }
 
 VkShaderModule Device::shader(std::span<const uint32_t> spirv) const

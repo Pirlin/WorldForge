@@ -3,6 +3,7 @@
 #include "State/NativeComponents.h"
 #include "State/StudioClip.h"
 #include "State/WorldScene.h"
+#include "State/CityDistrict.h"
 #include "State/PlayableStreet.h"
 #include "Engine/Geometry/MeshTopology.h"
 
@@ -22,6 +23,7 @@
 #include <QSaveFile>
 #include <QScopeGuard>
 #include <QSet>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QUuid>
 
@@ -561,6 +563,62 @@ QJsonArray meshVector(const std::array<float, N> &field)
     return array;
 }
 
+wf::MaterialLayers readMaterialLayers(const QJsonObject &row)
+{
+    wf::MaterialLayers layers;
+    if (row.contains("sheenColor"))
+        layers.sheenColor = meshVector<3>(row.value("sheenColor"));
+    layers.sheenRoughness = float(row.value("sheenRoughness").toDouble());
+    layers.transmission = float(row.value("transmission").toDouble());
+    layers.ior = float(row.value("ior").toDouble(1.5));
+    layers.subsurface = float(row.value("subsurface").toDouble(layers.subsurface));
+    layers.thickness = float(row.value("thickness").toDouble(layers.thickness));
+    layers.scatteringDistance = float(row.value("scatteringDistance").toDouble(layers.scatteringDistance));
+    layers.anisotropy = float(row.value("anisotropy").toDouble(layers.anisotropy));
+    layers.anisotropyRotation = float(row.value("anisotropyRotation").toDouble(layers.anisotropyRotation));
+    layers.coatNormalScale = float(row.value("coatNormalScale").toDouble(1));
+    layers.wetness = float(row.value("wetness").toDouble());
+    layers.puddles = float(row.value("puddles").toDouble());
+    layers.heightScale = float(row.value("heightScale").toDouble());
+    layers.decal = row.value("decal").toBool();
+    layers.decalOpacity = float(row.value("decalOpacity").toDouble(1));
+    return layers;
+}
+
+void writeMaterialLayers(QJsonObject &row,const wf::MaterialLayers &layers)
+{
+    if (layers.sheenColor != wf::Point3{})
+        row.insert("sheenColor",meshVector(layers.sheenColor));
+    if (layers.sheenRoughness != 0)
+        row.insert("sheenRoughness",layers.sheenRoughness);
+    if (layers.hasOptics()) {
+        row.insert("transmission",layers.transmission);
+        row.insert("ior",layers.ior);
+    }
+    if (layers.hasScatteringOrAnisotropy()) {
+        row.insert("subsurface",layers.subsurface);
+        row.insert("thickness",layers.thickness);
+        row.insert("scatteringDistance",layers.scatteringDistance);
+        row.insert("anisotropy",layers.anisotropy);
+        row.insert("anisotropyRotation",layers.anisotropyRotation);
+    }
+    if (layers.coatNormalScale != 1)
+        row.insert("coatNormalScale",layers.coatNormalScale);
+    if (layers.hasStreetLayers()) {
+        row.insert("wetness",layers.wetness);
+        row.insert("puddles",layers.puddles);
+        row.insert("heightScale",layers.heightScale);
+        row.insert("decal",layers.decal);
+        row.insert("decalOpacity",layers.decalOpacity);
+    }
+}
+
+constexpr const char *materialTextureKeys[wf::materialTextureCount]{
+    "baseColorTexture","normalTexture","metallicRoughnessTexture","occlusionTexture","emissiveTexture",
+    "clearcoatTexture","clearcoatRoughnessTexture","clearcoatNormalTexture","sheenColorTexture",
+    "sheenRoughnessTexture","transmissionTexture","anisotropyTexture"
+};
+
 void evaluateLod(MeshAsset &asset)
 {
     asset.lodMesh.reset();
@@ -695,13 +753,15 @@ std::optional<MeshAsset> readAsset(const QJsonObject &row)
             float(material.value("roughness").toDouble())});
         if (material.contains("emissive"))
             slot.emissive = meshVector<3>(material.value("emissive"));
+        slot.clearCoat = float(material.value("clearCoat").toDouble());
+        slot.clearCoatRoughness = float(material.value("clearCoatRoughness").toDouble());
+        slot.layers = readMaterialLayers(material);
         slot.sharedMaterialId = material.value("sharedMaterial").toString().toStdString();
-        const QString keys[]{"baseColorTexture","normalTexture","metallicRoughnessTexture","occlusionTexture","emissiveTexture"};
         const auto images = slot.previewTextures();
         for (unsigned i = 0; i < images.size(); ++i) {
-            if (!material.contains(keys[i]))
+            if (!material.contains(materialTextureKeys[i]))
                 continue;
-            const auto encoded = material.value(keys[i]).toString().toLatin1();
+            const auto encoded = material.value(materialTextureKeys[i]).toString().toLatin1();
             if (encoded.size() > qsizetype((wf::MeshMaterial::maxTextureBytes+2)/3*4))
                 return std::nullopt;
             const auto decoded = QByteArray::fromBase64Encoding(encoded,QByteArray::AbortOnBase64DecodingErrors);
@@ -872,8 +932,12 @@ bool validProjectMaterial(const ProjectMaterial &material,const SurfaceLibrary &
     const auto hasTexture = [&](const QString &id) { return id.isEmpty() || library.textures.contains(id); };
     return validSurfaceName(material.name)
         && hasTexture(material.textureId) && std::ranges::all_of(material.maps,hasTexture)
+        && std::ranges::all_of(material.layerMaps,hasTexture)
         && material.metallic >= 0 && material.metallic <= 1
         && material.roughness >= 0 && material.roughness <= 1
+        && material.clearCoat >= 0 && material.clearCoat <= 1
+        && material.clearCoatRoughness >= 0 && material.clearCoatRoughness <= 1
+        && material.layers.valid()
         && material.emission >= 0 && material.emission <= 1
         && std::ranges::all_of(material.tint,[](float channel) { return channel >= 0 && channel <= 1; });
 }
@@ -885,12 +949,15 @@ wf::MeshMaterial resolveProjectMaterial(const QString &id,const ProjectMaterial 
     resolved.color = material.tint;
     resolved.sharedMaterialId = id.toStdString();
     const auto images = resolved.previewTextures();
-    const std::array textureIds{material.textureId,material.maps[0],material.maps[1],material.maps[2],material.maps[3]};
     for (std::size_t i = 0; i < images.size(); ++i)
-        if (const auto texture = library.textures.constFind(textureIds[i]); texture != library.textures.cend())
+        if (const auto texture = library.textures.constFind(i == 0 ? material.textureId : material.map(i-1));
+            texture != library.textures.cend())
             images[i]->assign(texture->image.begin(),texture->image.end());
     resolved.metallic = material.metallic;
     resolved.roughness = material.roughness;
+    resolved.clearCoat = material.clearCoat;
+    resolved.clearCoatRoughness = material.clearCoatRoughness;
+    resolved.layers = material.layers;
     if (!resolved.emissiveTexture.empty())
         resolved.emissive = {material.emission,material.emission,material.emission};
     return resolved;
@@ -960,18 +1027,26 @@ std::optional<SurfaceLibrary> readSurfaceLibrary(const QJsonValue &value)
         const auto row = entry.toObject();
         const auto id = row.value("id").toString();
         ProjectMaterial material{row.value("name").toString(),row.value("textureId").toString(),meshVector<4>(row.value("tint"))};
-        if (row.contains("maps")) {
-            const auto maps = row.value("maps").toArray();
-            if (maps.size() != qsizetype(material.maps.size()))
-                return {};
+        const auto readMaps = [&](const char *key,auto &destination) {
+            if (!row.contains(key))
+                return true;
+            const auto maps = row.value(key).toArray();
+            if (maps.size() != qsizetype(destination.size()))
+                return false;
             for (qsizetype i = 0; i < maps.size(); ++i) {
                 if (!maps[i].isString())
-                    return {};
-                material.maps[i] = maps[i].toString();
+                    return false;
+                destination[i] = maps[i].toString();
             }
-        }
+            return true;
+        };
+        if (!readMaps("maps",material.maps) || !readMaps("layerMaps",material.layerMaps))
+            return {};
         material.metallic = float(row.value("metallic").toDouble(material.metallic));
         material.roughness = float(row.value("roughness").toDouble(material.roughness));
+        material.clearCoat = float(row.value("clearCoat").toDouble());
+        material.clearCoatRoughness = float(row.value("clearCoatRoughness").toDouble());
+        material.layers = readMaterialLayers(row);
         material.emission = float(row.value("emission").toDouble(material.emission));
         if (!wf::Guid::parse(id.toStdString()) || library.materials.contains(id) || !validProjectMaterial(material,library))
             return {};
@@ -990,8 +1065,17 @@ QJsonObject writeSurfaceLibrary(const SurfaceLibrary &library)
         QJsonArray maps;
         for (const auto &map : it->maps)
             maps.append(map);
-        materials.append(QJsonObject{{"id",it.key()},{"name",it->name},{"textureId",it->textureId},{"tint",meshVector(it->tint)},
-            {"maps",maps},{"metallic",it->metallic},{"roughness",it->roughness},{"emission",it->emission}});
+        QJsonObject row{{"id",it.key()},{"name",it->name},{"textureId",it->textureId},{"tint",meshVector(it->tint)},
+            {"maps",maps},{"metallic",it->metallic},{"roughness",it->roughness},{"emission",it->emission},
+            {"clearCoat",it->clearCoat},{"clearCoatRoughness",it->clearCoatRoughness}};
+        writeMaterialLayers(row,it->layers);
+        if (std::ranges::any_of(it->layerMaps,[](const QString &map) { return !map.isEmpty(); })) {
+            QJsonArray layerMaps;
+            for (const auto &map : it->layerMaps)
+                layerMaps.append(map);
+            row.insert("layerMaps",layerMaps);
+        }
+        materials.append(row);
     }
     return {{"textures",textures},{"materials",materials}};
 }
@@ -1010,11 +1094,15 @@ QJsonObject writeAsset(const MeshAsset &asset,const SurfaceLibrary &library)
     for (const auto &material : asset.mesh->materials) {
         QJsonObject row{{"name", QString::fromStdString(material.name)}, {"color", meshVector(material.color)},
             {"metallic", material.metallic}, {"roughness", material.roughness}};
-        const QString keys[]{"baseColorTexture","normalTexture","metallicRoughnessTexture","occlusionTexture","emissiveTexture"};
+        if (material.clearCoat != 0 || material.clearCoatRoughness != 0) {
+            row.insert("clearCoat",material.clearCoat);
+            row.insert("clearCoatRoughness",material.clearCoatRoughness);
+        }
+        writeMaterialLayers(row,material.layers);
         const auto images = material.previewTextures();
         for (unsigned i = 0; i < images.size(); ++i)
             if (!images[i]->empty() && !library.materials.contains(QString::fromStdString(material.sharedMaterialId)))
-                row.insert(keys[i],QString::fromLatin1(QByteArrayView(
+                row.insert(materialTextureKeys[i],QString::fromLatin1(QByteArrayView(
                     reinterpret_cast<const char *>(images[i]->data()),images[i]->size()).toByteArray().toBase64()));
         if (material.emissive != wf::Point3{})
             row.insert("emissive",meshVector(material.emissive));
@@ -1067,9 +1155,23 @@ private:
 };
 }
 
-ProjectStore::ProjectStore(QObject *parent) : QObject(parent)
+ProjectStore::ProjectStore(QObject *parent)
+    : ProjectStore(defaultStorageDirectory(),parent)
 {
-    const QDir dir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
+}
+
+QDir ProjectStore::defaultStorageDirectory()
+{
+    if (QStandardPaths::isTestModeEnabled() && QSettings::defaultFormat() == QSettings::IniFormat) {
+        // The editor audit gives its user-scope settings a temporary directory. Keep its projects there too.
+        const QFileInfo settings(QSettings{}.fileName());
+        return QDir(settings.dir().filePath(settings.completeBaseName()+"-projects"));
+    }
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
+}
+
+ProjectStore::ProjectStore(const QDir &dir,QObject *parent) : QObject(parent)
+{
     path_ = dir.filePath("projects.wfproject");
     baselineManifest_ = readFile(path_);
     const bool hadManifest = QFile::exists(path_);
@@ -1432,7 +1534,9 @@ QString ProjectStore::nativeGameplayPath() const
     if (!project())
         return {};
     const auto key = QCryptographicHash::hash(project()->id.toUtf8(),QCryptographicHash::Sha256).toHex();
-    return QDir(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation))
+    const auto directory = QStandardPaths::isTestModeEnabled() && QSettings::defaultFormat() == QSettings::IniFormat
+        ? defaultStorageDirectory() : QDir(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation));
+    return directory
         .filePath("NativeGameplay/"+QString::fromLatin1(key)+"/Gameplay.dll");
 }
 
@@ -1512,7 +1616,7 @@ bool ProjectStore::createStarterProject(const QString &name,QJsonObject configur
         return false;
     }
     const auto starter = configuration.value("starter").toString();
-    if (starter != "blank" && starter != "terrain" && starter != "physics" && starter != "street") {
+    if (starter != "blank" && starter != "terrain" && starter != "physics" && starter != "street" && starter != "district") {
         error = tr("Choose an available starter template.");
         return false;
     }
@@ -1536,6 +1640,12 @@ bool ProjectStore::createStarterProject(const QString &name,QJsonObject configur
         addPhysicsStarter(created);
     if (starter == "street")
         street::addStarter(created);
+    if (starter == "district") {
+        district::Layout layout;
+        layout.blocks = std::clamp(configuration.value("districtBlocks").toInt(layout.blocks),1,district::maximumBlocks);
+        layout.texturedFacades = configuration.value("districtTexturedFacades").toBool();
+        district::addStarter(created,layout);
+    }
     const auto settings = configuration.value("worldDefaults").toObject();
     if (!settings.isEmpty()) {
         SceneObject atmosphere;

@@ -108,7 +108,7 @@ void checkColorPipeline()
     // A histogram as the display shader fills it: bin 1+floor((log2 L - low) * 63 / (high - low)).
     const auto binOf = [](float luminance) {
         const float stops = std::log2(luminance);
-        return 1+int((stops-color::meterLowStops)*63/(color::meterHighStops-color::meterLowStops));
+        return 1+int(std::round((stops-color::meterLowStops)*(color::meterBins-2)/(color::meterHighStops-color::meterLowStops)));
     };
     std::array<std::uint32_t,color::meterBins> bins{};
     bins[std::size_t(binOf(0.18f))] = 1000;
@@ -254,7 +254,19 @@ void checkAtmosphere()
     const atmosphere::Sky noon({0.3f,0.2f,0.93f},1), evening({-0.66f,0.71f,0.12f},1);
     const float up[3]{0,0,1}, horizon[3]{1,0,0.02f}, away[3]{0.3f,0.95f,0.05f};
     const auto zenith = noon.radiance(up), side = noon.radiance(horizon);
-    if (std::getenv("WORLDFORGE_PRINT_ATMOSPHERE")) {
+    // Prints the sky values when WORLDFORGE_PRINT_ATMOSPHERE is set, for tuning the atmosphere by hand.
+    const bool printAtmosphere = [] {
+#ifdef _MSC_VER
+        char *value = nullptr;
+        std::size_t length = 0;
+        const bool set = _dupenv_s(&value,&length,"WORLDFORGE_PRINT_ATMOSPHERE") == 0 && value;
+        std::free(value);
+        return set;
+#else
+        return std::getenv("WORLDFORGE_PRINT_ATMOSPHERE") != nullptr;
+#endif
+    }();
+    if (printAtmosphere) {
         const auto p = [](const char *name,const color::Rgb &c) { std::cout << name << ' ' << c[0] << ' ' << c[1] << ' ' << c[2] << '\n'; };
         p("noon zenith",zenith); p("noon horizon",side); p("noon sun",noon.sunLight());
         p("evening zenith",evening.radiance(up)); p("evening away",evening.radiance(away)); p("evening sun",evening.sunLight());
@@ -267,6 +279,30 @@ void checkAtmosphere()
     const auto low = evening.sunLight(), high = noon.sunLight();
     require(lum(low) < lum(high) && low[0]/low[2] > 1.5f*high[0]/high[2], "A low sun is dimmer and redder");
     require(lum(zenith)/lum(high) > 0.05f && lum(zenith)/lum(high) < 0.5f, "The blue sky's radiance is a realistic fraction of sunlight");
+
+    const float radius = atmosphere::bottomRadius+atmosphere::viewerHeight;
+    const auto belowHorizon = atmosphere::Sky::transmittance(radius,-0.001f);
+    const auto grazing = atmosphere::Sky::transmittance(radius,0);
+    const auto aboveHorizon = atmosphere::Sky::transmittance(radius,0.005f);
+    require(belowHorizon == color::Rgb{}, "The Earth blocks sunlight below the geometric horizon");
+    require(grazing[0] > grazing[2] && grazing[2] > 0 && lum(grazing) < lum(aboveHorizon),
+            "Grazing sunlight is reddened and attenuated without mixing with Earth-blocked rays");
+
+    const float horizonAngle = std::asin(atmosphere::Sky::horizonCosine());
+    constexpr float sunRadius = shadow::sunAngularDiameter*0.5f;
+    float previousSun = 0;
+    for (int i = -32; i <= 32; ++i) {
+        const float elevation = horizonAngle+sunRadius*float(i)/24;
+        const atmosphere::Sky sunrise({std::cos(elevation),0,std::sin(elevation)},1);
+        const float direct = lum(sunrise.sunLight());
+        require(direct >= previousSun-1e-6f && direct-previousSun < 0.02f,
+                "Direct sunlight grows continuously as the solar disc rises across the horizon");
+        if (i == 0)
+            require(std::abs(direct-0.5f*sunrise.sunDiscStrength()) < 1e-6f,
+                    "The Earth covers half the sun when the disc is centered on the horizon");
+        previousSun = direct;
+    }
+    require(previousSun > 0.005f,"Sunlight reaches the ground once the solar disc clears the horizon");
 }
 
 void checkLightClusters()
@@ -313,6 +349,42 @@ void checkLightClusters()
     require(std::abs(near[0]) < 1e-4f && std::abs(near[1]) < 1e-4f && near[2] > 0 && near[2] < far[2] && far[2] < 1
             && std::abs(below[0]) < 1e-4f && std::abs(below[1]) < 1e-4f,
             "Point light shadow faces look along their axes with depth from near to the light's range");
+
+    const std::array<lights::Light,1> edgeLamp{{{{7,-16,4},0.00045f}}};
+    const auto tight = lights::build(edgeLamp,camera,{0,-30,1.7f},{0,1,0});
+    const float radius = lights::range(edgeLamp.front().intensity);
+    int checked = 0;
+    for (int ix = -4; ix <= 4; ++ix)
+        for (int iy = -4; iy <= 4; ++iy)
+            for (int iz = -4; iz <= 4; ++iz) {
+                if (ix*ix+iy*iy+iz*iz >= 16)
+                    continue;
+                const float x = 7+float(ix)*radius/4, y = -16+float(iy)*radius/4, z = 4+float(iz)*radius/4;
+                const float depth = y+30;
+                if (depth <= 0.1f)
+                    continue;
+                const auto ndc = project(camera,x,y,z);
+                if (std::abs(ndc[0]) >= 1 || std::abs(ndc[1]) >= 1)
+                    continue;
+                const int sampleTileX = int((ndc[0]*0.5f+0.5f)*lights::tilesX);
+                const int sampleTileY = int((ndc[1]*0.5f+0.5f)*lights::tilesY);
+                const auto &tile = tight.ranges[std::size_t((lights::slice(depth)*lights::tilesY+sampleTileY)*lights::tilesX+sampleTileX)];
+                require(tile[1] == 1 && tight.indices[tile[0]] == 0,"A visible point within a lamp's reach keeps its light");
+                ++checked;
+            }
+    // The sphere crosses the near plane, so the coarse projection touches every tile in the occupied depth slices.
+    const auto coarseEntries = std::size_t(lights::tilesX*lights::tilesY*(lights::slice(14+radius)-lights::slice(14-radius)+1));
+    require(checked > 30 && tight.indices.size() < coarseEntries,
+            "Tight cluster footprints conservatively reject unused lamp entries");
+
+    std::vector<lights::Light> lamps;
+    for (int index = -4; index <= 4; ++index)
+        lamps.push_back({{2.0f*float(index),0,4},0.02f});
+    const auto firstSlots = lights::build(lamps,camera,{-3,-30,1.7f},{0,1,0});
+    const auto secondSlots = lights::build(lamps,camera,{3,-30,1.7f},{0,1,0},firstSlots.shadowed);
+    const auto dirtySlots = lights::shadowUpdates(secondSlots.shadowed,firstSlots.shadowed,false);
+    require(firstSlots.shadowed.size() == lights::shadowSlots && secondSlots.shadowed.size() == lights::shadowSlots
+        && std::ranges::count(dirtySlots,true) == 1,"Replacing one selected lamp preserves the seven other shadow slots");
 }
 
 int main(int argc,char *argv[])
@@ -646,8 +718,8 @@ int main(int argc,char *argv[])
         weldedEdges.vertices.push_back(position);
     }
     auto second = unitPlane.faces.front();
-    for (auto &corner : second.corners)
-        corner.vertex += 4;
+    for (auto &secondCorner : second.corners)
+        secondCorner.vertex += 4;
     weldedEdges.faces.push_back(second);
     require(weldBoundaryEdges(weldedEdges,{4,7},{1,2}).empty()
         && weldedEdges.vertices.size() == 6 && MeshTopology(weldedEdges).edgeFaces.at({1,2}).size() == 2,
@@ -924,8 +996,107 @@ int main(int argc,char *argv[])
     require(loaded && loaded->simulation.terrains[0].field.samples == terrain.samples
             && loaded->simulation.terrains[0].field.layers == terrain.layers && loaded->localFogRadius == 13
             && loaded->simulation.bodies.front().shape == BoxBody::Shape::Capsule
-            && loaded->foliage[0].seed == 42 && loaded->meshes[0].vertices.size() == 36,
+            && loaded->foliage[0].seed == 42 && loaded->meshes[0].vertices.size() == 36
+            && loaded->meshes[0].clearCoat == 0 && loaded->meshes[0].clearCoatRoughness == 0,
             "Standalone package restores terrain, foliage, rigid bodies and render geometry");
+    playable.meshes[0].clearCoat = 0.75f;
+    playable.meshes[0].clearCoatRoughness = 0.19f;
+    std::stringstream coatedPackage;
+    require(writePlayable(coatedPackage,playable) && coatedPackage.str().starts_with("WORLDFORGE_PLAY 21\n"),
+            "A coated mesh selects version 21 without requiring other material inputs");
+    const auto coated = readPlayable(coatedPackage);
+    require(coated && coated->meshes.front().clearCoat == 0.75f && coated->meshes.front().clearCoatRoughness == 0.19f,
+            "Clear coat weight and roughness round-trip through the standalone package");
+    playable.meshes[0].clearCoatRoughness = 1.1f;
+    std::ostringstream invalidCoat;
+    require(!writePlayable(invalidCoat,playable), "Reject clear coat factors outside the supported range");
+    playable.meshes[0].clearCoatRoughness = 0.19f;
+    playable.meshes[0].layers = {{0.2f,0.4f,0.7f},0.55f};
+    std::stringstream layeredPackage;
+    require(writePlayable(layeredPackage,playable) && layeredPackage.str().starts_with("WORLDFORGE_PLAY 22\n"),
+            "A mesh with sheen selects the layered material package format");
+    const auto layered = readPlayable(layeredPackage);
+    require(layered && layered->meshes.front().layers == playable.meshes.front().layers
+            && layered->meshes.front().clearCoatRoughness == 0.19f && coated->meshes.front().layers == MaterialLayers{},
+            "Sheen and clear coat round-trip together and version 21 defaults to zero sheen");
+    playable.meshes[0].layers.transmission = 0.9f;
+    playable.meshes[0].layers.ior = 1.65f;
+    std::stringstream glassPackage;
+    require(writePlayable(glassPackage,playable) && glassPackage.str().starts_with("WORLDFORGE_PLAY 23\n"),
+            "Thin glass selects the transmissive material package format");
+    const auto glass = readPlayable(glassPackage);
+    require(glass && glass->meshes.front().layers == playable.meshes.front().layers
+            && layered->meshes.front().layers.transmission == 0 && layered->meshes.front().layers.ior == 1.5f,
+            "Transmission and IOR round-trip with earlier packages defaulting to opaque material");
+    auto &advanced = playable.meshes[0].layers;
+    advanced.subsurface = 0.55f;
+    advanced.thickness = 0.017f;
+    advanced.scatteringDistance = 0.029f;
+    advanced.anisotropy = 0.8f;
+    advanced.anisotropyRotation = -1.57f;
+    std::stringstream advancedPackage;
+    require(writePlayable(advancedPackage,playable) && advancedPackage.str().starts_with("WORLDFORGE_PLAY 24\n"),
+            "Measured scattering and directional roughness use version 24");
+    const auto advancedSurface = readPlayable(advancedPackage);
+    require(advancedSurface && advancedSurface->meshes.front().layers == advanced
+            && !glass->meshes.front().layers.hasScatteringOrAnisotropy(),
+            "Subsurface and anisotropy values round-trip with zero weights in earlier packages");
+    advanced.coatNormalScale = 0.6f;
+    auto &maps = playable.meshes.front().surfaceMaps;
+    for (std::size_t i = baseMaterialTextureCount-1; i < maps.size(); ++i)
+        maps[i] = {0x89,'P','N','G',uint8_t(i)};
+    std::stringstream mappedPackage;
+    require(writePlayable(mappedPackage,playable) && mappedPackage.str().starts_with("WORLDFORGE_PLAY 25\n"),
+            "Layer maps use version 25");
+    const auto mapped = readPlayable(mappedPackage);
+    require(mapped && mapped->meshes.front().surfaceMaps == maps && mapped->meshes.front().layers == advanced
+            && advancedSurface->meshes.front().layers.coatNormalScale == 1
+            && advancedSurface->meshes.front().surfaceMaps.back().empty(),
+            "Layer maps and normal scale round-trip while old packages retain their defaults");
+    advanced.wetness = 0.68f;
+    advanced.puddles = 0.39f;
+    advanced.heightScale = 0.08f;
+    advanced.decal = true;
+    advanced.decalOpacity = 0.77f;
+    playable.meshes.front().surfaceAlpha = 0.81f;
+    std::stringstream streetLayersPackage;
+    require(writePlayable(streetLayersPackage,playable) && streetLayersPackage.str().starts_with("WORLDFORGE_PLAY 26\n"),
+            "Street materials use version 26");
+    const auto streetLayers = readPlayable(streetLayersPackage);
+    require(streetLayers && streetLayers->meshes.front().layers == advanced && streetLayers->meshes.front().surfaceMaps == maps
+            && streetLayers->meshes.front().surfaceAlpha == 0.81f && !mapped->meshes.front().layers.hasStreetLayers(),
+            "Street layers and decal alpha round-trip with unchanged layer maps and old defaults");
+    playable.probeGi = playable.screenSpaceGi = playable.reflectionProbes = true;
+    std::stringstream giPackage;
+    require(writePlayable(giPackage,playable) && giPackage.str().starts_with("WORLDFORGE_PLAY 27\n"),
+            "R3 lighting controls use version 27");
+    const auto gi = readPlayable(giPackage);
+    require(gi && gi->probeGi && gi->screenSpaceGi && gi->reflectionProbes && gi->meshes.front().layers == advanced
+        && !streetLayers->probeGi && !streetLayers->screenSpaceGi && !streetLayers->reflectionProbes,
+        "R3 lighting controls round-trip while older scenes retain their lighting");
+
+    playable.weather = {0.8f,0.25f,0.75f,20};
+    std::stringstream weatherPackage;
+    require(writePlayable(weatherPackage,playable) && weatherPackage.str().starts_with("WORLDFORGE_PLAY 28\n"),
+            "Cloud cover and distance haze use version 28");
+    const auto weather = readPlayable(weatherPackage);
+    require(weather && weather->weather.haze == 0.8f && weather->weather.cloudsAt(-1) == 0.25f
+        && weather->weather.cloudsAt(10) == 0.5f && weather->weather.cloudsAt(25) == 0.75f
+        && !gi->weather.authored(),"Weather round-trips and smoothly interpolates to its target during play");
+
+    PlayLight warm{{3,4,2},0.025f,false};
+    warm.color = {1,0.43f,0.12f};
+    playable.lights.push_back(warm);
+    std::stringstream lampPackage;
+    require(writePlayable(lampPackage,playable) && lampPackage.str().starts_with("WORLDFORGE_PLAY 29\n"),
+            "Colored lamps use version 29");
+    const auto lamp = readPlayable(lampPackage);
+    require(lamp && lamp->lights.back().color == warm.color && lamp->weather.haze == 0.8f
+        && std::ranges::all_of(weather->lights,[](const PlayLight &light) { return light.color == Point3{1,1,1}; }),
+        "A lamp's linear tint round-trips and old scenes use white lamps");
+    playable.lights.back().color[0] = 1.01f;
+    std::ostringstream invalidLamp;
+    require(!writePlayable(invalidLamp,playable),"Reject lamp tints the reader cannot load");
     std::istringstream oversized("WORLDFORGE_PLAY 1\n999999 0 0 0 0 0");
     require(!readPlayable(oversized), "Reject oversized standalone scene package tables");
 

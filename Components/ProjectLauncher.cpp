@@ -568,6 +568,7 @@ ProjectLauncher::ProjectLauncher(QAbstractItemModel *projects,QWidget *parent) :
     starterContent_->addItem(tr("Rolling Hills with Trees"),"terrain");
     starterContent_->addItem(tr("Physics Lab"),"physics");
     starterContent_->addItem(tr("Playable Street · repair shop, traffic, mission"),"street");
+    starterContent_->addItem(tr("City District · blocks, buildings, street lamps"),"district");
     quality_ = new QComboBox;
     quality_->setAccessibleName(tr("Graphics quality"));
     quality_->addItem(tr("Standard (Default)"),true);

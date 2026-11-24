@@ -17,7 +17,7 @@ layout(set = 0, binding = 0) uniform sampler2D depth; // nearest
 layout(set = 0, binding = 1) uniform sampler2D scene; // this frame's lit scene, nearest
 layout(push_constant) uniform Occlusion {
     mat4 inverseViewProjection; // clip space (with this frame's jitter) to world space
-    vec4 settings;              // radius in meters, enabled, frame index, unused
+    vec4 settings;              // radius, 1 for AO + 2 for screen GI, frame index, probe GI on
 } occlusionSettings;
 layout(location = 0) out vec4 occlusion; // bounce light, sky visibility
 
@@ -36,20 +36,8 @@ float integrateArc(float h,float n)
     return 0.25*(-cos(2.0*h-n)+cos(n)+2.0*h*sin(n));
 }
 
-void main()
+vec3 surfaceNormalAt(ivec2 pixel,ivec2 size,vec2 texel,vec2 uv,float z,vec3 position,vec3 toCamera)
 {
-    ivec2 size = textureSize(depth,0);
-    ivec2 pixel = ivec2(gl_FragCoord.xy);
-    float z = texelFetch(depth,pixel,0).r;
-    if (occlusionSettings.settings.y < 0.5 || z >= 1.0) {
-        occlusion = vec4(0.0,0.0,0.0,1.0);
-        return;
-    }
-    vec2 texel = 1.0/vec2(size);
-    vec2 uv = (vec2(pixel)+0.5)*texel;
-    vec3 position = worldAt(uv,z);
-    vec3 toCamera = normalize(worldAt(uv,0.0)-worldAt(uv,1.0));
-
     // The normal from depth, using the neighbour on the side with the smaller depth step at each axis
     // so edges do not blend two surfaces.
     float left = texelFetch(depth,clamp(pixel-ivec2(1,0),ivec2(0),size-1),0).r;
@@ -63,8 +51,28 @@ void main()
     vec3 normal = normalize(cross(alongX,alongY));
     if (dot(normal,toCamera) < 0.0)
         normal = -normal;
+    return normal;
+}
 
-    float radius = occlusionSettings.settings.x;
+void main()
+{
+    ivec2 size = textureSize(depth,0);
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    int mode = int(occlusionSettings.settings.y);
+    bool useAo = (mode&1) != 0, useGi = (mode&2) != 0;
+    if (useGi)
+        pixel = min(2*pixel+ivec2(1),size-1);
+    float z = texelFetch(depth,pixel,0).r;
+    if (occlusionSettings.settings.y < 0.5 || z >= 1.0) {
+        occlusion = vec4(0.0,0.0,0.0,1.0);
+        return;
+    }
+    vec2 texel = 1.0/vec2(size);
+    vec2 uv = (vec2(pixel)+0.5)*texel;
+    vec3 position = worldAt(uv,z);
+    vec3 toCamera = normalize(worldAt(uv,0.0)-worldAt(uv,1.0));
+    vec3 normal = surfaceNormalAt(pixel,size,texel,uv,z,position,toCamera);
+    float radius = occlusionSettings.settings.x*(useGi && !useAo ? 1.6 : 1.0);
     float metersPerPixel = max(length(worldAt(uv+vec2(texel.x,0.0),z)-position),1e-6);
     float radiusPixels = min(radius/metersPerPixel,96.0);
     if (radiusPixels < 1.0) {
@@ -120,7 +128,22 @@ void main()
                 float raised = tangent-sideSign*max(sideSign*(tangent-horizon)-angleBias,0.0);
                 // A higher horizon: the arc it newly hides sees this sample instead of the sky.
                 if (sideSign*(edge-raised) > 0.0) {
-                    bounce += texelFetch(scene,samplePixel,0).rgb*projectedLength*(integrateArc(edge,n)-integrateArc(raised,n));
+                    float transport = 1.0;
+                    if (useGi) {
+                        // When the probe grid also contributes, keep only the shorter screen-space transport.
+                        float radiusFactor = occlusionSettings.settings.w > 0.5 ? 0.75 : 1.0;
+                        transport = 0.0;
+                        if (sampleDepth < 1.0 && distanceToSample < radiusFactor*radius) {
+                            vec3 sourceNormal = surfaceNormalAt(samplePixel,size,texel,sampleUv,sampleDepth,position+delta,toCamera);
+                            transport = max(0.0,dot(sourceNormal,-delta/distanceToSample))*
+                                (1.0-smoothstep(0.25*radius,radiusFactor*radius,distanceToSample));
+                        }
+                        if (isnan(transport))
+                            transport = 0.0;
+                    }
+                    if (transport > 0.0)
+                        bounce += texelFetch(scene,samplePixel,0).rgb*projectedLength*transport*
+                            (integrateArc(edge,n)-integrateArc(raised,n));
                     edge = raised;
                 }
             }
@@ -130,5 +153,5 @@ void main()
     }
     // Not clamped to 1: single slices of an open surface exceed 1 or fall short, and only their average
     // (over the TAA samples) is exact. Clamping first would darken every flat surface.
-    occlusion = vec4(bounce/float(slices),clamp(visibility/float(slices),0.0,2.0));
+    occlusion = vec4(bounce/float(slices),useAo ? clamp(visibility/float(slices),0.0,2.0) : 1.0);
 }

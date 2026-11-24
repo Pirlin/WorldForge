@@ -77,6 +77,7 @@ add_library(WorldForgeCore STATIC
     Engine/World/Gameplay.cpp Engine/World/Gameplay.h
     Engine/World/NativeGameplay.cpp Engine/World/NativeGameplay.h Engine/World/WorldForgeNative.h
     Engine/Render/ColorPipeline.h Engine/Render/Flip.cpp Engine/Render/Flip.h Engine/Render/AgxCurve.inc Engine/Render/AgxMatrices.inc
+    Engine/Render/ProbeGeometry.cpp Engine/Render/ProbeGeometry.h
 )
 target_include_directories(WorldForgeCore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(WorldForgeCore PRIVATE Jolt manifold)
@@ -99,7 +100,7 @@ if(Vulkan_INCLUDE_DIR AND WORLDFORGE_GLSLANG)
         Engine/Render/Shaders/PlayView.glsl Engine/Render/Shaders/SceneMotion.glsl Engine/Render/Shaders/Shading.glsl Engine/Render/AgxCurve.inc Engine/Render/AgxMatrices.inc)
     # Compiles GLSL to SPIR-V. With a variable name, the output is a C++ header that holds the words.
     function(worldforge_spirv source output variable)
-        set(arguments -V "-I${CMAKE_CURRENT_SOURCE_DIR}")
+        set(arguments -V "-I${CMAKE_CURRENT_SOURCE_DIR}" ${ARGN})
         if(variable)
             list(APPEND arguments --vn ${variable})
         endif()
@@ -109,6 +110,18 @@ if(Vulkan_INCLUDE_DIR AND WORLDFORGE_GLSLANG)
             COMMAND "${WORLDFORGE_GLSLANG}" ${arguments} "${CMAKE_CURRENT_SOURCE_DIR}/${source}" -o "${output}"
             DEPENDS "${source}" ${worldforge_shader_includes} VERBATIM)
     endfunction()
+    set(probe_shader "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders/ProbeTrace_comp.h")
+    worldforge_spirv(Engine/Render/Shaders/ProbeTrace.comp "${probe_shader}" spirv_ProbeTrace_comp)
+    set(cull_shader "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders/CullDraws_comp.h")
+    worldforge_spirv(Engine/Render/Shaders/CullDraws.comp "${cull_shader}" spirv_CullDraws_comp)
+    set(reduce_depth_shader "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders/ReduceDepth_comp.h")
+    worldforge_spirv(Engine/Render/Shaders/ReduceDepth.comp "${reduce_depth_shader}" spirv_ReduceDepth_comp)
+    target_sources(WorldForgeVulkan PRIVATE
+        Engine/Render/Vulkan/ProbeTrace.cpp Engine/Render/Vulkan/ProbeTrace.h "${probe_shader}"
+        Engine/Render/Vulkan/DrawCulling.cpp Engine/Render/Vulkan/DrawCulling.h "${cull_shader}"
+        Engine/Render/Vulkan/OcclusionDepth.cpp Engine/Render/Vulkan/OcclusionDepth.h "${reduce_depth_shader}")
+    target_include_directories(WorldForgeVulkan PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders")
+    target_link_libraries(WorldForgeVulkan PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 if(WIN32)
@@ -125,6 +138,9 @@ if(WIN32)
             worldforge_spirv("Engine/Render/Shaders/${shader}" "${output}" "spirv_${variable}")
             list(APPEND player_shaders "${output}")
         endforeach()
+        set(meshlet_shader "${CMAKE_CURRENT_BINARY_DIR}/player-shaders/PlayMeshlets_mesh.h")
+        worldforge_spirv(Engine/Render/Shaders/PlayMeshlets.mesh "${meshlet_shader}" spirv_PlayMeshlets_mesh --target-env vulkan1.2)
+        list(APPEND player_shaders "${meshlet_shader}")
         target_sources(WorldForgePlayer PRIVATE Player/VulkanRenderer.cpp Player/VulkanRenderer.h ${player_shaders})
         target_include_directories(WorldForgePlayer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/player-shaders")
         target_link_libraries(WorldForgePlayer PRIVATE WorldForgeVulkan)
@@ -138,6 +154,13 @@ if(BUILD_TESTING)
     target_link_libraries(WorldForgeCoreTests PRIVATE WorldForgeCore)
     worldforge_compile_options(WorldForgeCoreTests)
     add_test(NAME WorldForge.Core COMMAND WorldForgeCoreTests)
+    if(TARGET WorldForgeVulkan)
+        add_executable(WorldForgeProbeTests Tests/ProbeTraceTests.cpp)
+        target_link_libraries(WorldForgeProbeTests PRIVATE WorldForgeCore WorldForgeVulkan)
+        worldforge_compile_options(WorldForgeProbeTests)
+        add_test(NAME WorldForge.ProbeTrace COMMAND WorldForgeProbeTests)
+        set_tests_properties(WorldForge.ProbeTrace PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    endif()
     if(TARGET WorldForgePlayer)
         set(standalone_fixture "${CMAKE_CURRENT_BINARY_DIR}/standalone-smoke.wfplay")
         add_test(NAME WorldForge.StandaloneFixture COMMAND WorldForgeCoreTests "${standalone_fixture}")
@@ -179,7 +202,7 @@ set(editor_sources
     State/StudioPublishReview.h State/StudioPublishReview.cpp
     State/StudioClip.h State/StudioClip.cpp
     State/ForgeAi.h State/ForgeAi.cpp
-    State/PlayableStreet.h State/PlayableStreet.cpp
+    State/PlayableStreet.h State/PlayableStreet.cpp State/CityDistrict.h State/CityDistrict.cpp
     Workspaces/ForgeAiJob.h Workspaces/ForgeAiJob.cpp
     Components/ForgeAiPanel.h Components/ForgeAiPanel.cpp
     State/WorldScene.h State/WorldScene.cpp

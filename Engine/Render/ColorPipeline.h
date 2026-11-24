@@ -89,9 +89,10 @@ inline float exposureScale(float stops)
 inline constexpr float bloomStrength = 0.04f;
 
 // Auto exposure. The display pass counts scene luminance into a histogram: bin 0 holds black pixels
-// and bins 1 to 63 cover log2 luminance in scene units from meterLowStops to meterHighStops.
+// and bins 1 to 63 are centered on uniformly spaced log2 luminance values in scene units.
+// Each non-black sample splits its weight across its neighboring bins.
 inline constexpr int meterBins = 64;
-inline constexpr float meterLowStops = -16, meterHighStops = 8;
+inline constexpr float meterLowStops = -24, meterHighStops = 8;
 
 // The log2 average scene luminance of the metered pixels between the 10th and 90th percentile,
 // which keeps a few bright lights or dark corners from swinging the exposure. Returns false when
@@ -113,8 +114,8 @@ inline bool meteredLuminance(std::span<const std::uint32_t> bins,float &log2Aver
         const double used = std::max(0.0,std::min(end,high)-std::max(start,low));
         if (used <= 0)
             continue;
-        const double stops = bin == 0 ? meterLowStops-1
-            : meterLowStops+(bin-0.5)*double(meterHighStops-meterLowStops)/(meterBins-1);
+        const double binWidth = double(meterHighStops-meterLowStops)/(meterBins-2);
+        const double stops = meterLowStops+(bin-1)*binWidth;
         sum += used*stops;
         weight += used;
     }

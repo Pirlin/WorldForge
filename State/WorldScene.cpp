@@ -60,7 +60,14 @@ WorldAtmosphere readAtmosphere(const QJsonObject &details)
     environment.autoExposure = details.value("exposureMode").toString() == "Auto";
     environment.temporalAntiAliasing = details.value("antiAliasing").toString() != "Off";
     environment.ambientOcclusion = details.value("ambientOcclusion").toBool(true);
+    environment.probeGi = details.value("probeGi").toBool();
+    environment.screenSpaceGi = details.value("screenSpaceGi").toBool();
+    environment.reflectionProbes = details.value("reflectionProbes").toBool();
     environment.physicalSky = details.value("skyModel").toString() == QStringLiteral("Physical");
+    environment.weather.haze = float(std::clamp(details.value("aerialHaze").toDouble(),0.0,double(worldforge::Weather::maximumHaze)));
+    environment.weather.cloudCover = float(std::clamp(details.value("cloudCover").toDouble(),0.0,1.0));
+    environment.weather.targetCloudCover = float(std::clamp(details.value("targetCloudCover").toDouble(),0.0,1.0));
+    environment.weather.cloudTransition = float(std::clamp(details.value("cloudTransition").toDouble(),0.0,double(worldforge::Weather::maximumTransition)));
     environment.bloom = details.value("bloom").toBool(true);
     environment.reflections = details.value("reflections").toBool(true);
     environment.contactShadows = details.value("contactShadows").toBool(true);
@@ -108,6 +115,18 @@ void setLightPhotometric(QJsonObject &details,const QString &type,double value)
         details.insert("luminousIntensity",std::clamp(value,0.0,maximumLuminousIntensity));
     else
         details.insert("illuminance",std::clamp(value,0.0,maximumIlluminance));
+}
+
+QColor lampColor(const SceneObject &object)
+{
+    const QColor color(object.details.value("lightColor").toString());
+    return color.isValid() ? color : QColor(Qt::white);
+}
+
+worldforge::color::Rgb linearLampColor(const SceneObject &object)
+{
+    const auto color = lampColor(object);
+    return worldforge::color::srgbToLinear(worldforge::color::Rgb{float(color.redF()),float(color.greenF()),float(color.blueF())});
 }
 
 double spotConeAngle(const SceneObject &object)

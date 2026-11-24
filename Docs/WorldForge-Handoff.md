@@ -1,6 +1,6 @@
 # WorldForge handoff
 
-Read this first if you are continuing the work. The strategy is in `WorldForge-Strategy-and-Roadmap.md`, and each finished rendering feature has a row in its R1 status table.
+Read [WorldForge-Development-Playbook.md](WorldForge-Development-Playbook.md) first: it is the working method (verification, review checklist, pitfalls) and the detailed plan of what to do next. Then read this handoff for the build, the frame architecture and the current status. The strategy is in `WorldForge-Strategy-and-Roadmap.md`, and each finished rendering feature has a row in its stage's status table.
 
 ## Conventions
 - Commit and push straight to `master` (github.com/Pirlin/WorldForge). Don't create feature branches.
@@ -31,6 +31,10 @@ Put Qt on PATH first (`%LOCALAPPDATA%/WorldForge/Qt/6.8.3/msvc2022_64/bin`), the
 | `--rendering` | Street views in the editor and the Player (`WorldForgePlayer --capture`) against `Tests/Golden`. |
 | `--realism` | The Player against Cycles (rendered through Studio), scored with LDR-FLIP against `Tests/Golden/realism.json`. Results are in `controls.csv` as "Realism score". |
 | `--street` | Needs `WORLDFORGE_STUDIO_TEST_FORGE=1`. Reports frame times. |
+| `--r3-performance` | The street mission in the Player with R3 lighting off, then on. |
+| `--district` | Generates the City District (R4 test scene), flies the Player's `--verify-district` route, and records frame, CPU and per-pass GPU times, draw calls, triangles and memory. |
+
+`Tests/Run-Verification.ps1` builds and runs any of these one after another and prints a summary (see the playbook, section 4).
 
 - If the full audit stops writing `controls.csv`, a modal dialog is open outside `withDialog`.
 - The Authoring check "Sun casts visible geometry shadows" is flaky. Rerun it before treating a failure as real.
@@ -59,7 +63,7 @@ Settings flow through these files:
 - Sky & Fog dialog: `App/MainWindow.cpp`
 - `WorldAtmosphere`: `State/WorldScene.*`
 - Export: `State/WorldRuntime.cpp`
-- Player format, now v18: `Engine/World/PlayableScene.*`
+- Player format, now v21 for clear coat: `Engine/World/PlayableScene.*`
 - Player `View`: `Player/PlayerRender.h`, which must stay a multiple of 16 bytes for D3D11
 
 ## Status (2026-11-22)
@@ -84,11 +88,38 @@ Later on 2026-11-22, after per-object motion vectors, the same street measured 9
 - Contact shadows
 - Per-object motion vectors
 
+**R2 materials:** The Vulkan editor and Player support clear coat, cloth sheen, tinted thin glass, local subsurface scattering, anisotropic reflection, seven material layer maps, wet surfaces, puddles, mesh decals, and parallax occlusion. GLB interchange supports five Khronos material extensions. Playable formats 21–26 introduce the R2 material parameters and retain support for earlier packages.
+
+The final Vulkan rendering audit passed 42 checks. The surface-library audit passed 18 checks, including GLB and project round trips. The playable street audit passed 12 checks and measured 13.83 ms p95 on the GTX 1650. The street material comparisons ranged from 0.21 to 0.43 display levels between the editor and Player. The full editor audit passed 1,375 checks on retry, with three skips. Both Material tab navigation checks passed after the initial timeout.
+
+**R3 lighting:** The Vulkan editor and Player use a 6 × 6 × 4 grid of world-space probes for single-bounce light from sunlit and emissive geometry. The grid follows the camera and refreshes as the scene moves. Screen-space GI traces at half resolution and rejects samples across depth edges at full resolution. Reflection probes use 8 × 8 directional captures with first-hit distances for parallax correction. The three controls are in Sky & Fog, start off by default, and export through playable format 27.
+
+The GTX 1650 passed the GPU probe test and all 45 rendering checks. Editor and Player comparisons for the three effects differed by at most 0.05 display levels on average. Run the editor audit with `--r3-performance` to compare the street mission with all three controls off and on. The final benchmark measured 15.42 ms p95 off and 15.74 ms p95 on. With R3 on it peaked at 201 MiB working set and recorded a longest frame of 61.72 ms.
+
+**Atmosphere before R4:** The physical sky uses a more precise lookup for grazing sunlight. The visible sun disc matches the angular size used by the shadow filter. Height fog and local mist now receive the same physical sunlight and skylight, and fog shadow samples vary across pixels and frames to reduce visible bands.
+
 ## Next, in order
-1. **R2 materials:**
-   - clear coat, sheen, transmission and glass
-   - subsurface and anisotropy
-   - glTF material extensions
-   - wet and puddle layers
-   - decals and parallax occlusion
-2. **R3 GI.** Bounce light from beyond the screen is the largest remaining gap against Cycles.
+The detailed, step-by-step version of this list, with files, methods, tests and acceptance criteria, is section 10 of the [development playbook](WorldForge-Development-Playbook.md#10-the-plan-what-to-do-next). Start there with the district's frame cost (10.1).
+
+The district profiling audit will reuse the same exported starter and camera route for the original settings and five single-feature variations. The Player's timestamps will give street and rooftop scene-pass times for each. Each run must complete on Vulkan. Compare the variations in the same session before changing the scene shaders. The street-level target is 16.7 ms p95.
+
+The profile identified lamp shading as the largest cost. Refine the light sphere against the screen-tile sides within each depth slice, then reject out-of-range and back-facing lamp samples before shadow lookups on surfaces without a coat or subsurface scattering. Verify that valid lamp contributions stay in their clusters and recheck the renderings and district on the same power plan.
+
+Lamp color will use the same scene-linear RGB in the editor's light clusters and the Player's version 29 package. The rendering audit will capture the same warm and cool lamp from an identical view with and without mist, requiring a visible color difference and an editor–Player difference at or below one display level.
+
+The first draw-submission change will preserve the Player's existing vertex order and cache mesh ranges whose sizes stay fixed. The Vulkan vertex ring will refresh only moving ranges and the terrain and effects suffix after its first upload. Meshes with variable vertex counts keep the existing full upload until the culling and LOD work can handle them. The rendering and motion audits will check that the cache preserves the same images.
+
+A shared Vulkan compute pass will test opaque world-space bounds against the camera and sun cascades and write indirect draws into each in-flight frame's buffers. Use the conservative winding bounds for foliage and preserve submission order. The direct path remains available for queues without compute or when indirect resources fail to allocate. The district will compare rendered images and report how much geometry the GPU rejected.
+
+For the horizon crossing, use the visible fraction of the solar disc to drive direct illumination and the geometric horizon to clip the rendered disc. Keep the atmosphere and shadow filter in agreement on the disc's radius. Verify the sunlight across a sweep through the horizon before extending the moving-shot exposure audit.
+
+The 12 × 12 route spends more than 6 ms in point-light shadows when the nearest-lamp set changes. Keep lamps that remain selected in their previous atlas slots. Rebuild only changed cubemaps between periodic geometry refreshes, using a load pass that preserves the other tiles. Compare direct and indirect district captures and remeasure the point-shadow pass on the same route.
+
+The point-shadow atlas now keeps unchanged lamps in the same slots and redraws only changed cubemaps between periodic geometry refreshes. In the first 12 × 12 run with this change, it updated an average of 2.78 faces per frame and spent 1.10 ms on the street and 1.00 ms above the roofs. Still images now average temporal history at the same pixel. The 6 × 6 editor–Player comparison passed at 0.470 display levels.
+
+The district report now counts draws and triangles that survive the GPU frustum test. The editor and the sun cascades can use compacted indirect draws. `WORLDFORGE_FIXED_INDIRECT=1` selects fixed-size indirect submission, and `--direct` selects ordinary draw commands. The `district-compare` mode runs a back-to-back comparison.
+
+The `district-textured` audit exports a 12 × 12 district with five generated facade textures. The `sunrise` audit measures 73 exposure histograms in each renderer. Its first pass detected a 1.30-stop step after the horizon crossing. The physical atmosphere now includes diffuse skylight reflected from distant ground.
+
+1. **Atmosphere and lighting realism.** Continue with moving sunrise and sunset shots, night lighting, distance haze, and weather. Use the [realism checklist](WorldForge-Strategy-and-Roadmap.md#realism-pass-before-city-scaling) to record visual and performance results on the Playable Street.
+2. **R4 city scale.** Use the [R4 implementation checklist](WorldForge-Strategy-and-Roadmap.md#r4-implementation-checklist) to establish a district baseline and begin GPU-driven drawing after the realism pass.

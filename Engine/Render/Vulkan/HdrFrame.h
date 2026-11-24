@@ -4,8 +4,42 @@
 #include "Engine/Render/Vulkan/VulkanApi.h"
 
 #include <array>
+#include <span>
 
 namespace worldforge::vk {
+
+enum class MaterialPass : uint32_t { Opaque, Transmission, Radiance };
+
+struct TriangleRange { std::size_t first, count; };
+
+// Transmissive triangles are kept in the vertex stream for picking and motion. Skip them in depth and opaque draws.
+template<class Draw>
+void drawOpaqueRanges(std::size_t count,std::span<const TriangleRange> transparent,Draw draw)
+{
+    std::size_t first = 0;
+    for (const auto &range : transparent) {
+        if (range.first > first)
+            draw(uint32_t(first),uint32_t(range.first-first));
+        first = range.first+range.count;
+    }
+    if (count > first)
+        draw(uint32_t(first),uint32_t(count-first));
+}
+
+// The first glass draw attenuates the destination by a different factor for each RGB channel. The second
+// adds the pane's own lighting. Auxiliary targets preserve alpha, including the linear depth used by SSR.
+inline VkPipelineColorBlendAttachmentState materialBlend(MaterialPass pass,VkPipelineColorBlendAttachmentState blend)
+{
+    if (pass != MaterialPass::Opaque) {
+        blend.blendEnable = VK_TRUE;
+        blend.srcColorBlendFactor = pass == MaterialPass::Transmission ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
+        blend.dstColorBlendFactor = pass == MaterialPass::Transmission ? VK_BLEND_FACTOR_SRC_COLOR : VK_BLEND_FACTOR_ONE;
+        blend.colorBlendOp = blend.alphaBlendOp = VK_BLEND_OP_ADD;
+        blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    }
+    return blend;
+}
 
 // The frame passes shared by the editor viewport and the Player:
 //   Scene pass: sky and lit geometry into a linear 16-bit float color target and a depth target.
@@ -49,6 +83,8 @@ public:
     // Ground-truth ambient occlusion and screen-space bounce light (Ambient.frag) from the scene depth and color.
     struct Occlusion {
         bool enabled = false;
+        bool screenSpaceGi = false;
+        bool probeGi = false;
         // This frame's clip space (with its jitter) to world space, column-major as GLSL reads it.
         std::array<float,16> inverseViewProjection{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         float radius = 1.5f; // meters

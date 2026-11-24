@@ -17,6 +17,7 @@
 #include <QVector3D>
 #include <set>
 
+class QDir;
 struct StudioMeshData;
 namespace worldforge { struct MeshClip; }
 
@@ -97,6 +98,15 @@ struct ProjectMaterial {
     float metallic = 0;
     float roughness = 0.65f;
     float emission = 1;
+    float clearCoat = 0, clearCoatRoughness = 0;
+    worldforge::MaterialLayers layers;
+    std::array<QString,worldforge::LayerMapCount> layerMaps;
+    const QString &map(std::size_t index) const {
+        return index < maps.size() ? maps[index] : layerMaps[index-maps.size()];
+    }
+    QString &map(std::size_t index) {
+        return index < maps.size() ? maps[index] : layerMaps[index-maps.size()];
+    }
     bool operator==(const ProjectMaterial &) const = default;
 };
 
@@ -142,6 +152,8 @@ class ProjectStore : public QObject {
 
 public:
     explicit ProjectStore(QObject *parent = nullptr);
+    explicit ProjectStore(const QDir &storageDirectory,QObject *parent = nullptr);
+    static QDir defaultStorageDirectory();
     const QList<Project> &projects() const { return projects_; }
     const Project *project() const;
     const SceneObject *selectedObject() const;

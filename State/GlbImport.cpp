@@ -23,6 +23,16 @@
 namespace {
 namespace wf = worldforge;
 constexpr int limit = 2'000'000;
+constexpr auto clearCoatExtension = "KHR_materials_clearcoat";
+constexpr auto sheenExtension = "KHR_materials_sheen";
+constexpr auto transmissionExtension = "KHR_materials_transmission";
+constexpr auto iorExtension = "KHR_materials_ior";
+constexpr auto anisotropyExtension = "KHR_materials_anisotropy";
+constexpr std::array materialExtensions{clearCoatExtension,sheenExtension,transmissionExtension,iorExtension,anisotropyExtension};
+constexpr std::array layerTextureKeys{"clearcoatTexture","clearcoatRoughnessTexture","clearcoatNormalTexture",
+    "sheenColorTexture","sheenRoughnessTexture","transmissionTexture","anisotropyTexture"};
+constexpr std::array layerTextureExtensions{clearCoatExtension,clearCoatExtension,clearCoatExtension,
+    sheenExtension,sheenExtension,transmissionExtension,anisotropyExtension};
 
 void require(bool condition, const QString &error)
 {
@@ -120,7 +130,9 @@ public:
     {
         require(json_.value("asset").toObject().value("version").toString() == "2.0",
                 QStringLiteral("Only glTF 2.0 is supported."));
-        require(json_.value("extensionsRequired").toArray().isEmpty(),
+        const auto extensions = json_.value("extensionsRequired").toArray();
+        for (const auto &extension : extensions)
+            require(std::ranges::any_of(materialExtensions,[&](const char *name) { return extension.toString() == name; }),
                 QStringLiteral("This GLB requires an unsupported extension."));
         const auto buffers = json_.value("buffers").toArray();
         const auto buffer = entry(buffers, 0);
@@ -138,13 +150,34 @@ public:
             for (int channel = 0; channel < 3; ++channel)
                 slot.color[channel] = wf::color::linearToSrgb(slot.color[channel]);
             slot.emissive = vector<3>(material.value("emissiveFactor"));
+            const auto materialLayers = material.value("extensions").toObject();
+            const auto coat = materialLayers.value(clearCoatExtension).toObject();
+            slot.clearCoat = float(coat.value("clearcoatFactor").toDouble());
+            slot.clearCoatRoughness = float(coat.value("clearcoatRoughnessFactor").toDouble());
+            slot.layers.coatNormalScale = float(coat.value("clearcoatNormalTexture").toObject().value("scale").toDouble(1));
+            const auto sheen = materialLayers.value(sheenExtension).toObject();
+            slot.layers.sheenColor = vector<3>(sheen.value("sheenColorFactor"));
+            slot.layers.sheenRoughness = float(sheen.value("sheenRoughnessFactor").toDouble());
+            slot.layers.transmission = float(materialLayers.value(transmissionExtension).toObject().value("transmissionFactor").toDouble());
+            slot.layers.ior = float(materialLayers.value(iorExtension).toObject().value("ior").toDouble(1.5));
+            const auto anisotropy = materialLayers.value(anisotropyExtension).toObject();
+            slot.layers.anisotropy = float(anisotropy.value("anisotropyStrength").toDouble());
+            slot.layers.anisotropyRotation = float(std::fmod(anisotropy.value("anisotropyRotation").toDouble(),wf::MaterialLayers::fullTurn));
             const QJsonObject fields[]{pbr.value("baseColorTexture").toObject(),material.value("normalTexture").toObject(),
                 pbr.value("metallicRoughnessTexture").toObject(),material.value("occlusionTexture").toObject(),
                 material.value("emissiveTexture").toObject()};
             const auto channels = slot.previewTextures();
-            for (unsigned i = 0; i < channels.size(); ++i)
+            for (std::size_t i = 0; i < std::size(fields); ++i)
                 if (!fields[i].isEmpty())
                     readTexture(*channels[i],fields[i]);
+            for (std::size_t i = 0; i < slot.layerMaps.size(); ++i) {
+                const auto info = materialLayers.value(layerTextureExtensions[i]).toObject().value(layerTextureKeys[i]).toObject();
+                if (!info.isEmpty()) {
+                    readTexture(slot.layerMaps[i],info);
+                    require(!slot.layerMaps[i].empty() || !extensions.contains(QString::fromLatin1(layerTextureExtensions[i])),
+                        QStringLiteral("A required GLB material map must be an embedded PNG or JPEG using the active UV set."));
+                }
+            }
         }
         const auto scene = entry(json_.value("scenes").toArray(), integer(json_.value("scene"), 0));
         for (const auto &node : scene.value("nodes").toArray())
@@ -468,7 +501,7 @@ QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &e
     };
     QByteArray binary;
     binary.reserve(bytes);
-    QJsonArray views, accessors, entries, materials, images, textures;
+    QJsonArray views, accessors, entries, materials, images, textures, extensionsUsed;
     for (const auto &mat : mesh.materials) {
         QJsonArray rgba;
         for (int channel = 0; channel < 4; ++channel) {
@@ -479,11 +512,24 @@ QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &e
             {"roughnessFactor",std::clamp(mat.roughness,0.0f,1.0f)}};
         QJsonObject material{{"name",QString::fromStdString(mat.name)},
             {"emissiveFactor",QJsonArray{mat.emissive[0],mat.emissive[1],mat.emissive[2]}}};
+        QJsonObject extensions;
+        const auto &layer = mat.layers;
+        if (mat.clearCoat != 0 || mat.clearCoatRoughness != 0)
+            extensions.insert(clearCoatExtension,QJsonObject{{"clearcoatFactor",mat.clearCoat},{"clearcoatRoughnessFactor",mat.clearCoatRoughness}});
+        if (layer.sheenColor != wf::Point3{} || layer.sheenRoughness != 0)
+            extensions.insert(sheenExtension,QJsonObject{{"sheenColorFactor",QJsonArray{layer.sheenColor[0],layer.sheenColor[1],layer.sheenColor[2]}},
+                {"sheenRoughnessFactor",layer.sheenRoughness}});
+        if (layer.transmission != 0)
+            extensions.insert(transmissionExtension,QJsonObject{{"transmissionFactor",layer.transmission}});
+        if (layer.ior != 1.5f)
+            extensions.insert(iorExtension,QJsonObject{{"ior",layer.ior}});
+        if (layer.anisotropy != 0 || layer.anisotropyRotation != 0)
+            extensions.insert(anisotropyExtension,QJsonObject{{"anisotropyStrength",layer.anisotropy},{"anisotropyRotation",layer.anisotropyRotation}});
         if (studioTopology)
             material.insert("extras",QJsonObject{{"worldforgeSlot",materials.size()}});
         const QString fields[]{"baseColorTexture","normalTexture","metallicRoughnessTexture","occlusionTexture","emissiveTexture"};
         const auto channels = mat.previewTextures();
-        for (unsigned i = 0; i < channels.size(); ++i) {
+        for (std::size_t i = 0; i < channels.size(); ++i) {
             const auto &imageBytes = *channels[i];
             if (imageBytes.empty())
                 continue;
@@ -499,8 +545,25 @@ QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &e
             binary.append((4-binary.size()%4)%4,'\0');
             images.append(QJsonObject{{"bufferView",int(views.size()-1)},{"mimeType",mime}});
             textures.append(QJsonObject{{"source",int(images.size()-1)}});
-            auto &destination = i == 0 || i == 2 ? pbr : material;
-            destination.insert(fields[i],QJsonObject{{"index",int(textures.size()-1)}});
+            QJsonObject info{{"index",int(textures.size()-1)}};
+            if (i < std::size(fields)) {
+                auto &destination = i == 0 || i == 2 ? pbr : material;
+                destination.insert(fields[i],info);
+            } else {
+                const auto layerIndex = i-wf::baseMaterialTextureCount;
+                if (layerIndex == wf::CoatNormal && layer.coatNormalScale != 1)
+                    info.insert("scale",layer.coatNormalScale);
+                const auto key = layerTextureExtensions[layerIndex];
+                auto extension = extensions.value(key).toObject();
+                extension.insert(layerTextureKeys[layerIndex],info);
+                extensions.insert(key,extension);
+            }
+        }
+        if (!extensions.isEmpty()) {
+            material.insert("extensions",extensions);
+            for (const auto &extension : extensions.keys())
+                if (!extensionsUsed.contains(extension))
+                    extensionsUsed.append(extension);
         }
         material.insert("pbrMetallicRoughness",pbr);
         materials.append(material);
@@ -527,6 +590,41 @@ QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &e
             attributes.insert(key,int(accessors.size()));
             views.append(QJsonObject{{"buffer",0},{"byteOffset",start},{"byteLength",binary.size()-start},{"target",34962}});
             accessors.append(accessor);
+        }
+        const auto &mat = mesh.materials[slot];
+        if (mat.layers.anisotropy != 0 || mat.layers.anisotropyRotation != 0
+            || !mat.layerMaps[wf::Anisotropy].empty() || !mat.layerMaps[wf::CoatNormal].empty()) {
+            std::vector<QVector3D> tangents(part.vertices.size()), bitangents(part.vertices.size());
+            for (std::size_t i = 0; i < part.triangles.size(); i += 3) {
+                const auto a = part.triangles[i], b = part.triangles[i+1], c = part.triangles[i+2];
+                const auto &p = part.vertices[a], &q = part.vertices[b], &r = part.vertices[c];
+                const QVector3D x(q[0]-p[0],q[1]-p[1],q[2]-p[2]), y(r[0]-p[0],r[1]-p[1],r[2]-p[2]);
+                const float u = q[6]-p[6], v = q[7]-p[7], s = r[6]-p[6], t = r[7]-p[7];
+                const float determinant = u*t-v*s;
+                if (std::abs(determinant) <= 1e-10f)
+                    continue;
+                const auto tangent = (t*x-v*y)/determinant, bitangent = (u*y-s*x)/determinant;
+                for (auto index : {a,b,c}) {
+                    tangents[index] += tangent;
+                    bitangents[index] += bitangent;
+                }
+            }
+            const auto start = binary.size();
+            for (std::size_t i = 0; i < part.vertices.size(); ++i) {
+                const auto &vertex = part.vertices[i];
+                const QVector3D n(vertex[3],vertex[4],vertex[5]);
+                auto t = tangents[i]-n*QVector3D::dotProduct(n,tangents[i]);
+                if (t.lengthSquared() < 1e-14f)
+                    t = QVector3D::crossProduct(std::abs(n.z()) < 0.9f ? QVector3D(0,0,1) : QVector3D(0,1,0),n);
+                t.normalize();
+                const auto hand = QVector3D::dotProduct(QVector3D::crossProduct(n,t),bitangents[i]) < 0 ? -1.0f : 1.0f;
+                for (const float value : {t.x(),t.y(),t.z(),hand})
+                    append(binary,std::bit_cast<quint32>(value));
+            }
+            attributes.insert("TANGENT",int(accessors.size()));
+            views.append(QJsonObject{{"buffer",0},{"byteOffset",start},{"byteLength",binary.size()-start},{"target",34962}});
+            accessors.append(QJsonObject{{"bufferView",int(views.size()-1)},{"componentType",5126},
+                {"count",int(part.vertices.size())},{"type","VEC4"}});
         }
         const auto indexStart = binary.size();
         for (const auto index : part.triangles)
@@ -565,6 +663,8 @@ QByteArray exportGlb(const worldforge::Mesh &mesh,const QString &name,QString &e
         {"meshes",QJsonArray{meshEntry}},
         {"materials",materials},{"accessors",accessors},{"bufferViews",views},
         {"buffers",QJsonArray{QJsonObject{{"byteLength",binary.size()}}}}};
+    if (!extensionsUsed.isEmpty())
+        document.insert("extensionsUsed",extensionsUsed);
     if (!images.isEmpty()) {
         document.insert("images",images);
         document.insert("textures",textures);

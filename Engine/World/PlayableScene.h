@@ -5,6 +5,7 @@
 #include "Engine/World/WorldSimulation.h"
 #include "Engine/Geometry/MeshClip.h"
 #include "Engine/Render/ColorPipeline.h"
+#include "Engine/Render/Weather.h"
 
 #include <iosfwd>
 
@@ -24,11 +25,14 @@ struct PlayMesh {
     float lodDistance = 0;
     // Encoded PNG or JPEG base-color map multiplied with the vertex colors, or empty.
     std::vector<std::uint8_t> baseColorTexture;
-    std::array<std::vector<std::uint8_t>,4> surfaceMaps;
+    std::array<std::vector<std::uint8_t>,materialTextureCount-1> surfaceMaps;
     Point3 emissive{};
     float metallic = 0, roughness = 0.65f;
     bool advancedSurface = false;
     std::optional<MeshClip> clip;
+    float clearCoat = 0, clearCoatRoughness = 0; // format version 21
+    MaterialLayers layers; // format version 22
+    float surfaceAlpha = 1; // base-color tint alpha, format version 26
 };
 
 struct PlayLight {
@@ -40,6 +44,7 @@ struct PlayLight {
     Point3 spotDirection{0,0,-1};
     float spotAngle = 0;
     float spotBlend = 0.15f;
+    Point3 color{1,1,1}; // scene-linear lamp tint, format 29
 };
 
 struct PlayableScene {
@@ -64,9 +69,11 @@ struct PlayableScene {
     bool temporalAntiAliasing = true;
     // Ground-truth ambient occlusion darkens sky light in creases, corners and openings.
     bool ambientOcclusion = true;
+    bool probeGi = false, screenSpaceGi = false, reflectionProbes = false; // format 27
     // The physically based atmosphere (Engine/Render/Atmosphere.h) instead of the horizon and zenith gradient
     // (format version 15).
     bool physicalSky = false;
+    Weather weather; // format 28
     // Bloom: light scattered around bright areas, as a camera lens does (format version 16 when off).
     bool bloom = true;
     // Screen-space reflections: glossy surfaces reflect what the previous frame shows (format version 19 when off).

@@ -6,7 +6,7 @@
 //   the camera matrices.
 // - Clamp: the history is clipped to the colour spread of this pixel's 3x3 neighbourhood (variance
 //   clipping in YCoCg), which rejects history that no longer matches, such as newly revealed surfaces.
-//   Still frames skip the clamp so the result is an exact average of the jittered samples.
+//   Still frames average jittered samples at the same pixel without reprojection or clamping.
 layout(set = 0, binding = 0) uniform sampler2D scene;   // this frame, nearest
 layout(set = 0, binding = 1) uniform sampler2D depth;   // this frame, nearest
 layout(set = 0, binding = 2) uniform sampler2D history; // the previous resolve, bilinear
@@ -16,7 +16,7 @@ layout(set = 0, binding = 5) uniform sampler2D albedo;   // diffuse albedo and f
 layout(set = 0, binding = 6) uniform sampler2D surfaceMotion; // each surface's own motion in the previous frame's UV, nearest
 layout(push_constant) uniform Temporal {
     mat4 reprojection; // this frame's clip space to the previous frame's clip space
-    vec4 settings;     // weight of this frame, history valid, clamp history, ambient occlusion on
+    vec4 settings;     // weight, history valid, reproject history, ambient resolution (0 off, 1 full, 2 half)
 } taa;
 // RGB: the resolved light. Alpha: this frame's depth along the camera's forward axis at the pixel (from the scene's
 // sky-light target; 0 for sky), which the next frame's screen-space reflections trace against.
@@ -47,7 +47,29 @@ vec3 sceneAt(ivec2 pixel)
 {
     vec3 light = texelFetch(scene,pixel,0).rgb;
     if (taa.settings.w > 0.5) {
-        vec4 nearby = texelFetch(ambient,pixel,0);
+        vec4 nearby;
+        if (taa.settings.w > 1.5) {
+            // Half resolution: each ambient texel was traced at full-resolution pixel 2 * texel + 1. Of the four
+            // nearest, take the one whose surface depth is closest to this pixel's, so lighting gathered on the other
+            // side of a depth edge is not used here, while pixels along the edge keep their own occlusion.
+            ivec2 size = textureSize(depth,0);
+            ivec2 halfSize = (size+1)/2;
+            ivec2 halfPixel = pixel/2;
+            ivec2 toward = ivec2((pixel.x&1) == 0 ? -1 : 1,(pixel.y&1) == 0 ? -1 : 1);
+            float here = texelFetch(depth,pixel,0).r;
+            nearby = vec4(0.0,0.0,0.0,1.0);
+            float closest = 2.0;
+            for (int i = 0; i < 4 && here < 1.0; ++i) {
+                ivec2 candidate = clamp(halfPixel+toward*ivec2(i&1,i>>1),ivec2(0),halfSize-1);
+                float sampled = texelFetch(depth,min(2*candidate+ivec2(1),size-1),0).r;
+                if (sampled < 1.0 && abs(here-sampled) < closest) {
+                    closest = abs(here-sampled);
+                    nearby = texelFetch(ambient,candidate,0);
+                }
+            }
+        } else {
+            nearby = texelFetch(ambient,pixel,0);
+        }
         vec4 surface = texelFetch(albedo,pixel,0);
         light += surface.rgb*nearby.rgb*surface.a-texelFetch(indirect,pixel,0).rgb*(1.0-nearby.a);
     }
@@ -62,6 +84,14 @@ void main()
     float depthAlong = texelFetch(indirect,pixel,0).a;
     if (taa.settings.y < 0.5 || taa.settings.x >= 1.0) {
         color = vec4(current,depthAlong);
+        return;
+    }
+    float weight = taa.settings.x;
+    if (taa.settings.z < 0.5) {
+        // Consecutive still frames already share a pixel grid. A matrix round trip and bilinear
+        // filtering here can blur distant edges, where depth reconstruction loses precision.
+        vec3 past = texelFetch(history,pixel,0).rgb;
+        color = vec4(mix(past,current,weight),depthAlong);
         return;
     }
     vec3 sum = vec3(0.0), squares = vec3(0.0);
@@ -89,18 +119,11 @@ void main()
         return;
     }
     vec3 past = max(texture(history,previousUv).rgb,vec3(0.0));
-    if (taa.settings.z > 0.5) {
-        vec3 mean = sum/9.0;
-        vec3 deviation = sqrt(max(squares/9.0-mean*mean,vec3(0.0)));
-        past = fromYCoCg(clipToBox(toYCoCg(past),mean,1.25*deviation));
-    }
+    vec3 mean = sum/9.0;
+    vec3 deviation = sqrt(max(squares/9.0-mean*mean,vec3(0.0)));
+    past = fromYCoCg(clipToBox(toYCoCg(past),mean,1.25*deviation));
     // Weighting by inverse brightness keeps single bright samples from flickering through the average.
-    float weight = taa.settings.x;
-    if (taa.settings.z > 0.5) {
-        float currentWeight = weight/(1.0+dot(current,vec3(0.2126,0.7152,0.0722)));
-        float pastWeight = (1.0-weight)/(1.0+dot(past,vec3(0.2126,0.7152,0.0722)));
-        color = vec4((current*currentWeight+past*pastWeight)/max(currentWeight+pastWeight,1e-6),depthAlong);
-    } else {
-        color = vec4(mix(past,current,weight),depthAlong);
-    }
+    float currentWeight = weight/(1.0+dot(current,vec3(0.2126,0.7152,0.0722)));
+    float pastWeight = (1.0-weight)/(1.0+dot(past,vec3(0.2126,0.7152,0.0722)));
+    color = vec4((current*currentWeight+past*pastWeight)/max(currentWeight+pastWeight,1e-6),depthAlong);
 }

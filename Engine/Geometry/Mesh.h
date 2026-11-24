@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Engine/Render/MaterialLayers.h"
+
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -43,18 +45,32 @@ struct MeshMaterial {
     std::vector<std::uint8_t> normalTexture, metallicRoughnessTexture, occlusionTexture, emissiveTexture;
     Point3 emissive{};
     std::string sharedMaterialId;
+    float clearCoat = 0, clearCoatRoughness = 0;
+    MaterialLayers layers;
+    std::array<std::vector<std::uint8_t>,LayerMapCount> layerMaps;
     bool hasAdvancedSurface() const {
         return metallic != 0 || roughness != 0.65f || emissive != Point3{}
+            || clearCoat != 0 || clearCoatRoughness != 0 || layers != MaterialLayers{}
             || !normalTexture.empty() || !metallicRoughnessTexture.empty()
-            || !occlusionTexture.empty() || !emissiveTexture.empty();
+            || !occlusionTexture.empty() || !emissiveTexture.empty()
+            || std::ranges::any_of(layerMaps,[](const auto &map) { return !map.empty(); });
     }
     auto previewTextures() const {
-        return std::array{&baseColorTexture,&normalTexture,&metallicRoughnessTexture,&occlusionTexture,&emissiveTexture};
+        return textures(*this);
     }
     auto previewTextures() {
-        return std::array{&baseColorTexture,&normalTexture,&metallicRoughnessTexture,&occlusionTexture,&emissiveTexture};
+        return textures(*this);
     }
     bool operator==(const MeshMaterial &) const = default;
+private:
+    template<class Material>
+    static auto textures(Material &slot) -> std::array<decltype(&slot.baseColorTexture),materialTextureCount> {
+        std::array<decltype(&slot.baseColorTexture),materialTextureCount> result{
+            &slot.baseColorTexture,&slot.normalTexture,&slot.metallicRoughnessTexture,&slot.occlusionTexture,&slot.emissiveTexture};
+        for (std::size_t i = 0; i < slot.layerMaps.size(); ++i)
+            result[baseMaterialTextureCount+i] = &slot.layerMaps[i];
+        return result;
+    }
 };
 
 struct Mesh {

@@ -1,4 +1,5 @@
 #include "Workspaces/SurfaceWorkspace.h"
+#include "Components/MaterialLayerControls.h"
 
 #include "Components/LiveViewport.h"
 #include "State/ProjectStore.h"
@@ -59,12 +60,6 @@ void drawUvLayout(QPainter &painter,const wf::Mesh &mesh,int slot,const QRectF &
         painter.setPen(QPen(QColor("#d6b4ff"),1));
         painter.drawPolygon(polygon);
     }
-}
-
-QStringList channelNames()
-{
-    return {QObject::tr("Base Color"),QObject::tr("Normal"),QObject::tr("Metallic / Roughness"),
-        QObject::tr("Ambient Occlusion"),QObject::tr("Emissive")};
 }
 
 QImage decode(QImageReader &reader,int limit,QSize *original = nullptr)
@@ -357,18 +352,26 @@ SurfaceWorkspace::SurfaceWorkspace(ProjectStore &store,bool textureWorkspace,QWi
     auto *mapLayout = new QVBoxLayout(maps);
     mapLayout->setContentsMargins(4,4,4,4);
     mapLayout->addWidget(new QLabel(tr("Texture Maps"),maps));
+    auto *mapScroll = new QScrollArea(maps);
+    mapScroll->setWidgetResizable(true);
+    auto *mapList = new QWidget(mapScroll);
+    auto *mapButtons = new QVBoxLayout(mapList);
+    mapButtons->setContentsMargins(0,0,0,0);
+    mapScroll->setWidget(mapList);
+    mapLayout->addWidget(mapScroll,1);
     auto *picker = new QButtonGroup(maps);
-    const auto names = channelNames();
+    const auto names = materialMapNames();
     for (int i = 0; i < int(channels_.size()); ++i) {
-        auto *button = channels_[i] = new QToolButton(maps);
+        auto *button = channels_[i] = new QToolButton(mapList);
         button->setText(names[i]);
         button->setAccessibleName(names[i]);
         button->setCheckable(true);
         button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
         button->setIconSize({48,42});
-        mapLayout->addWidget(button);
+        mapButtons->addWidget(button);
         picker->addButton(button,i);
     }
+    mapButtons->addStretch(1);
     channels_[0]->setChecked(true);
     imageInfo_ = new QLabel(maps);
     imageInfo_->setWordWrap(true);
@@ -380,7 +383,6 @@ SurfaceWorkspace::SurfaceWorkspace(ProjectStore &store,bool textureWorkspace,QWi
     mapLayout->addWidget(import_);
     mapLayout->addWidget(exportMap_);
     mapLayout->addWidget(remove_);
-    mapLayout->addStretch(1);
 
     auto *views = new QSplitter(Qt::Horizontal,split_);
     views->setChildrenCollapsible(false);
@@ -488,7 +490,9 @@ SurfaceWorkspace::SurfaceWorkspace(ProjectStore &store,bool textureWorkspace,QWi
     metallic_ = new QDoubleSpinBox(properties);
     roughness_ = new QDoubleSpinBox(properties);
     emission_ = new QDoubleSpinBox(properties);
-    for (auto *field : {metallic_,roughness_,emission_}) {
+    clearCoat_ = new QDoubleSpinBox(properties);
+    coatRoughness_ = new QDoubleSpinBox(properties);
+    for (auto *field : {metallic_,roughness_,emission_,clearCoat_,coatRoughness_}) {
         field->setRange(0,1);
         field->setDecimals(3);
         field->setSingleStep(0.05);
@@ -496,8 +500,14 @@ SurfaceWorkspace::SurfaceWorkspace(ProjectStore &store,bool textureWorkspace,QWi
     metallic_->setAccessibleName(tr("Surface metallic"));
     roughness_->setAccessibleName(tr("Surface roughness"));
     emission_->setAccessibleName(tr("Surface emission"));
+    clearCoat_->setAccessibleName(tr("Clear coat weight"));
+    coatRoughness_->setAccessibleName(tr("Clear coat roughness"));
     form->addRow(tr("Metallic"),metallic_);
     form->addRow(tr("Roughness"),roughness_);
+    form->addRow(tr("Clear coat weight"),clearCoat_);
+    form->addRow(tr("Clear coat roughness"),coatRoughness_);
+    layers_ = new MaterialLayerControls(properties);
+    form->addRow(layers_);
     form->addRow(tr("Emission"),emission_);
     apply_ = new QPushButton(tr("Apply Material"),properties);
     link_ = new QPushButton(tr("Link Existing Material…"),properties);
@@ -619,12 +629,16 @@ void SurfaceWorkspace::refreshSlot()
     const int index = slot_->currentIndex();
     const auto *material = asset && index >= 0 && std::size_t(index) < asset->mesh->materials.size()
         ? &asset->mesh->materials[index] : nullptr;
-    for (auto *control : std::array<QWidget *,8>{name_,metallic_,roughness_,emission_,color_,apply_,import_,link_})
+    for (auto *control : std::array<QWidget *,10>{name_,metallic_,roughness_,emission_,clearCoat_,coatRoughness_,color_,apply_,import_,link_})
         control->setEnabled(material != nullptr);
     refreshMaps();
     name_->setText(material ? QString::fromStdString(material->name) : QString{});
     metallic_->setValue(material ? material->metallic : 0);
     roughness_->setValue(material ? material->roughness : 0);
+    clearCoat_->setValue(material ? material->clearCoat : 0);
+    coatRoughness_->setValue(material ? material->clearCoatRoughness : 0);
+    layers_->setEnabled(material != nullptr);
+    layers_->setLayers(material ? material->layers : wf::MaterialLayers{});
     emission_->setValue(material ? *std::ranges::max_element(material->emissive) : 0);
     tint_ = material ? QColor::fromRgbF(std::clamp(material->color[0],0.0f,1.0f),
         std::clamp(material->color[1],0.0f,1.0f),std::clamp(material->color[2],0.0f,1.0f)) : QColor("#808080");
@@ -646,7 +660,7 @@ void SurfaceWorkspace::refreshMaps()
     const int index = slot_->currentIndex();
     const auto *material = asset && index >= 0 && std::size_t(index) < asset->mesh->materials.size()
         ? &asset->mesh->materials[index] : nullptr;
-    const auto names = channelNames();
+    const auto names = materialMapNames();
     QSize dimensions;
     for (int i = 0; i < int(channels_.size()); ++i) {
         images_[i] = {};
@@ -878,6 +892,9 @@ void SurfaceWorkspace::applyMaterial()
     material.color[2] = float(tint_.blueF());
     material.metallic = float(metallic_->value());
     material.roughness = float(roughness_->value());
+    material.clearCoat = float(clearCoat_->value());
+    material.clearCoatRoughness = float(coatRoughness_->value());
+    material.layers = layers_->layers();
     const auto previous = *std::ranges::max_element(material.emissive);
     const auto emission = float(emission_->value());
     for (auto &value : material.emissive)

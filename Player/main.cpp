@@ -2,6 +2,7 @@
 #include "Player/PlayerRender.h"
 #include "Player/WorldShaders.h"
 #include "Player/ReferenceScene.h"
+#include "Engine/Render/CameraProjection.h"
 #include "Engine/Render/ColorPipeline.h"
 #include "Engine/Render/SkyLight.h"
 #ifdef WORLDFORGE_PLAYER_VULKAN
@@ -20,6 +21,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -27,7 +29,9 @@
 #include <fstream>
 #include <memory>
 #include <numeric>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <string_view>
 
 extern "C" {
@@ -52,6 +56,7 @@ using wf::player::MaterialDraw;
 using wf::player::DrawRange;
 using wf::player::Image;
 using wf::player::Renderer;
+using wf::player::RenderStats;
 using wf::player::ReferenceCamera;
 using wf::player::writeReference;
 
@@ -527,25 +532,39 @@ public:
     int uploadTextures(Renderer &renderer,std::vector<Image> *decoded = nullptr)
     {
         int failed = 0;
+        fixedMeshLayout_ = std::ranges::none_of(playable_.meshes,[](const wf::PlayMesh &mesh) { return !mesh.lodVertices.empty(); });
+        meshOffsets_.clear();
         materials_.clear();
         textured_ = 0;
         surfaceMaps_ = 0;
+        // Playable files embed maps in each material. Reuse the decoded GPU texture for identical bytes.
+        std::unordered_map<std::string_view,int> uploaded;
         for (const auto &mesh : playable_.meshes) {
             MaterialDraw material;
             material.advanced = mesh.advancedSurface;
             material.metallic = mesh.metallic;
             material.roughness = mesh.roughness;
+            material.clearCoat = mesh.clearCoat;
+            material.clearCoatRoughness = mesh.clearCoatRoughness;
+            material.layers = mesh.layers;
+            material.surfaceAlpha = mesh.surfaceAlpha;
             material.emissive = mesh.emissive;
             for (std::size_t i = 0; i < material.textures.size(); ++i) {
                 const auto &bytes = i == 0 ? mesh.baseColorTexture : mesh.surfaceMaps[i-1];
                 if (bytes.empty())
                     continue;
-                auto image = decodeImage(bytes);
-                material.textures[i] = renderer.addTexture(image);
-                if (decoded && material.textures[i] >= 0) {
-                    decoded->resize(std::max(decoded->size(),std::size_t(material.textures[i])+1));
-                    (*decoded)[std::size_t(material.textures[i])] = std::move(image);
+                const std::string_view source(reinterpret_cast<const char *>(bytes.data()),bytes.size());
+                const auto [entry,newTexture] = uploaded.try_emplace(source,-1);
+                if (newTexture) {
+                    auto image = decodeImage(bytes);
+                    entry->second = renderer.addTexture(image);
+                    if (decoded && entry->second >= 0) {
+                        const auto index = std::size_t(entry->second);
+                        decoded->resize(std::max(decoded->size(),index+1));
+                        (*decoded)[index] = std::move(image);
+                    }
                 }
+                material.textures[i] = entry->second;
                 failed += material.textures[i] < 0;
                 surfaceMaps_ += i > 0 && material.textures[i] >= 0;
             }
@@ -578,13 +597,26 @@ public:
 
     // The realism check compares lighting and materials without fog, which Cycles would need a volume for.
     // The Cycles reference has no fog and no lens: compare the scene's light alone.
-    void clearFog()
+    void clearReferenceEffects()
     {
         playable_.fogDensity = 0;
         playable_.localFogRadius = 0;
         playable_.localFogDensity = 0;
+        playable_.weather = {};
         playable_.bloom = false;
         playable_.depthOfField = playable_.motionBlur = false;
+    }
+
+    bool setSunElevation(float elevation)
+    {
+        const auto sun = std::ranges::find(playable_.lights,true,&wf::PlayLight::directional);
+        if (sun == playable_.lights.end())
+            return false;
+        const auto azimuth = std::atan2(sun->vector[1],sun->vector[0]);
+        const auto angle = XMConvertToRadians(elevation);
+        sun->vector = {std::cos(azimuth)*std::cos(angle),std::sin(azimuth)*std::cos(angle),std::sin(angle)};
+        skyLight_.reset();
+        return true;
     }
 
     wf::BoxBody &player() { return playable_.simulation.bodies[playable_.player]; }
@@ -614,7 +646,7 @@ public:
         const auto direction = XMVector3Normalize(XMVectorSubtract(eye,target));
         const auto up = std::abs(XMVectorGetZ(direction)) > 0.99995f ? XMVectorSet(0,1,0,0) : XMVectorSet(0,0,1,0);
         const auto projection = XMMatrixLookAtRH(eye,target,up)
-            * XMMatrixPerspectiveFovRH(XM_PIDIV4,aspect,0.05f,1800);
+            * XMMatrixPerspectiveFovRH(wf::camera::verticalFovRadians,aspect,wf::camera::nearPlane,wf::camera::farPlane);
         XMStoreFloat4x4(&view.viewProjection,projection);
         XMStoreFloat4x4(&view.inverseProjection,XMMatrixInverse(nullptr,projection));
         view.eye = parameter(point(eye),0);
@@ -631,10 +663,12 @@ public:
                 continue;
             }
             if (light.intensity > 0)
-                sceneLights_.push_back({{light.vector[0],light.vector[1],light.vector[2]},light.intensity,{1,1,1},light.directional,
+                sceneLights_.push_back({{light.vector[0],light.vector[1],light.vector[2]},light.intensity,light.color,light.directional,
                                         light.spotDirection,light.spotAngle,light.spotBlend});
             if (view.eye.w < 16 && light.intensity > 0) {
-                view.lights[int(view.eye.w)] = parameter(light.vector,light.directional ? -light.intensity : light.intensity);
+                const int lightIndex = int(view.eye.w);
+                view.lights[lightIndex] = parameter(light.vector,light.directional ? -light.intensity : light.intensity);
+                view.lightColors[lightIndex] = parameter(light.color,0);
                 ++view.eye.w;
             }
         }
@@ -660,35 +694,58 @@ public:
         }
         view.authoredSun = view.sun.w;
         view.bloom = playable_.bloom ? wf::color::bloomStrength : 0.0f;
-        view.lens = {playable_.depthOfField ? 1.0f : 0.0f,playable_.focusDistance,playable_.fNumber,XM_PIDIV4};
+        view.lens = {playable_.depthOfField ? 1.0f : 0.0f,playable_.focusDistance,playable_.fNumber,wf::camera::verticalFovRadians};
         view.shutter = {playable_.motionBlur ? 1.0f : 0.0f,playable_.shutter,playable_.reflections ? 1.0f : 0.0f,
                        playable_.contactShadows ? 1.0f : 0.0f};
+        view.probeGi = playable_.probeGi;
+        view.movingGeometry = std::ranges::any_of(playable_.meshes,[](const wf::PlayMesh &mesh) {
+            return mesh.body >= 0 || mesh.clip.has_value();
+        }) ? 1u : 0u;
+        view.screenSpaceGi = playable_.screenSpaceGi;
+        view.reflectionProbes = playable_.reflectionProbes;
+        if (fixedMeshLayout_ && !meshOffsets_.empty()) {
+            view.cachedMeshVertices = meshOffsets_.back();
+            view.movingVertices = &movingVertices_;
+        }
         // The physical sky's sun reaches the ground dimmer and warmer than overhead.
         const auto &sunLight = skyLight_->sunLight;
         const float sunLuminance = 0.2126f*sunLight[0]+0.7152f*sunLight[1]+0.0722f*sunLight[2];
-        view.sun.w = sunLuminance;
+        const float clouds = playable_.physicalSky ? playable_.weather.cloudsAt(clipTime_) : 0;
+        view.weather = {playable_.physicalSky ? playable_.weather.haze : 0,clouds,0,0};
+        view.sun.w = sunLuminance*wf::cloudSunTransmission(clouds);
+        view.lighting.y = playable_.shadows && view.sun.w > 0 ? 1.0f : 0.0f;
         view.sunTint = sunLuminance > 0 ? XMFLOAT4{sunLight[0]/sunLuminance,sunLight[1]/sunLuminance,sunLight[2]/sunLuminance,0}
                                         : XMFLOAT4{1,1,1,0};
         view.skyEnvironment = &skyLight_->environment;
         view.skyRevision = skyRevision_;
         view.sceneLights = &sceneLights_;
-        for (std::size_t i = 0; i < 9; ++i)
-            view.skyIrradiance[i] = {skyLight_->irradiance[i][0],skyLight_->irradiance[i][1],skyLight_->irradiance[i][2],0};
-        view.skyHorizon = parameter(skyLight_->horizon,0);
-        view.skyZenith = parameter(skyLight_->zenith,0);
+        for (std::size_t i = 0; i < 9; ++i) {
+            const float scale = wf::cloudSkyScale(clouds,i == 0);
+            view.skyIrradiance[i] = {scale*skyLight_->irradiance[i][0],scale*skyLight_->irradiance[i][1],
+                                    scale*skyLight_->irradiance[i][2],0};
+        }
+        view.skyHorizon = parameter(skyLight_->horizon,skyLight_->sunDiscStrength*wf::cloudSunTransmission(clouds));
+        view.skyZenith = parameter(skyLight_->zenith,skyLight_->sunHorizon);
         view.skyGround = parameter(skyLight_->ground,0);
         return view;
     }
 
     const std::vector<wf::PlayVertex> &vertices()
     {
-        vertices_.clear();
-        ranges_.clear();
-        const auto mark = [this](std::size_t start,const MaterialDraw &material) {
+        const bool cached = fixedMeshLayout_ && !meshOffsets_.empty();
+        if (cached) {
+            vertices_.resize(meshOffsets_.back());
+            ranges_.resize(meshRangeCount_);
+        } else {
+            vertices_.clear();
+            ranges_.clear();
+        }
+        movingVertices_.clear();
+        const auto mark = [this](std::size_t start,const MaterialDraw &material,bool separate = false) {
             const auto count = vertices_.size()-start;
             if (!count)
                 return;
-            if (!ranges_.empty() && ranges_.back().material == material
+            if (!separate && !ranges_.empty() && ranges_.back().material == material
                 && ranges_.back().start+ranges_.back().count == UINT(start))
                 ranges_.back().count += UINT(count);
             else
@@ -697,7 +754,11 @@ public:
         const auto &world = playable_.simulation;
         for (std::size_t index = 0; index < playable_.meshes.size(); ++index) {
             const auto &mesh = playable_.meshes[index];
-            const auto start = vertices_.size();
+            const auto start = cached ? meshOffsets_[index] : vertices_.size();
+            if (fixedMeshLayout_ && !cached)
+                meshOffsets_.push_back(start);
+            if (cached && mesh.body < 0 && !mesh.clip)
+                continue;
             const auto material = index < materials_.size() ? materials_[index] : MaterialDraw{};
             auto origin = vector(mesh.lodOrigin);
             if (!mesh.lodVertices.empty() && mesh.body >= 0) {
@@ -714,6 +775,12 @@ public:
                 continue;
             }
             const auto *body = mesh.body >= 0 ? &world.bodies[mesh.body] : nullptr;
+            if (fixedMeshLayout_ && !vertices.empty()) {
+                if (!movingVertices_.empty() && movingVertices_.back().first+movingVertices_.back().count == start)
+                    movingVertices_.back().count += vertices.size();
+                else
+                    movingVertices_.push_back({start,vertices.size()});
+            }
             const auto rotation = body ? XMVectorSet(body->rotation[0],body->rotation[1],body->rotation[2],body->rotation[3])
                 : XMQuaternionIdentity();
             const auto phase = mesh.clip ? mesh.clip->phase(clipTime_) : wf::MeshClip::Sample{};
@@ -731,11 +798,19 @@ public:
                     v.position = point(XMVectorAdd(XMVector3Rotate(vector(v.position),rotation),vector(body->position)));
                     v.normal = point(XMVector3Rotate(vector(v.normal),rotation));
                 }
-                vertices_.push_back(v);
+                if (cached)
+                    vertices_[start+i] = v;
+                else
+                    vertices_.push_back(v);
             }
-            mark(start,material);
+            if (!cached)
+                mark(start,material);
         }
         const auto terrainStart = vertices_.size();
+        if (fixedMeshLayout_ && !cached) {
+            meshOffsets_.push_back(terrainStart);
+            meshRangeCount_ = ranges_.size();
+        }
         for (const auto *beacons : {&playable_.gameplay.beacons,&playable_.gameplay.behaviorBeacons})
             for (const auto &beacon : *beacons) {
                 if (beacon.remaining <= 0)
@@ -771,7 +846,7 @@ public:
                     vertices_.insert(vertices_.end(),chunk.begin(),chunk.end());
                 }
         }
-        mark(terrainStart,{});
+        mark(terrainStart,{},fixedMeshLayout_);
         return vertices_;
     }
     const std::vector<DrawRange> &ranges() const { return ranges_; }
@@ -794,6 +869,10 @@ private:
     std::vector<std::array<std::vector<wf::PlayVertex>,wf::Heightfield::chunks*wf::Heightfield::chunks>> chunks_;
     std::vector<wf::PlayVertex> vertices_;
     std::vector<DrawRange> ranges_;
+    std::vector<std::size_t> meshOffsets_;
+    std::vector<wf::player::VertexUpload> movingVertices_;
+    std::size_t meshRangeCount_ = 0;
+    bool fixedMeshLayout_ = false;
     std::vector<MaterialDraw> materials_;
     int surfaceMaps_ = 0;
     double clipTime_ = 0;
@@ -903,10 +982,120 @@ struct StreetRun {
 };
 }
 
+// The city-scale benchmark (--verify-district): a fixed camera route through the scene, first along its outer ring road
+// at eye height, then circling over the rooftops toward the center. It records frame times, what each frame submitted
+// and memory, for each half of the route and overall.
+struct DistrictRun {
+    static constexpr int warmUpFrames = 30, routeFrames = 1500;
+    float inset = 5, rooftop = 60;
+    std::array<float,3> minimum{}, maximum{};
+    std::vector<double> frameMs, cpuMs, streetMs, rooftopMs;
+    std::uint64_t sceneDraws = 0, depthDraws = 0, sceneTriangles = 0, depthTriangles = 0;
+    std::uint64_t rejectedOpaqueDraws = 0, rejectedOpaqueTriangles = 0, occludedOpaqueDraws = 0;
+    std::uint64_t pointShadowFaces = 0;
+    std::size_t compactedShadowFrames = 0;
+    std::uint64_t meshletShaderGroups = 0, meshletIndexedDraws = 0;
+    std::size_t promotedTextures = 0, peakTextureDetail = 0;
+    uint32_t longestTextureWait = 0;
+    double longestTextureStall = 0;
+    std::uint32_t peakSceneDraws = 0;
+    // GPU time per pass (RenderStats::gpuMs), summed over the street and rooftop halves of the route.
+    std::array<double,RenderStats::passCount> streetGpu{}, rooftopGpu{};
+    std::size_t streetFrames = 0, rooftopFrames = 0;
+
+    // The camera at fraction t of the route, and where it looks.
+    std::pair<XMVECTOR,XMVECTOR> camera(float t) const
+    {
+        const float x0 = minimum[0]+inset, x1 = maximum[0]-inset, y0 = minimum[1]+inset, y1 = maximum[1]-inset;
+        const XMVECTOR center = XMVectorSet((minimum[0]+maximum[0])/2,(minimum[1]+maximum[1])/2,0,0);
+        if (t < 0.6f) {
+            // Once around the ring road, counterclockwise, looking down the road ahead.
+            const float perimeter = 2*(x1-x0)+2*(y1-y0);
+            float along = t/0.6f*perimeter;
+            const auto at = [&](float distance) {
+                distance = std::fmod(distance,perimeter);
+                if (distance < x1-x0) return XMVectorSet(x0+distance,y0,1.7f,0);
+                distance -= x1-x0;
+                if (distance < y1-y0) return XMVectorSet(x1,y0+distance,1.7f,0);
+                distance -= y1-y0;
+                if (distance < x1-x0) return XMVectorSet(x1-distance,y1,1.7f,0);
+                return XMVectorSet(x0,y1-(distance-(x1-x0)),1.7f,0);
+            };
+            return {at(along),XMVectorAdd(at(along+12),XMVectorSet(0,0,-0.2f,0))};
+        }
+        // Climbing over the rooftops while circling the center, which keeps the whole district in view.
+        const float s = (t-0.6f)/0.4f;
+        const float radius = 0.45f*std::max(maximum[0]-minimum[0],maximum[1]-minimum[1]);
+        const float angle = -XM_PIDIV2+s*XM_2PI;
+        const float height = 1.7f+(rooftop-1.7f)*std::min(1.0f,s*4);
+        return {XMVectorSet(XMVectorGetX(center)+radius*std::cos(angle),XMVectorGetY(center)+radius*std::sin(angle),height,0),
+                center};
+    }
+    bool write(const std::filesystem::path &file,const Renderer &renderer,const Scene &scene) const
+    {
+        PROCESS_MEMORY_COUNTERS_EX memory{};
+        memory.cb = sizeof(memory);
+        GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&memory),sizeof(memory));
+        const auto average = [](const std::vector<double> &values) {
+            return values.empty() ? 0.0 : std::accumulate(values.begin(),values.end(),0.0)/double(values.size());
+        };
+        const auto percentile = StreetRun::percentile;
+        const double frames = double(std::max<std::size_t>(frameMs.size(),1));
+        const auto gpuJson = [](const std::array<double,RenderStats::passCount> &totals,std::size_t count) {
+            const char *names[RenderStats::passCount]{"sunShadows","skyMaps","pointShadows","scene","postProcess"};
+            std::ostringstream json;
+            json << '{';
+            for (std::size_t pass = 0; pass < totals.size(); ++pass)
+                json << (pass ? ", " : "") << '"' << names[pass] << "\": " << totals[pass]/double(std::max<std::size_t>(count,1));
+            json << '}';
+            return json.str();
+        };
+        std::size_t vertices = 0;
+        for (const auto &mesh : scene.playable().meshes)
+            vertices += mesh.vertices.size();
+        std::ofstream out(file);
+        out << "{\n  \"adapter\": \"" << escape(utf8(renderer.adapterName())) << "\",\n"
+            << "  \"renderer\": \"" << renderer.api() << "\",\n"
+            << "  \"frames\": " << frameMs.size() << ",\n"
+            << "  \"meshes\": " << scene.playable().meshes.size() << ",\n"
+            << "  \"lights\": " << scene.playable().lights.size() << ",\n"
+            << "  \"vertices\": " << vertices << ",\n"
+            << "  \"frameMs\": {\"average\": " << average(frameMs) << ", \"p95\": " << percentile(frameMs,0.95)
+            << ", \"p99\": " << percentile(frameMs,0.99) << ", \"max\": " << percentile(frameMs,1) << "},\n"
+            << "  \"streetMs\": {\"average\": " << average(streetMs) << ", \"p95\": " << percentile(streetMs,0.95) << "},\n"
+            << "  \"rooftopMs\": {\"average\": " << average(rooftopMs) << ", \"p95\": " << percentile(rooftopMs,0.95) << "},\n"
+            << "  \"cpuMs\": {\"average\": " << average(cpuMs) << ", \"p95\": " << percentile(cpuMs,0.95)
+            << ", \"max\": " << percentile(cpuMs,1) << "},\n"
+            << "  \"sceneDraws\": {\"average\": " << double(sceneDraws)/frames << ", \"max\": " << peakSceneDraws << "},\n"
+            << "  \"sceneTriangles\": " << double(sceneTriangles)/frames << ",\n"
+            << "  \"visibleSceneDraws\": " << (double(sceneDraws)-double(rejectedOpaqueDraws))/frames << ",\n"
+            << "  \"visibleSceneTriangles\": " << (double(sceneTriangles)-double(rejectedOpaqueTriangles))/frames << ",\n"
+            << "  \"rejectedOpaqueDraws\": " << double(rejectedOpaqueDraws)/frames << ",\n"
+            << "  \"occludedOpaqueDraws\": " << double(occludedOpaqueDraws)/frames << ",\n"
+            << "  \"rejectedOpaqueTriangles\": " << double(rejectedOpaqueTriangles)/frames << ",\n"
+            << "  \"pointShadowFacesPerFrame\": " << double(pointShadowFaces)/frames << ",\n"
+            << "  \"compactedShadowFrames\": " << compactedShadowFrames << ",\n"
+            << "  \"meshletShaderGroups\": " << meshletShaderGroups << ", \"meshletIndexedDraws\": " << meshletIndexedDraws << ",\n"
+            << "  \"textureStreaming\": {\"promotions\": " << promotedTextures << ", \"longestWaitFrames\": " << longestTextureWait
+            << ", \"peakDetailBytes\": " << peakTextureDetail << ", \"longestStallMs\": " << longestTextureStall << "},\n"
+            << "  \"depthDraws\": " << double(depthDraws)/frames << ",\n"
+            << "  \"depthTriangles\": " << double(depthTriangles)/frames << ",\n"
+            << "  \"gpuMs\": {\"street\": " << gpuJson(streetGpu,streetFrames) << ", \"rooftop\": "
+            << gpuJson(rooftopGpu,rooftopFrames) << "},\n"
+            << "  \"workingSetMiB\": " << double(memory.WorkingSetSize)/1048576
+            << ",\n  \"peakWorkingSetMiB\": " << double(memory.PeakWorkingSetSize)/1048576
+            << ",\n  \"privateMiB\": " << double(memory.PrivateUsage)/1048576 << "\n}\n";
+        return bool(out);
+    }
+};
+
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
 {
     int argc = 0;
     auto **args = CommandLineToArgvW(GetCommandLineW(),&argc);
+    const bool directDraws = argc > 1 && std::wstring_view(args[argc-1]) == L"--direct";
+    if (directDraws)
+        --argc;
     std::filesystem::path module;
     if (argc >= 4 && std::wstring_view(args[argc-2]) == L"--module") {
         module = args[argc-1];
@@ -916,12 +1105,18 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
     const bool smoke = software || (argc == 3 && std::wstring_view(args[1]) == L"--smoke-test");
     const bool packagedStreet = argc == 3 && std::wstring_view(args[1]) == L"--verify-packaged-street";
     const bool street = packagedStreet || (argc == 4 && std::wstring_view(args[1]) == L"--verify-street");
+    // --verify-district <scene> <report> <inset> <rooftop> flies the city-scale benchmark route (DistrictRun): the ring road
+    // runs inset meters inside the scene's bounds, and the camera then circles at rooftop meters.
+    const bool districtRun = argc == 6 && std::wstring_view(args[1]) == L"--verify-district";
     // --capture <scene> <png> <width> <height> <eye x y z> <target x y z> renders one frame off screen.
     // --reference takes the same arguments with a folder in place of the PNG: it writes the frame without fog as
     // engine.png, plus the scene description that Tests/CyclesReference.py renders with Cycles.
     const bool reference = argc == 12 && std::wstring_view(args[1]) == L"--reference";
-    const bool capture = reference || (argc == 12 && std::wstring_view(args[1]) == L"--capture");
-    const bool scripted = smoke || street || capture;
+    // --verify-sunrise uses the same camera arguments and writes a meter sweep and key frames to a folder.
+    const bool sunrise = argc == 12 && std::wstring_view(args[1]) == L"--verify-sunrise";
+    const bool sunset = argc == 12 && std::wstring_view(args[1]) == L"--verify-sunset";
+    const bool capture = sunrise || sunset || reference || (argc == 12 && std::wstring_view(args[1]) == L"--capture");
+    const bool scripted = smoke || street || capture || districtRun;
     std::filesystem::path capturePath;
     UINT captureWidth = 0, captureHeight = 0;
     std::array<float,6> captureCamera{};
@@ -933,7 +1128,13 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
             captureCamera[i] = float(_wtof(args[6+i]));
     }
     auto file = argc >= 2 && !packagedStreet ? std::filesystem::path(args[scripted ? 2 : 1]) : std::filesystem::path();
-    const auto reportFile = street ? std::filesystem::path(args[packagedStreet ? 2 : 3]) : std::filesystem::path();
+    const auto reportFile = street ? std::filesystem::path(args[packagedStreet ? 2 : 3])
+        : districtRun ? std::filesystem::path(args[3]) : std::filesystem::path();
+    DistrictRun district;
+    if (districtRun) {
+        district.inset = float(std::clamp(_wtof(args[4]),0.0,1000.0));
+        district.rooftop = float(std::clamp(_wtof(args[5]),2.0,2000.0));
+    }
     LocalFree(args);
     if (argc < 2 || packagedStreet) {
         wchar_t executable[32768]{};
@@ -963,6 +1164,20 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
     if (!playable)
         return fail(L"The playable scene could not be read. Export it from WorldForge Editor.");
     Scene scene(std::move(*playable));
+    if (districtRun) {
+        // The route follows the bounds of the static geometry.
+        district.minimum = {std::numeric_limits<float>::max(),std::numeric_limits<float>::max(),std::numeric_limits<float>::max()};
+        district.maximum = {std::numeric_limits<float>::lowest(),std::numeric_limits<float>::lowest(),std::numeric_limits<float>::lowest()};
+        for (const auto &mesh : scene.playable().meshes)
+            if (mesh.body < 0)
+                for (const auto &vertex : mesh.vertices)
+                    for (int axis = 0; axis < 3; ++axis) {
+                        district.minimum[axis] = std::min(district.minimum[axis],vertex.position[axis]);
+                        district.maximum[axis] = std::max(district.maximum[axis],vertex.position[axis]);
+                    }
+        if (district.minimum[0] > district.maximum[0])
+            return fail(L"The district has no static geometry to fly through.");
+    }
     if (!module.empty()) {
         std::string error;
         if (!scene.stageNative(module,error))
@@ -1008,10 +1223,38 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
         const auto eye = XMVectorSet(captureCamera[0],captureCamera[1],captureCamera[2],0);
         const auto target = XMVectorSet(captureCamera[3],captureCamera[4],captureCamera[5],0);
         if (reference)
-            scene.clearFog();
-        const auto view = scene.viewFrom(eye,target,float(captureWidth)/float(captureHeight),0);
-        Image image;
+            scene.clearReferenceEffects();
         const auto &vertices = scene.vertices();
+        const float aspect = float(captureWidth)/float(captureHeight);
+        if (sunrise || sunset) {
+            std::error_code error;
+            std::filesystem::create_directories(capturePath,error);
+            std::ofstream report(capturePath / L"meter.csv");
+            if (error || !report)
+                return 4;
+            report << "Elevation,Log2Luminance\n";
+            constexpr int steps = 90;
+            for (int frame = 0; frame <= steps; ++frame) {
+                const int sample = sunrise ? frame : steps-frame;
+                const float elevation = float(sample-30)/5;
+                if (!scene.setSunElevation(elevation))
+                    return 4;
+                const auto shown = scene.viewFrom(eye,target,aspect,0);
+                float meter = std::numeric_limits<float>::quiet_NaN();
+                Image frameImage;
+                if (!renderer->capture(vertices,scene.ranges(),shown,captureWidth,captureHeight,scene.sky(),frameImage,&meter)
+                    || !std::isfinite(meter))
+                    return 4;
+                report << elevation << ',' << meter << '\n';
+                if ((sample == 0 || sample == 30 || sample == steps)
+                    && !savePng(capturePath / (std::to_wstring(frame)+L".png"),frameImage))
+                    return 4;
+            }
+            return report ? 0 : 4;
+        }
+        auto view = scene.viewFrom(eye,target,aspect,0);
+        view.drawCulling = !directDraws;
+        Image image;
         if (!renderer->capture(vertices,scene.ranges(),view,captureWidth,captureHeight,scene.sky(),image))
             return 4;
         if (!reference)
@@ -1022,7 +1265,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
             if (!textures[i].pixels.empty() && !savePng(capturePath / (L"texture-" + std::to_wstring(i) + L".png"),textures[i]))
                 return 4;
         const ReferenceCamera camera{{captureCamera[0],captureCamera[1],captureCamera[2]},
-            {captureCamera[3],captureCamera[4],captureCamera[5]},XM_PIDIV4,captureWidth,captureHeight};
+            {captureCamera[3],captureCamera[4],captureCamera[5]},wf::camera::verticalFovRadians,captureWidth,captureHeight};
         std::string error;
         if (!savePng(capturePath / L"engine.png",image)
             || !writeReference(capturePath,vertices,scene.ranges(),view,camera,scene.sky(),0,error)) {
@@ -1123,8 +1366,10 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
                 run.seconds += wf::WorldSimulation::stepSeconds;
             } else {
                 const bool testJump = smoke && !testJumped && scene.player().grounded;
-                scene.tick(yaw,smoke ? int(frames >= 25) : int(down('W'))-int(down('S')),
-                    int(down('D'))-int(down('A')),jumpPending || testJump,interactPending);
+                // The district benchmark flies its own camera; the player stands still.
+                const bool keys = !districtRun;
+                scene.tick(yaw,smoke ? int(frames >= 25) : keys ? int(down('W'))-int(down('S')) : 0,
+                    keys ? int(down('D'))-int(down('A')) : 0,keys && (jumpPending || testJump),keys && interactPending);
                 testJumped |= testJump && scene.player().velocity[2] > 1;
             }
             jumpPending = interactPending = false;
@@ -1145,12 +1390,51 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
             lastHudWidth = client.right;
             SetWindowPos(missionHud,HWND_TOP,16,16,std::clamp<int>(client.right-32,1,460),38,SWP_NOACTIVATE);
         }
-        const auto view = scene.view(yaw,pitch,float(client.right)/client.bottom,std::chrono::duration<float>(now-launched).count());
+        const float aspect = float(client.right)/client.bottom;
+        const float seconds = std::chrono::duration<float>(now-launched).count();
+        const float routeFraction = std::clamp(float(frames-DistrictRun::warmUpFrames)/float(DistrictRun::routeFrames),0.0f,1.0f);
         const auto &vertices = scene.vertices();
+        auto view = districtRun
+            ? scene.viewFrom(district.camera(routeFraction).first,district.camera(routeFraction).second,aspect,seconds)
+            : scene.view(yaw,pitch,aspect,seconds);
+        view.drawCulling = !directDraws;
         const auto beforePresent = Clock::now();
         if (!renderer->draw(vertices,scene.ranges(),view,UINT(client.right),UINT(client.bottom),scene.sky(),
-                           smoke && scene.sky() && frames == 0,street ? 0 : 1))
+                           smoke && scene.sky() && frames == 0,street || districtRun ? 0 : 1))
             return fail(L"The Player could not render the current scene.");
+        if (districtRun) {
+            const auto end = Clock::now();
+            const auto stats = renderer->stats();
+            district.promotedTextures += stats.texturesPromoted;
+            district.longestTextureWait = std::max(district.longestTextureWait,stats.textureWaitFrames);
+            district.peakTextureDetail = std::max(district.peakTextureDetail,stats.textureDetailBytes);
+            district.longestTextureStall = std::max(district.longestTextureStall,stats.textureStallMs);
+            if (++frames > DistrictRun::warmUpFrames) {
+                const double frameMs = std::chrono::duration<double,std::milli>(end-frameStart).count();
+                district.frameMs.push_back(frameMs);
+                (routeFraction < 0.6f ? district.streetMs : district.rooftopMs).push_back(frameMs);
+                district.cpuMs.push_back(std::chrono::duration<double,std::milli>(beforePresent-frameStart).count());
+                district.sceneDraws += stats.sceneDraws;
+                district.depthDraws += stats.depthDraws;
+                district.sceneTriangles += stats.sceneTriangles;
+                district.rejectedOpaqueDraws += stats.rejectedOpaqueDraws;
+                district.occludedOpaqueDraws += stats.occludedOpaqueDraws;
+                district.rejectedOpaqueTriangles += stats.rejectedOpaqueTriangles;
+                district.pointShadowFaces += stats.pointShadowFaces;
+                district.compactedShadowFrames += stats.compactedShadowDraws ? 1 : 0;
+                district.meshletShaderGroups += stats.meshletShaderGroups;
+                district.meshletIndexedDraws += stats.meshletIndexedDraws;
+                district.depthTriangles += stats.depthTriangles;
+                district.peakSceneDraws = std::max(district.peakSceneDraws,stats.sceneDraws);
+                const bool onStreet = routeFraction < 0.6f;
+                auto &gpu = onStreet ? district.streetGpu : district.rooftopGpu;
+                for (std::size_t pass = 0; pass < gpu.size(); ++pass)
+                    gpu[pass] += stats.gpuMs[pass];
+                ++(onStreet ? district.streetFrames : district.rooftopFrames);
+            }
+            if (frames >= DistrictRun::warmUpFrames+DistrictRun::routeFrames)
+                return district.write(reportFile,*renderer,scene) ? 0 : 3;
+        }
         if (smoke && ++frames == 90) {
             const auto &position = scene.player().position;
             return testJumped && std::hypot(position[0]-initialPosition[0],position[1]-initialPosition[1]) > 1 ? 0 : 2;

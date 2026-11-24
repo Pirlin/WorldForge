@@ -5,8 +5,8 @@
 // previous frame (its previous position, swayed by the previous frame's wind) and where it is now. Their difference on
 // screen is the surface's own motion, apart from the camera's, which TAA and motion blur add to the camera's.
 //
-// Vertex shaders cannot include Lighting.glsl (its functions use gl_FragCoord), so this block reads only the two
-// members at the end of the Lighting block (binding 1).
+// Vertex shaders cannot include Lighting.glsl (its functions use gl_FragCoord), so this block reads only these two
+// members of the Lighting block (binding 1), at their byte offsets. New Lighting members must go after them.
 layout(std140, set = 0, binding = 1) uniform LightingMotion {
     layout(offset = 1904) mat4 previousViewProjection;
     vec4 settings; // w: the previous frame's wind time in seconds

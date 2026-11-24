@@ -11,7 +11,7 @@ layout(std430, set = 0, binding = 1) buffer Meter { uint bins[64]; } meter;
 layout(set = 0, binding = 2) uniform sampler2D bloomLight;
 layout(push_constant) uniform Display {
     vec4 settings; // exposure scale, view transform (0 Standard, 1 AgX), sRGB swap chain, metering
-    vec4 bloom;    // strength (0 off), levels in the chain, unused, unused
+    vec4 bloom;    // strength (0 off), levels in the chain, minimum and maximum metered stops
 } display;
 layout(location = 0) out vec4 color;
 void main()
@@ -19,11 +19,21 @@ void main()
     vec3 scene = texelFetch(finalImage,ivec2(gl_FragCoord.xy),0).rgb;
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     if (display.settings.w > 0.5 && ((pixel.x | pixel.y) & 1) == 0) {
-        const float low = -16.0, high = 8.0;
+        const uint weight = 32u;
+        float low = display.bloom.z, high = display.bloom.w;
         float luminance = dot(max(scene,vec3(0.0)),vec3(0.2126,0.7152,0.0722));
-        float stops = log2(max(luminance,1e-12));
-        int bin = stops < low ? 0 : clamp(1+int((stops-low)*(63.0/(high-low))),1,63);
-        atomicAdd(meter.bins[bin],1u);
+        if (luminance <= 0.0) {
+            atomicAdd(meter.bins[0],weight);
+        } else {
+            float stops = clamp(log2(luminance),low,high);
+            float position = 1.0+(stops-low)*(62.0/(high-low));
+            int bin = clamp(int(position),1,63);
+            uint upper = bin < 63 ? uint(round(fract(position)*float(weight))) : 0u;
+            if (upper < weight)
+                atomicAdd(meter.bins[bin],weight-upper);
+            if (upper > 0u)
+                atomicAdd(meter.bins[bin+1],upper);
+        }
     }
     // A lens scatters a few percent of the light that reaches it around the image; mixing keeps the total.
     vec3 lit = scene;

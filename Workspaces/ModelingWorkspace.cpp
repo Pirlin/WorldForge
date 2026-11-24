@@ -1,5 +1,6 @@
 #include "Workspaces/ModelingWorkspace.h"
 #include "Components/LiveViewport.h"
+#include "Components/MaterialLayerControls.h"
 #include "DesignSystem/Icons.h"
 #include "Engine/Geometry/MeshRemesh.h"
 #include "Engine/Geometry/MeshTopology.h"
@@ -1100,7 +1101,7 @@ ModelingWorkspace::ModelingWorkspace(ProjectStore &store, QWidget *parent)
         }
         const auto &material = asset->mesh->materials[slot];
         const auto maps = material.previewTextures();
-        const QString names[]{tr("Base Color"),tr("Normal"),tr("Metallic / Roughness"),tr("Ambient Occlusion"),tr("Emissive")};
+        const auto names = materialMapNames();
         QStringList assigned;
         for (std::size_t i = 0; i < maps.size(); ++i)
             if (!maps[i]->empty())
@@ -3186,7 +3187,14 @@ void ModelingWorkspace::assignBaseColorTexture()
     const auto revision = asset->mesh;
     QDialog dialog(this);
     dialog.setWindowTitle(tr("Material Preview Settings"));
-    auto *form = new QFormLayout(&dialog);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *scroll = new QScrollArea(&dialog);
+    scroll->setWidgetResizable(true);
+    auto *properties = new QWidget(scroll);
+    auto *form = new QFormLayout(properties);
+    scroll->setWidget(properties);
+    layout->addWidget(scroll);
+    dialog.resize(510,610);
     auto *slot = new QComboBox(&dialog);
     for (const auto &material : revision->materials)
         slot->addItem(QString::fromStdString(material.name));
@@ -3194,18 +3202,26 @@ void ModelingWorkspace::assignBaseColorTexture()
     form->addRow(tr("Material slot"),slot);
     auto *metallic = new QDoubleSpinBox(&dialog);
     auto *roughness = new QDoubleSpinBox(&dialog);
+    auto *clearCoat = new QDoubleSpinBox(&dialog);
+    auto *coatRoughness = new QDoubleSpinBox(&dialog);
     metallic->setAccessibleName(tr("Material metallic"));
     roughness->setAccessibleName(tr("Material roughness"));
-    for (auto *field : {metallic,roughness}) {
+    clearCoat->setAccessibleName(tr("Clear coat weight"));
+    coatRoughness->setAccessibleName(tr("Clear coat roughness"));
+    for (auto *field : {metallic,roughness,clearCoat,coatRoughness}) {
         field->setRange(0,1);
         field->setDecimals(3);
         field->setSingleStep(0.05);
     }
     form->addRow(tr("Metallic"),metallic);
     form->addRow(tr("Roughness"),roughness);
+    form->addRow(tr("Clear coat weight"),clearCoat);
+    form->addRow(tr("Clear coat roughness"),coatRoughness);
+    auto *layers = new MaterialLayerControls(&dialog);
+    form->addRow(layers);
     auto *channel = new QComboBox(&dialog);
     channel->setAccessibleName(tr("Material map channel"));
-    channel->addItems({tr("Base Color"),tr("Normal"),tr("Metallic / Roughness"),tr("Ambient Occlusion"),tr("Emissive")});
+    channel->addItems(materialMapNames());
     form->addRow(tr("Texture"),channel);
     auto *emissive = new QDoubleSpinBox(&dialog);
     emissive->setRange(0,1);
@@ -3241,10 +3257,13 @@ void ModelingWorkspace::assignBaseColorTexture()
     const auto updateChannel = [revision,slot,channel,remove] {
         remove->setEnabled(!revision->materials[slot->currentIndex()].previewTextures()[channel->currentIndex()]->empty());
     };
-    const auto loadSlot = [revision,slot,metallic,roughness,emissive,updateChannel] {
+    const auto loadSlot = [revision,slot,metallic,roughness,clearCoat,coatRoughness,layers,emissive,updateChannel] {
         const auto &material = revision->materials[slot->currentIndex()];
         metallic->setValue(material.metallic);
         roughness->setValue(material.roughness);
+        clearCoat->setValue(material.clearCoat);
+        coatRoughness->setValue(material.clearCoatRoughness);
+        layers->setLayers(material.layers);
         emissive->setValue(*std::ranges::max_element(material.emissive));
         updateChannel();
     };
@@ -3252,7 +3271,7 @@ void ModelingWorkspace::assignBaseColorTexture()
     connect(channel,&QComboBox::currentIndexChanged,&dialog,updateChannel);
     loadSlot();
     const auto initialEmission = emissive->value();
-    form->addRow(buttons);
+    layout->addWidget(buttons);
     bool clear = false;
     bool chooseImage = false;
     connect(choose,&QPushButton::clicked,&dialog,[&] { chooseImage = true; dialog.accept(); });
@@ -3271,6 +3290,9 @@ void ModelingWorkspace::assignBaseColorTexture()
     auto &material = mesh.materials[slot->currentIndex()];
     material.metallic = float(metallic->value());
     material.roughness = float(roughness->value());
+    material.clearCoat = float(clearCoat->value());
+    material.clearCoatRoughness = float(coatRoughness->value());
+    material.layers = layers->layers();
     const auto previousEmission = *std::ranges::max_element(material.emissive);
     if (std::abs(emissive->value()-previousEmission) > 0.00051) {
         const auto multiplier = float(emissive->value());

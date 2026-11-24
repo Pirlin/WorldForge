@@ -15,6 +15,7 @@ cbuffer View : register(b0) {
     float4 lighting; // density, shadow enable, time, depth bias
     float4 display; // exposure scale, view transform (0 Standard, 1 AgX)
     float4 skyLight; // ambient light scale from the sky colors
+    float4 lightColors[16];
 };
 Texture2D<float> shadowMap : register(t0);
 SamplerState shadowSampler : register(s0);
@@ -59,7 +60,7 @@ struct Surface {
     float3 position : POSITION;
     float3 color : COLOR0;
     float3 tint : COLOR1;
-    float directSun : TEXCOORD0;
+    float3 directSun : TEXCOORD0;
     float2 uv : TEXCOORD1;
     float3 normal : TEXCOORD2;
 };
@@ -120,7 +121,7 @@ Surface sceneVS(Vertex input) {
     output.position = displace(input);
     output.clip = mul(float4(output.position,1),viewProjection);
     float3 normal = input.normal;
-    float strength = skyLight.x*(0.34 + 0.16*max(normal.z,0));
+    float3 strength = skyLight.x*(0.34 + 0.16*max(normal.z,0));
     float key = sun.w*max(0,dot(normal,normalize(sun.xyz)));
     strength += key;
     for (int i = 0; i < int(eye.w); ++i) {
@@ -128,14 +129,14 @@ Surface sceneVS(Vertex input) {
         float3 offset = directional ? lights[i].xyz : lights[i].xyz-input.position;
         float distanceSquared = dot(offset,offset);
         float attenuation = directional ? 1 : 1/(1+distanceSquared);
-        strength += abs(lights[i].w)*attenuation*max(0,dot(normal,offset*rsqrt(max(1e-8,distanceSquared))));
+        strength += lightColors[i].rgb*abs(lights[i].w)*attenuation*max(0,dot(normal,offset*rsqrt(max(1e-8,distanceSquared))));
     }
     float3 albedo = srgbToLinear(input.color);
     output.color = albedo*saturate(strength);
     output.tint = albedo;
     output.normal = input.normal;
     output.directSun = (saturate(strength)-saturate(strength-key))/max(0.001,saturate(strength));
-    output.uv = input.uv;
+    output.uv = float2(input.uv.x,1-input.uv.y);
     return output;
 }
 float3 materialLighting(Surface input,float3 albedo,float shadow) {

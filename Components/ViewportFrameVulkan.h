@@ -46,6 +46,7 @@ public:
     }
     void finishMeter(VkCommandBuffer command) const { frame_.finishMeter(command); }
     bool takeMeter(uint32_t slot,float &log2Average) const { return frame_.takeMeter(slot,log2Average); }
+    const worldforge::vk::Device &device() const { return device_; }
 
 private:
     QVulkanWindow *window_ = nullptr;

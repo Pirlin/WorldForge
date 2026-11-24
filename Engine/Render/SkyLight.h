@@ -49,6 +49,7 @@ struct SkyLight {
     std::vector<std::array<float,4>> environment;
     // Sunlight at the ground in scene units per channel, for the sun that lights the scene.
     Rgb sunLight{};
+    float sunDiscStrength = 0, sunHorizon = 0;
 };
 
 namespace sky {
@@ -264,6 +265,8 @@ inline SkyLight physicalSkyLight(std::array<float,3> sun,float sunIntensity)
     const atmosphere::Sky atmosphereSky(sun,sunIntensity);
     auto light = skyLightFrom([&](const float *direction) { return atmosphereSky.radiance(direction); });
     light.sunLight = atmosphereSky.sunLight();
+    light.sunDiscStrength = atmosphereSky.sunDiscStrength();
+    light.sunHorizon = atmosphere::Sky::horizonCosine();
     return light;
 }
 

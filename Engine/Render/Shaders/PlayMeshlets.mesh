@@ -1,0 +1,65 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_GOOGLE_include_directive : require
+#include "PlayView.glsl"
+#include "ColorPipeline.glsl"
+#include "SceneMotion.glsl"
+
+layout(local_size_x = 32) in;
+layout(triangles,max_vertices = 64,max_primitives = 124) out;
+
+struct Meshlet {
+    uvec4 counts;
+    vec4 center;
+    vec4 extent;
+    vec4 cone;
+    uint vertices[64];
+    uint triangles[124];
+};
+layout(std430,set = 0,binding = 10) readonly buffer Meshlets { Meshlet items[]; };
+layout(std430,set = 0,binding = 11) readonly buffer Corners { float positions[]; };
+layout(push_constant) uniform Batch { layout(offset = 112) uint firstMeshlet; } batch;
+
+layout(location = 0) out vec3 worldPosition[];
+layout(location = 1) out vec3 albedo[];
+layout(location = 2) out vec2 surfaceUv[];
+layout(location = 3) out vec3 surfaceNormal[];
+layout(location = 4) out vec4 previousClip[];
+layout(location = 5) out vec4 currentClip[];
+
+bool outside(vec4 plane,vec3 center,vec3 extent)
+{
+    return dot(plane.xyz,center)+plane.w+dot(abs(plane.xyz),extent) < -0.0001*length(plane.xyz);
+}
+
+void main()
+{
+    uint item = batch.firstMeshlet+gl_WorkGroupID.x;
+    vec3 center = items[item].center.xyz, extent = items[item].extent.xyz;
+    mat4 rows = transpose(view.viewProjection);
+    if (outside(rows[3]+rows[0],center,extent) || outside(rows[3]-rows[0],center,extent)
+        || outside(rows[3]+rows[1],center,extent) || outside(rows[3]-rows[1],center,extent)
+        || outside(rows[2],center,extent) || outside(rows[3]-rows[2],center,extent)) {
+        SetMeshOutputsEXT(0,0);
+        return;
+    }
+    uvec2 counts = items[item].counts.xy;
+    SetMeshOutputsEXT(counts.x,counts.y);
+    for (uint v = gl_LocalInvocationIndex; v < counts.x; v += gl_WorkGroupSize.x) {
+        uint offset = 12u*items[item].vertices[v];
+        vec3 position = vec3(positions[offset],positions[offset+1u],positions[offset+2u]);
+        float wind = positions[offset+9u];
+        vec3 shadedPosition = swayed(position,wind,view.time.x);
+        worldPosition[v] = shadedPosition;
+        gl_MeshVerticesEXT[v].gl_Position = view.viewProjection*vec4(shadedPosition,1.0);
+        previousClip[v] = motion.previousViewProjection*vec4(swayed(position,wind,motion.settings.w),1.0);
+        currentClip[v] = motion.previousViewProjection*vec4(shadedPosition,1.0);
+        surfaceNormal[v] = vec3(positions[offset+3u],positions[offset+4u],positions[offset+5u]);
+        albedo[v] = srgbToLinear(vec3(positions[offset+6u],positions[offset+7u],positions[offset+8u]));
+        surfaceUv[v] = vec2(positions[offset+10u],1.0-positions[offset+11u]);
+    }
+    for (uint t = gl_LocalInvocationIndex; t < counts.y; t += gl_WorkGroupSize.x) {
+        uint packed = items[item].triangles[t];
+        gl_PrimitiveTriangleIndicesEXT[t] = uvec3(packed & 63u,(packed >> 6u) & 63u,(packed >> 12u) & 63u);
+    }
+}

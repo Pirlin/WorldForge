@@ -9,6 +9,7 @@
 #include "State/WorldScene.h"
 #include "State/WorldRuntime.h"
 #include "State/NativeComponents.h"
+#include "State/CityDistrict.h"
 #include "State/ProjectStore.h"
 #include "Workspaces/ModelingWorkspace.h"
 #include "Workspaces/SurfaceWorkspace.h"
@@ -2773,6 +2774,348 @@ QString playerSummary(const PlayerRun &run)
         .arg(run.report.value("privateMiB").toDouble(),0,'f',0).arg(run.report.value("texturedMeshes").toInt());
 }
 
+void r3PerformanceWorkflow(const QDir &output,Audit &audit)
+{
+    const QString page = "R3 lighting";
+    QTemporaryDir directory;
+    QString error;
+    if (!directory.isValid()) {
+        audit.check(page,"performance","Create temporary storage for the street",false,directory.errorString());
+        return;
+    }
+    ProjectStore store(QDir(directory.filePath("index")));
+    if (!store.createStarterProject("R3 Performance",
+        {{"location",directory.filePath("R3 Performance")},{"starter","street"}},error)) {
+        audit.check(page,"performance","Create the street for the R3 benchmark",false,error);
+        return;
+    }
+    const auto baseline = runStreetPlayer(store,output,"r3-lighting-off");
+    auto atmosphere = store.environment() ? store.environment()->details : QJsonObject{};
+    atmosphere.insert("probeGi",true);
+    atmosphere.insert("screenSpaceGi",true);
+    atmosphere.insert("reflectionProbes",true);
+    store.setAtmosphere(atmosphere);
+    const auto enabled = runStreetPlayer(store,output,"r3-lighting-on");
+    const auto completed = [](const PlayerRun &run) {
+        return run.exitCode == 0 && run.report.value("renderer").toString() == "Vulkan"
+            && run.report.value("missionComplete").toBool() && run.report.value("trafficLooped").toBool();
+    };
+    const auto p95 = [](const PlayerRun &run) { return run.report.value("frameMs").toObject().value("p95").toDouble(); };
+    audit.check(page,"performance","The baseline mission renders with Vulkan",
+                completed(baseline) && p95(baseline) > 0,playerSummary(baseline));
+    audit.check(page,"performance","The mission completes with all R3 lighting enabled",
+                completed(enabled) && p95(enabled) > 0,playerSummary(enabled));
+    audit.check(page,"performance","All R3 lighting fits the street frame and memory budget",
+                p95(enabled) > 0 && p95(enabled) < 16.7 && enabled.report.value("peakWorkingSetMiB").toDouble() < 1024,
+                QString("p95 %1 ms with R3 off, %2 ms on. Budget: p95 under 16.7 ms and peak working set under 1 GiB.")
+                    .arg(p95(baseline),0,'f',2).arg(p95(enabled),0,'f',2));
+}
+
+// The city-scale benchmark (R4): a generated district flown along a fixed route in the packaged Player
+// (--verify-district). It records the baseline that culling, indirect drawing and streaming are measured against.
+struct DistrictAuditOptions {
+    bool profile = false, large = false, textured = false, compareDirect = false, compareOcclusion = false, streamTextures = false;
+    QString meshlets;
+};
+
+void districtWorkflow(const QDir &output,Audit &audit,const DistrictAuditOptions &options)
+{
+    const auto &[profile,large,textured,compareDirect,compareOcclusion,streamTextures,meshlets] = options;
+    const QString page = "City district";
+    QTemporaryDir directory;
+    QString error;
+    if (!directory.isValid()) {
+        audit.check(page,"performance","Create temporary storage for the district",false,directory.errorString());
+        return;
+    }
+    ProjectStore store(QDir(directory.filePath("index")));
+    district::Layout layout;
+    if (large)
+        layout.blocks = 12;
+    if (!store.createStarterProject("City District",{{"location",directory.filePath("City District")},{"starter","district"},
+            {"districtBlocks",layout.blocks},{"districtTexturedFacades",textured}},error)) {
+        audit.check(page,"workflow","Create the City District starter",false,error);
+        return;
+    }
+    const auto &objects = store.project()->objects;
+    const auto count = [&](const QString &type) { return std::ranges::count(objects,type,&SceneObject::type); };
+    const auto expectedBuildings = layout.blocks*layout.blocks*layout.lotsPerSide*layout.lotsPerSide;
+    const auto lamps = (layout.blocks+1)*(layout.blocks+1);
+    audit.check(page,"workflow","The City District starter lays out blocks, buildings and street lamps",
+                count("Point Light") == lamps && count("Static Mesh") == 1+layout.blocks*layout.blocks+2*expectedBuildings+lamps,
+                QString("%1 meshes, %2 lamps for %3 x %3 blocks").arg(count("Static Mesh")).arg(count("Point Light"))
+                    .arg(layout.blocks));
+    std::stringstream playable;
+    QFile scene(output.filePath("district.wfplay"));
+    const bool exported = WorldRuntime::exportScene(store,playable,&error) && scene.open(QIODevice::WriteOnly)
+        && scene.write(playable.str().data(),qint64(playable.str().size())) == qint64(playable.str().size());
+    scene.close();
+    audit.check(page,"workflow","Export the district for the Player",exported,error);
+    if (!exported)
+        return;
+    if (textured) {
+        const auto bytes = playable.str();
+        std::istringstream exportedDistrict(bytes);
+        const auto loaded = worldforge::readPlayable(exportedDistrict);
+        std::set<std::vector<std::uint8_t>> textures;
+        int texturedMeshes = 0;
+        if (loaded) {
+            for (const auto &mesh : loaded->meshes) {
+                if (!mesh.baseColorTexture.empty()) {
+                    textures.insert(mesh.baseColorTexture);
+                    ++texturedMeshes;
+                }
+            }
+        }
+        const bool sized = std::ranges::all_of(textures,[](const auto &png) {
+            return QImage::fromData(png.data(),int(png.size()),"PNG").size() == QSize(512,512);
+        });
+        audit.check(page,"textures","Every district building exports a facade from the five 512-pixel materials",
+                    textures.size() == 5 && texturedMeshes == expectedBuildings && sized,
+                    QString("%1 unique textures, %2 textured meshes, %3 MiB playable")
+                        .arg(textures.size()).arg(texturedMeshes).arg(double(bytes.size())/1048576,0,'f',2));
+    }
+    const auto runDistrict = [&](const QString &name,const QString &path,bool direct = false,bool withOcclusion = false) {
+        QProcess player;
+        const auto reportPath = output.filePath(name+"-player.json");
+        QFile::remove(reportPath);
+        QStringList options{"--verify-district",path,reportPath,QString::number(layout.roadWidth/2),"70"};
+        if (direct)
+            options << "--direct";
+        auto environment = QProcessEnvironment::systemEnvironment();
+        environment.insert("WORLDFORGE_OCCLUSION",withOcclusion ? "1" : "0");
+        environment.insert("WORLDFORGE_TEXTURE_STREAMING",streamTextures ? "1" : "0");
+        environment.insert("WORLDFORGE_MESHLETS",meshlets);
+        player.setProcessEnvironment(environment);
+        player.start(QDir(QCoreApplication::applicationDirPath()).filePath("WorldForgePlayer.exe"),options);
+        if (!player.waitForFinished(300000)) {
+            player.kill();
+            player.waitForFinished();
+            return QJsonObject{};
+        }
+        if (player.exitStatus() != QProcess::NormalExit || player.exitCode() != 0)
+            return QJsonObject{};
+        QFile result(reportPath);
+        return result.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(result.readAll()).object() : QJsonObject{};
+    };
+    const auto report = runDistrict("district",scene.fileName(),false,compareOcclusion);
+    const auto stat = [&](const char *group,const char *value) {
+        return report.value(group).toObject().value(value).toDouble();
+    };
+    const auto completedRoute = [](const QJsonObject &result) {
+        return result.value("renderer").toString() == "Vulkan" && result.value("frames").toInt() > 1000;
+    };
+    const bool completed = completedRoute(report);
+    const auto summary = QString("%1 meshes, %2 lights, %3 vertices · frame avg %4 ms p95 %5 ms p99 %6 ms max %7 ms"
+                                 " (street p95 %8 ms, rooftops p95 %9 ms) · CPU avg %10 ms p95 %11 ms · scene draws %12"
+                                 " (max %13), %14 k triangles; depth passes %15 draws, %16 k triangles · working set %17 MiB,"
+                                 " peak %18 MiB")
+        .arg(report.value("meshes").toInt()).arg(report.value("lights").toInt()).arg(report.value("vertices").toInt())
+        .arg(stat("frameMs","average"),0,'f',2).arg(stat("frameMs","p95"),0,'f',2).arg(stat("frameMs","p99"),0,'f',2)
+        .arg(stat("frameMs","max"),0,'f',2).arg(stat("streetMs","p95"),0,'f',2).arg(stat("rooftopMs","p95"),0,'f',2)
+        .arg(stat("cpuMs","average"),0,'f',2).arg(stat("cpuMs","p95"),0,'f',2)
+        .arg(stat("sceneDraws","average"),0,'f',0).arg(stat("sceneDraws","max"),0,'f',0)
+        .arg(report.value("sceneTriangles").toDouble()/1000,0,'f',0).arg(report.value("depthDraws").toDouble(),0,'f',0)
+        .arg(report.value("depthTriangles").toDouble()/1000,0,'f',0)
+        .arg(report.value("workingSetMiB").toDouble(),0,'f',0).arg(report.value("peakWorkingSetMiB").toDouble(),0,'f',0);
+    const auto gpu = [&](const char *phase) {
+        const auto passes = report.value("gpuMs").toObject().value(phase).toObject();
+        return QString("sun shadows %1, sky maps %2, point shadows %3, scene %4, post-process %5 ms")
+            .arg(passes.value("sunShadows").toDouble(),0,'f',2).arg(passes.value("skyMaps").toDouble(),0,'f',2)
+            .arg(passes.value("pointShadows").toDouble(),0,'f',2).arg(passes.value("scene").toDouble(),0,'f',2)
+            .arg(passes.value("postProcess").toDouble(),0,'f',2);
+    };
+    audit.record(page,"performance","GPU time per pass along the district route",completed ? "INFO" : "FAIL",
+                 QString("Street: %1. Rooftops: %2.").arg(gpu("street"),gpu("rooftop")));
+    audit.check(page,"performance","The Player flies the whole district route with Vulkan",completed,summary);
+    audit.check(page,"performance","The district stays within the memory budget",
+                completed && report.value("peakWorkingSetMiB").toDouble() < 1024,summary);
+    if (streamTextures && completed) {
+        const auto streaming = report.value("textureStreaming").toObject();
+        const int promotions = streaming.value("promotions").toInt();
+        const int wait = streaming.value("longestWaitFrames").toInt();
+        const double residency = streaming.value("peakDetailBytes").toDouble()/1048576;
+        audit.check(page,"textures","Visible facade detail is restored within eight frames under the GPU detail budget",
+            promotions == 5 && wait <= 8 && residency > 0 && residency <= 64,
+            QString("%1 promotions, longest wait %2 frames, %3 MiB of detail, longest upload stall %4 ms")
+                .arg(promotions).arg(wait).arg(residency,0,'f',2).arg(streaming.value("longestStallMs").toDouble(),0,'f',2));
+    }
+    if (!meshlets.isEmpty() && completed) {
+        const bool indexed = meshlets == "indexed";
+        const auto shaderGroups = report.value("meshletShaderGroups").toDouble();
+        const auto indexedDraws = report.value("meshletIndexedDraws").toDouble();
+        const bool targetGpu = report.value("adapter").toString().contains("GTX 1650");
+        audit.record(page,"meshlets",indexed ? "The forced fallback renders static meshlets with Vulkan indexed draws"
+            : "The mesh shader renders static district meshlets",indexed || targetGpu
+                ? ((indexed ? indexedDraws > 0 && shaderGroups == 0 : shaderGroups > 0) ? "PASS" : "FAIL") : "SKIP",
+            QString("%1 mesh workgroups, %2 indexed draws").arg(shaderGroups,0,'f',0).arg(indexedDraws,0,'f',0));
+    }
+    // The frame-time baseline that R4 improves on; it is recorded, not yet held to the street budget.
+    audit.record(page,"performance","District frame-time baseline (budget: p95 under 16.7 ms)",
+                 completed && stat("frameMs","p95") < 16.7 ? "PASS" : "INFO",summary);
+    if (compareDirect && completed) {
+        const auto direct = runDistrict("district-direct-route",scene.fileName(),true);
+        const auto baseline = [&](const char *group) { return direct.value(group).toObject().value("p95").toDouble(); };
+        audit.check(page,"performance","The direct and indirect paths both complete the same Vulkan route",
+                    completed && completedRoute(direct) && direct.value("adapter") == report.value("adapter")
+                    && direct.value("frames") == report.value("frames"));
+        audit.record(page,"performance","Direct versus indirect route frame times",completedRoute(direct) ? "INFO" : "FAIL",
+            QString("Indirect/direct p95 %1/%2 ms overall, %3/%4 ms street, %5/%6 ms rooftops")
+                .arg(stat("frameMs","p95"),0,'f',2).arg(baseline("frameMs"),0,'f',2)
+                .arg(stat("streetMs","p95"),0,'f',2).arg(baseline("streetMs"),0,'f',2)
+                .arg(stat("rooftopMs","p95"),0,'f',2).arg(baseline("rooftopMs"),0,'f',2));
+    }
+    if (compareOcclusion && completed) {
+        const auto baseline = runDistrict("district-frustum-route",scene.fileName());
+        const double visible = report.value("visibleSceneDraws").toDouble();
+        const double frustumVisible = baseline.value("visibleSceneDraws").toDouble();
+        const double rejected = report.value("occludedOpaqueDraws").toDouble();
+        audit.check(page,"occlusion","The depth pyramid rejects geometry beyond the frustum test along the route",
+            completedRoute(baseline) && rejected > 0 && visible < frustumVisible,
+            QString("%1 draws additionally rejected per frame, %2 visible versus %3 with frustum alone")
+                .arg(rejected,0,'f',1).arg(visible,0,'f',1).arg(frustumVisible,0,'f',1));
+        const auto baselineTime = baseline.value("frameMs").toObject().value("p95").toDouble();
+        audit.record(page,"performance","Frustum versus depth-pyramid route frame times",completedRoute(baseline) ? "INFO" : "FAIL",
+            QString("Frustum p95 %1 ms, depth pyramid p95 %2 ms").arg(baselineTime,0,'f',2).arg(stat("frameMs","p95"),0,'f',2));
+    }
+    if (!profile && completed) {
+        const double rejected = report.value("rejectedOpaqueTriangles").toDouble();
+        const double rejectedDraws = report.value("rejectedOpaqueDraws").toDouble();
+        const bool targetGpu = report.value("adapter").toString().contains("GTX 1650");
+        audit.record(page,"culling","GPU frustum culling rejects opaque triangles along the route",
+                     rejected > 0 ? "PASS" : targetGpu ? "FAIL" : "SKIP",
+                     QString("%1 draws and %2 triangles rejected per frame on average").arg(rejectedDraws,0,'f',1).arg(rejected,0,'f',1));
+        const int compacted = report.value("compactedShadowFrames").toInt();
+        audit.record(page,"culling","Sun shadow frames using compacted indirect draws","INFO",
+                     QString("%1 of %2 frames").arg(compacted).arg(report.value("frames").toInt()));
+        store.select({});
+        LiveViewport viewport(store,false);
+        viewport.resize(640,360);
+        viewport.show();
+        const float edge = (layout.roadWidth-layout.extent())*0.5f;
+        const QVector3D eye{edge+12,edge,2}, target{edge+90,edge,2.5f};
+        viewport.setCameraPreview(eye,target);
+        const auto editor = waitForRender(viewport) ? viewport.captureFrame().convertToFormat(QImage::Format_RGB32) : QImage{};
+        const auto capture = [&](const QString &name,bool direct,QVector3D cameraEye,QVector3D cameraTarget,bool streaming = false) {
+            if (editor.isNull())
+                return QImage{};
+            const auto file = output.filePath(name+".png");
+            QStringList args{"--capture",scene.fileName(),file,QString::number(editor.width()),QString::number(editor.height()),
+                             QString::number(cameraEye.x()),QString::number(cameraEye.y()),QString::number(cameraEye.z()),
+                             QString::number(cameraTarget.x()),QString::number(cameraTarget.y()),QString::number(cameraTarget.z())};
+            if (direct)
+                args << "--direct";
+            QProcess player;
+            auto environment = QProcessEnvironment::systemEnvironment();
+            environment.insert("WORLDFORGE_OCCLUSION",compareOcclusion ? "1" : "0");
+            environment.insert("WORLDFORGE_TEXTURE_STREAMING",streaming ? "1" : "0");
+            environment.insert("WORLDFORGE_MESHLETS",meshlets);
+            player.setProcessEnvironment(environment);
+            player.start(QDir(QCoreApplication::applicationDirPath()).filePath("WorldForgePlayer.exe"),args);
+            if (!player.waitForFinished(60000) || player.exitStatus() != QProcess::NormalExit || player.exitCode() != 0)
+                return QImage{};
+            return QImage(file).convertToFormat(QImage::Format_RGB32);
+        };
+        const auto indirect = capture("district-indirect",false,eye,target);
+        const auto direct = capture("district-direct",true,eye,target);
+        viewport.setDrawCullingEnabled(false);
+        const auto editorDirect = viewport.captureFrame().convertToFormat(QImage::Format_RGB32);
+        const auto meanDifference = [](const QImage &a,const QImage &b) {
+            if (a.isNull() || a.size() != b.size())
+                return 255.0;
+            double total = 0;
+            for (int y = 0; y < a.height(); ++y) {
+                const auto *one = reinterpret_cast<const QRgb *>(a.constScanLine(y));
+                const auto *two = reinterpret_cast<const QRgb *>(b.constScanLine(y));
+                for (int x = 0; x < a.width(); ++x)
+                    total += std::max({std::abs(qRed(one[x])-qRed(two[x])),std::abs(qGreen(one[x])-qGreen(two[x])),
+                                       std::abs(qBlue(one[x])-qBlue(two[x]))});
+            }
+            return total/(double(a.width())*a.height());
+        };
+        editor.save(output.filePath("district-editor.png"));
+        editorDirect.save(output.filePath("district-editor-direct.png"));
+        const double playerError = meanDifference(direct,indirect), editorError = meanDifference(editor,editorDirect);
+        audit.check(page,"culling","Indirect district draws match direct draws in both renderers",
+            playerError <= 0.1 && editorError <= 0.1,
+            QString("Player mean error %1 levels. Editor mean error %2 levels").arg(playerError,0,'f',3).arg(editorError,0,'f',3));
+        const double rendererError = meanDifference(editor,indirect);
+        audit.check(page,"culling","The editor and Player match on the district street view",rendererError <= 1,
+            QString("Mean error %1 levels").arg(rendererError,0,'f',3));
+        if (streamTextures) {
+            const auto streamed = capture("district-streamed",false,eye,target,true);
+            const auto difference = meanDifference(streamed,indirect);
+            audit.check(page,"textures","Restored facade detail matches the full-resolution street capture",difference <= 0.5,
+                QString("Mean pixel error %1 levels").arg(difference,0,'f',3));
+        }
+        if (compareOcclusion) {
+            const std::array<std::pair<QVector3D,QVector3D>,4> poses{{
+                {{edge+5,edge+11,1.7f},{edge+42,edge+32,3}},
+                {{edge+55,edge+51,2},{edge+105,edge+57,2.5f}},
+                {{edge+85,edge+48,2},{edge+40,edge+56,3}},
+                {{edge+61,edge+44,70},{40,40,5}}}};
+            double playerPeak = 0, editorPeak = 0;
+            for (std::size_t i = 0; i < poses.size(); ++i) {
+                const auto [cameraEye,cameraTarget] = poses[i];
+                const auto stem = QString("district-turn-%1").arg(i);
+                playerPeak = std::max(playerPeak,meanDifference(capture(stem+"-occlusion",false,cameraEye,cameraTarget),
+                    capture(stem+"-direct",true,cameraEye,cameraTarget)));
+                viewport.setCameraPreview(cameraEye,cameraTarget);
+                viewport.setDrawCullingEnabled(true);
+                const auto active = viewport.captureFrame().convertToFormat(QImage::Format_RGB32);
+                viewport.setDrawCullingEnabled(false);
+                const auto disabled = viewport.captureFrame().convertToFormat(QImage::Format_RGB32);
+                editorPeak = std::max(editorPeak,meanDifference(active,disabled));
+            }
+            audit.check(page,"occlusion","Depth culling preserves frames across turns, district blocks and an abrupt rooftop move",
+                playerPeak <= 0.1 && editorPeak <= 0.1,
+                QString("Worst mean pixel error: editor %1, Player %2 levels").arg(editorPeak,0,'f',3).arg(playerPeak,0,'f',3));
+        }
+    }
+    if (!profile || !completed)
+        return;
+
+    const auto baselineBytes = playable.str();
+    const bool reloadable = worldforge::readPlayable(playable).has_value();
+    audit.check(page,"profile","Load the exported district for single-feature comparisons",reloadable);
+    if (!reloadable)
+        return;
+    struct Variant {
+        const char *name;
+        void (*apply)(worldforge::PlayableScene &);
+    };
+    const Variant variants[]{
+        {"without-height-fog",[](auto &copy) { copy.fogDensity = 0; }},
+        {"without-contact-shadows",[](auto &copy) { copy.contactShadows = false; }},
+        {"without-reflections",[](auto &copy) { copy.reflections = false; }},
+        {"without-sun-shadows",[](auto &copy) { copy.shadows = false; }},
+        {"without-lamps",[](auto &copy) { std::erase_if(copy.lights,[](const auto &light) { return !light.directional; }); }}
+    };
+    const auto sceneMs = [](const QJsonObject &run,const char *phase) {
+        return run.value("gpuMs").toObject().value(phase).toObject().value("scene").toDouble();
+    };
+    for (const auto &variant : variants) {
+        std::istringstream input(baselineBytes);
+        auto copy = worldforge::readPlayable(input);
+        if (copy)
+            variant.apply(*copy);
+        std::ostringstream bytes;
+        QFile package(output.filePath(QString("district-%1.wfplay").arg(variant.name)));
+        bool written = copy && worldforge::writePlayable(bytes,*copy) && package.open(QIODevice::WriteOnly);
+        if (written) {
+            const auto data = bytes.str();
+            written = package.write(data.data(),qint64(data.size())) == qint64(data.size());
+        }
+        package.close();
+        const auto result = written ? runDistrict(QString("district-%1").arg(variant.name),package.fileName()) : QJsonObject{};
+        const bool profiled = completedRoute(result) && sceneMs(result,"street") > 0 && sceneMs(result,"rooftop") > 0;
+        audit.check(page,"profile",QString("Profile the district %1").arg(variant.name),profiled,
+            profiled ? QString("Scene GPU time %1 ms street (%2 ms with all effects), %3 ms rooftop (%4 ms with all effects)")
+                .arg(sceneMs(result,"street"),0,'f',2).arg(sceneMs(report,"street"),0,'f',2)
+                .arg(sceneMs(result,"rooftop"),0,'f',2).arg(sceneMs(report,"rooftop"),0,'f',2)
+                : QStringLiteral("The export or timestamped Vulkan route did not complete."));
+    }
+}
 void streetWorkflow(const QDir &output,Audit &audit)
 {
     const QString page = "Playable street";
@@ -2907,15 +3250,144 @@ void streetWorkflow(const QDir &output,Audit &audit)
         view.captureFrame().save(output.filePath("street-editor.png"));
 }
 
+void sunSweepWorkflow(const QDir &output,Audit &audit,bool sunrise)
+{
+    const QString page = sunrise ? "Sunrise" : "Sunset";
+    QTemporaryDir directory;
+    ProjectStore store(QDir(directory.filePath("index")));
+    QString error;
+    QJsonObject atmosphere{{"skyModel","Physical"},{"sunAzimuth",90},{"sunElevation",sunrise ? -6 : 12},{"exposureMode","Auto"},
+        {"antiAliasing","Off"},{"fogDensity",0},{"localFogRadius",0},{"bloom",false},{"ambientOcclusion",false},
+        {"reflections",false},{"contactShadows",false},{"shadows",false}};
+    if (!directory.isValid() || !store.createStarterProject("Sunrise",{{"location",directory.filePath("street")},
+            {"starter","street"},{"worldDefaults",atmosphere}},error)) {
+        audit.check(page,"workflow","Create the sunrise scene",false,error);
+        return;
+    }
+    // Look down the solar azimuth from above the roofs so the horizon and upper sky are both visible.
+    const QVector3D eye{0,-50,65}, target{0,25,65};
+    store.select({});
+    LiveViewport viewport(store,false);
+    viewport.resize(400,260);
+    viewport.setCameraPreview(eye,target);
+    viewport.show();
+    const auto first = waitForRender(viewport) ? viewport.captureFrame() : QImage{};
+    if (first.isNull()) {
+        audit.check(page,"render","Capture the editor's Vulkan sky",false);
+        return;
+    }
+    QFile playable(output.filePath("sunrise.wfplay"));
+    std::ostringstream scene;
+    const bool exported = WorldRuntime::exportScene(store,scene,&error) && playable.open(QIODevice::WriteOnly);
+    const auto bytes = scene.str();
+    const bool written = exported && playable.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+    playable.close();
+    if (!written) {
+        audit.check(page,"workflow","Export the sunrise scene",false,error);
+        return;
+    }
+    const auto playerOutput = output.filePath("player");
+    QProcess player;
+    player.start(QDir(QCoreApplication::applicationDirPath()).filePath("WorldForgePlayer.exe"),
+        {sunrise ? "--verify-sunrise" : "--verify-sunset",playable.fileName(),playerOutput,QString::number(first.width()),QString::number(first.height()),
+         QString::number(eye.x()),QString::number(eye.y()),QString::number(eye.z()),
+         QString::number(target.x()),QString::number(target.y()),QString::number(target.z())});
+    if (!player.waitForFinished(300000)) {
+        player.kill();
+        player.waitForFinished();
+    }
+    QFile report(QDir(playerOutput).filePath("meter.csv"));
+    if (player.exitStatus() != QProcess::NormalExit || player.exitCode() != 0 || !report.open(QIODevice::ReadOnly)) {
+        audit.check(page,"render","Capture the Player's Vulkan sunrise sweep",false,QString::number(player.exitCode()));
+        return;
+    }
+    QFile editorReport(output.filePath("editor-meter.csv"));
+    if (!editorReport.open(QIODevice::WriteOnly)) {
+        audit.check(page,"workflow","Write the editor's exposure readings",false,editorReport.errorString());
+        return;
+    }
+    QTextStream playerMeter(&report), editorMeter(&editorReport);
+    playerMeter.readLine();
+    editorMeter << "Elevation,EditorLog2Luminance,PlayerLog2Luminance\n";
+    float lastEditor = 0, lastPlayer = 0, editorStep = 0, playerStep = 0, rendererDifference = 0;
+    QImage editorTwilight;
+    int samples = 0;
+    bool metered = true;
+    constexpr int steps = 90;
+    while (!playerMeter.atEnd()) {
+        const int sample = sunrise ? samples : steps-samples;
+        const auto row = playerMeter.readLine().split(',');
+        bool validElevation = false, validLuminance = false;
+        const float elevation = row.value(0).toFloat(&validElevation);
+        const float playerLuminance = row.value(1).toFloat(&validLuminance);
+        if (!validElevation || !validLuminance || !std::isfinite(playerLuminance) || elevation != float(sample-30)/5) {
+            metered = false;
+            break;
+        }
+        atmosphere.insert("sunElevation",elevation);
+        store.setAtmosphere(atmosphere);
+        const auto luminance = viewport.captureMeteredLuminance();
+        if (!luminance || !std::isfinite(*luminance)) {
+            metered = false;
+            break;
+        }
+        if (samples > 0) {
+            editorStep = std::max(editorStep,std::abs(*luminance-lastEditor));
+            playerStep = std::max(playerStep,std::abs(playerLuminance-lastPlayer));
+        }
+        lastEditor = *luminance;
+        lastPlayer = playerLuminance;
+        rendererDifference = std::max(rendererDifference,std::abs(*luminance-playerLuminance));
+        editorMeter << elevation << ',' << *luminance << ',' << playerLuminance << '\n';
+        if (sample == 0 || sample == 30 || sample == steps) {
+            const auto frame = viewport.captureFrame();
+            frame.save(output.filePath(QString("editor-%1.png").arg(samples)));
+            if (sample == 0)
+                editorTwilight = frame;
+        }
+        ++samples;
+    }
+    const bool complete = metered && samples == steps+1;
+    audit.check(page,"exposure","Both renderers meter the sun sweep without a step over 0.5 stops",
+                complete && editorStep <= 0.5f && playerStep <= 0.5f,
+                QString("%1 elevations, editor peak step %2 stops, Player %3 stops")
+                    .arg(samples).arg(editorStep,0,'f',3).arg(playerStep,0,'f',3));
+    audit.check(page,"exposure","Editor and Player meter the same luminance during the sun sweep",
+                complete && rendererDifference <= 0.10f,
+                QString("Largest difference %1 stops").arg(rendererDifference,0,'f',3));
+    const auto skyHue = [](const QImage &image,int numerator) {
+        if (image.isNull())
+            return 0.0;
+        const int y = image.height()*numerator/20;
+        double blue = 0, total = 0;
+        for (int x = image.width()*3/8; x < image.width()*5/8; ++x) {
+            const auto pixel = image.pixel(x,y);
+            blue += qBlue(pixel);
+            total += qRed(pixel)+qGreen(pixel)+qBlue(pixel);
+        }
+        return total > 0 ? blue/total : 0.0;
+    };
+    const QImage playerTwilight(QDir(playerOutput).filePath(sunrise ? "0.png" : QString("%1.png").arg(steps)));
+    const double editorBlue = skyHue(editorTwilight,2)-skyHue(editorTwilight,9);
+    const double playerBlue = skyHue(playerTwilight,2)-skyHue(playerTwilight,9);
+    audit.check(page,"sky","The upper twilight sky is bluer than the horizon in both renderers",
+                editorBlue > 0.01 && playerBlue > 0.01,
+                QString("Blue channel share above horizon: editor +%1, Player +%2").arg(editorBlue,0,'f',3).arg(playerBlue,0,'f',3));
+}
+
 // Fixed camera views of the Playable Street, compared with reference images in Tests/Golden.
 // Set WORLDFORGE_UPDATE_GOLDEN=1 to record new references after an intended rendering change.
 void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
 {
     const QString page = "Rendering";
     QTemporaryDir directory;
-    ProjectStore store;
     QString error;
-    if (!directory.isValid() || !store.createStarterProject("Rendering QA",
+    if (!directory.isValid()) {
+        audit.check(page,"workflow","Create temporary storage for the street",false,directory.errorString());
+        return;
+    }
+    ProjectStore store(QDir(directory.filePath("index")));
+    if (!store.createStarterProject("Rendering QA",
         {{"location",directory.filePath("Rendering QA")},{"starter","street"}},error)) {
         audit.check(page,"workflow","Create the Playable Street starter",false,error);
         return;
@@ -3123,6 +3595,105 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
                 !litFog.isNull() && !shadowedFog.isNull() && scatter > 0.01 && clearAlike.mean < 0.5,
                 QString("Fog brightens by %1 display levels without shadows. Clear sky: %2")
                     .arg(scatter*255,0,'f',2).arg(describe(clearAlike)));
+
+    const Shot duskShot{"physical-fog-dusk",fogShot.eye,fogShot.target};
+    setDisplay({{"skyModel","Physical"},{"sunAzimuth",90},{"sunElevation",-8},
+                {"ev100",10},{"exposureMode","Manual"},{"fogDensity",0},{"localFogRadius",0}});
+    const auto duskClear = settled(duskShot);
+    setDisplay({{"localFogCenter",QJsonArray{-50,-38,5.5}},{"localFogRadius",10},{"localFogDensity",0.20}});
+    const auto duskMist = settled(duskShot);
+    duskMist.save(output.filePath("rendering-physical-fog-dusk.png"));
+    const double duskClearLevel = luminance(skyPatch(duskClear)), duskMistLevel = luminance(skyPatch(duskMist));
+    audit.check(page,"fog","Local mist stays dark under the physical sky after sunset",
+                !duskMist.isNull() && !duskClear.isNull() && duskMistLevel < 0.12 && duskMistLevel <= duskClearLevel+0.025,
+                QString("Sky %1, mist %2 mean display levels").arg(255*duskClearLevel,0,'f',2).arg(255*duskMistLevel,0,'f',2));
+
+    const Shot sunsetShot{"physical-fog-sunset",shots[0].eye,shots[0].target};
+    setDisplay({{"sunAzimuth",73},{"sunElevation",7},{"ev100",14},{"localFogRadius",0}});
+    const auto sunsetClear = settled(sunsetShot);
+    setDisplay({{"fogDensity",0.003},{"localFogCenter",QJsonArray{-3,-2,1.5}},
+                {"localFogRadius",9},{"localFogDensity",0.035}});
+    const auto sunsetMist = settled(sunsetShot);
+    sunsetMist.save(output.filePath("rendering-physical-fog-sunset.png"));
+    const auto sunsetFog = difference(sunsetMist,sunsetClear,"rendering-physical-fog-sunset-diff.png");
+    std::ostringstream sunsetPlayable;
+    QFile sunsetFile(playablePath);
+    const bool sunsetExported = WorldRuntime::exportScene(store,sunsetPlayable) && sunsetFile.open(QIODevice::WriteOnly);
+    const auto sunsetBytes = sunsetPlayable.str();
+    const bool sunsetWritten = sunsetExported && sunsetFile.write(sunsetBytes.data(),qint64(sunsetBytes.size())) == qint64(sunsetBytes.size());
+    sunsetFile.close();
+    const auto playedSunset = sunsetWritten ? playerCapture(sunsetShot,sunsetMist.size()) : QImage();
+    const auto sunsetAlike = difference(playedSunset,sunsetMist,"rendering-physical-fog-sunset-editor-player-diff.png");
+    audit.check(page,"fog","Editor and Player match with physical height fog and local mist at sunset",
+                !playedSunset.isNull() && !sunsetClear.isNull() && sunsetFog.mean > 1
+                && sunsetAlike.mean <= 1 && sunsetAlike.share <= 0.005,
+                QString("Fog changes the view by %1. Editor and Player: %2").arg(describe(sunsetFog),describe(sunsetAlike)));
+
+    const auto captureWeatherPlayer = [&](const Shot &shot,const QImage &editor) {
+        std::ostringstream weatherBytes;
+        QFile package(playablePath);
+        if (!WorldRuntime::exportScene(store,weatherBytes) || !package.open(QIODevice::WriteOnly))
+            return QImage{};
+        const auto bytes = weatherBytes.str();
+        const bool written = package.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+        package.close();
+        return written ? playerCapture(shot,editor.size()) : QImage{};
+    };
+    const Shot weatherShot{"overcast",shots[1].eye,shots[1].target};
+    setDisplay({{"sunElevation",30},{"fogDensity",0},{"localFogRadius",0},{"cloudCover",0},{"aerialHaze",0}});
+    const auto clearWeather = settled(weatherShot);
+    setDisplay({{"cloudCover",0.92},{"targetCloudCover",0.3},{"cloudTransition",12}});
+    const auto overcast = settled(weatherShot);
+    overcast.save(output.filePath("rendering-overcast.png"));
+    const auto cloudChange = difference(overcast,clearWeather,"rendering-overcast-diff.png");
+    const auto cloudParity = difference(captureWeatherPlayer(weatherShot,overcast),overcast,"rendering-overcast-parity.png");
+    audit.check(page,"weather","Cloud cover changes the sky and street lighting alike in both renderers",
+                !overcast.isNull() && !clearWeather.isNull() && cloudChange.mean > 3
+                && cloudParity.mean <= 1 && cloudParity.share <= 0.005,
+                QString("Clouds change the view by %1. Editor and Player have %2").arg(describe(cloudChange),describe(cloudParity)));
+
+    const Shot hazeShot{"distance-haze",shots[2].eye,shots[2].target};
+    setDisplay({{"cloudCover",0},{"cloudTransition",0}});
+    const auto clearAir = settled(hazeShot);
+    setDisplay({{"aerialHaze",8}});
+    const auto haze = settled(hazeShot);
+    haze.save(output.filePath("rendering-distance-haze.png"));
+    const auto hazeChange = difference(haze,clearAir,"rendering-distance-haze-diff.png");
+    const auto hazeParity = difference(captureWeatherPlayer(hazeShot,haze),haze,"rendering-distance-haze-parity.png");
+    audit.check(page,"weather","Distance haze changes the aerial view alike in both renderers",
+                !haze.isNull() && !clearAir.isNull() && hazeChange.mean > 2
+                && hazeParity.mean <= 1 && hazeParity.share <= 0.005,
+                QString("Haze changes the view by %1. Editor and Player have %2").arg(describe(hazeChange),describe(hazeParity)));
+
+    const Shot lampShot{"lamp-mist",fogShot.eye,fogShot.target};
+    setDisplay({{"sunElevation",-12},{"ev100",7},{"aerialHaze",0},{"localFogCenter",QJsonArray{-50,-39,5}},
+                {"localFogRadius",8},{"localFogDensity",0.07},{"fogColor","#ffffff"}});
+    const auto unlitMist = settled(lampShot);
+    store.addObject("Point Light","Lighting");
+    if (const auto *selected = store.selectedObject(); selected && selected->type == "Point Light") {
+        auto lamp = *selected;
+        lamp.position = {-50,-39,5};
+        setLightPhotometric(lamp.details,lamp.type,6000);
+        lamp.details.insert("lightColor","#ffbb71");
+        QString lampError;
+        const bool warmReady = store.updateObjects({lamp},"Set warm lamp in the mist",lampError);
+        const auto warm = settled(lampShot);
+        warm.save(output.filePath("rendering-warm-lamp-mist.png"));
+        lamp.details.insert("lightColor","#72b4ff");
+        const bool coolReady = store.updateObjects({lamp},"Set cool lamp in the mist",lampError);
+        const auto cool = settled(lampShot);
+        cool.save(output.filePath("rendering-cool-lamp-mist.png"));
+        const auto lampChange = difference(warm,unlitMist,"rendering-lamp-mist-diff.png");
+        const auto colorChange = difference(cool,warm,"rendering-warm-cool-lamp-diff.png");
+        const auto lampParity = difference(captureWeatherPlayer(lampShot,cool),cool,"rendering-lamp-mist-parity.png");
+        audit.check(page,"fog","Warm and cool lamps scatter colored light through physical mist in both renderers",
+            warmReady && coolReady && !cool.isNull() && !warm.isNull() && !unlitMist.isNull()
+            && lampChange.mean > 2 && colorChange.mean > 2 && lampParity.mean <= 1 && lampParity.share <= 0.005,
+            QString("Lamp effect has %1. Warm and cool images have %2. Editor and Player have %3")
+                .arg(describe(lampChange),describe(colorChange),describe(lampParity)));
+    } else {
+        audit.check(page,"fog","Create a lamp to illuminate physical mist",false);
+    }
     while (store.history().index() > historyStart && store.history().canUndo())
         store.history().undo();
 
@@ -3181,6 +3752,407 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
                 mirrorReady && !reflected.isNull() && !skyOnly.isNull() && floorChange.mean > 3 && skyChange.mean < 0.5,
                 QString("Floor changes by %1 levels on average with reflections on; the view above it by %2.")
                     .arg(floorChange.mean,0,'f',2).arg(skyChange.mean,0,'f',2));
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+
+    // A low sun reflects off lacquer over a rough painted slab isolated from the street.
+    const Shot coatShot{"clear-coat",{-140,-62,3.8f},{-140,-50,0.1f}};
+    QString coatAsset, coatError;
+    store.addCube();
+    if (const auto *selected = store.selectedObject()) {
+        auto slab = *selected;
+        slab.position = {-140,-51,0.05f};
+        slab.scale = {12,16,0.1f};
+        store.updateObject(slab,"Clear coat test slab");
+        coatAsset = slab.meshAsset;
+    }
+    const auto setCoat = [&](float weight,float roughness) {
+        const auto *asset = store.meshAsset(coatAsset);
+        if (!asset || !asset->mesh)
+            return false;
+        auto mesh = *asset->mesh;
+        for (auto &slot : mesh.materials) {
+            slot.color = {0.26f,0.06f,0.04f,1};
+            slot.roughness = 0.7f;
+            slot.clearCoat = weight;
+            slot.clearCoatRoughness = roughness;
+        }
+        return store.updateMesh(coatAsset,std::move(mesh),"Set clear coat",coatError);
+    };
+    store.select({});
+    setDisplay({{"fogDensity",0},{"localFogRadius",0},{"bloom",false},{"shadows",false},{"reflections",false},
+                {"sunAzimuth",90},{"sunElevation",19}});
+    bool coatReady = setCoat(0,0.12f);
+    const auto bare = settled(coatShot);
+    coatReady &= setCoat(1,0.12f);
+    const auto lacquer = settled(coatShot);
+    {
+        std::ostringstream package;
+        QFile file(playablePath);
+        const bool coatExported = WorldRuntime::exportScene(store,package) && file.open(QIODevice::WriteOnly);
+        const auto bytes = package.str();
+        const bool written = coatExported && file.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+        file.close();
+        const auto played = written ? playerCapture(coatShot,lacquer.size()) : QImage();
+        const auto alike = difference(played,lacquer,"rendering-clear-coat-editor-player-diff.png");
+        audit.check(page,"clear coat","Editor and Player match on lacquer over rough paint",
+                    coatReady && !played.isNull() && alike.mean <= 1 && alike.share <= 0.005,describe(alike));
+    }
+    coatReady &= setCoat(1,0.5f);
+    const auto satin = settled(coatShot);
+    lacquer.save(output.filePath("rendering-clear-coat.png"));
+    const auto coatChange = difference(lacquer,bare,"rendering-clear-coat-weight-diff.png");
+    const auto roughnessChange = difference(lacquer,satin,"rendering-clear-coat-roughness-diff.png");
+    audit.check(page,"clear coat","Weight and roughness change the coating over the same base paint",
+                coatReady && !bare.isNull() && !lacquer.isNull() && !satin.isNull()
+                && coatChange.mean > 0.3 && roughnessChange.mean > 0.3,
+                QString("Weight changes the view by %1 levels on average and roughness by %2. %3")
+                    .arg(coatChange.mean,0,'f',2).arg(roughnessChange.mean,0,'f',2).arg(coatError));
+
+    const Shot clothShot{"sheen",{-140,-62,2.0f},{-140,-50,0.1f}};
+    setDisplay({{"sunElevation",10}});
+    const auto dressCloth = [&](const worldforge::MaterialLayers &layers) {
+        const auto *asset = store.meshAsset(coatAsset);
+        if (!asset || !asset->mesh)
+            return false;
+        auto mesh = *asset->mesh;
+        for (auto &slot : mesh.materials) {
+            slot.clearCoat = 0;
+            slot.layers = layers;
+        }
+        return store.updateMesh(coatAsset,std::move(mesh),"Set fabric material",coatError);
+    };
+    bool clothReady = dressCloth({});
+    const auto clothBare = settled(clothShot);
+    clothReady &= dressCloth({{0.18f,0.35f,0.85f},0.52f});
+    const auto cloth = settled(clothShot);
+    {
+        std::ostringstream package;
+        QFile file(playablePath);
+        const bool exportedCloth = WorldRuntime::exportScene(store,package) && file.open(QIODevice::WriteOnly);
+        const auto bytes = package.str();
+        const bool written = exportedCloth && file.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+        file.close();
+        const auto played = written ? playerCapture(clothShot,cloth.size()) : QImage();
+        const auto alike = difference(played,cloth,"rendering-sheen-editor-player-diff.png");
+        audit.check(page,"sheen","The editor and Player match on a grazing fabric highlight",
+                    clothReady && !played.isNull() && alike.mean <= 1 && alike.share <= 0.005,describe(alike));
+    }
+    clothReady &= dressCloth({{0.18f,0.35f,0.85f},0.88f});
+    const auto clothRough = settled(clothShot);
+    const auto sheenColorChange = difference(cloth,clothBare,"rendering-sheen-color-diff.png");
+    const auto sheenRoughnessChange = difference(cloth,clothRough,"rendering-sheen-roughness-diff.png");
+    audit.check(page,"sheen","Sheen color and roughness visibly affect the fabric",
+                clothReady && sheenColorChange.mean > 0.3 && sheenRoughnessChange.mean > 0.3,
+                describe(sheenColorChange)+" / "+describe(sheenRoughnessChange));
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+
+    // A single glass quad in front of an opaque block. This checks current-frame visibility through the pane.
+    const Shot glassShot{"thin-glass",{-155,-67,2},{-155,-55,2}};
+    store.addCube();
+    if (const auto *selected = store.selectedObject()) {
+        auto block = *selected;
+        block.position = {-155,-54,2};
+        block.scale = {2,1,3};
+        store.updateObject(block,"Object behind the pane");
+    }
+    QString paneAsset;
+    store.addCube();
+    if (const auto *selected = store.selectedObject()) {
+        auto pane = *selected;
+        pane.position = {-155,-57,2};
+        store.updateObject(pane,"Thin glass pane");
+        paneAsset = pane.meshAsset;
+    }
+    const auto makePane = [&](float transmission,std::array<float,4> color,
+                              worldforge::MaterialLayers layers = {},float metallic = 0,float roughness = 0.14f) {
+        if (paneAsset.isEmpty())
+            return false;
+        worldforge::Mesh mesh;
+        mesh.vertices = {{-3,0,-2},{3,0,-2},{3,0,2},{-3,0,2}};
+        mesh.faces.push_back({{{0,{0,0}},{1,{1,0}},{2,{1,1}},{3,{0,1}}},0});
+        auto &surface = mesh.materials.front();
+        surface.color = color;
+        surface.metallic = metallic;
+        surface.roughness = roughness;
+        surface.layers = layers;
+        surface.layers.transmission = transmission;
+        return store.updateMesh(paneAsset,std::move(mesh),"Set the pane material",coatError);
+    };
+    setDisplay({{"fogDensity",0},{"localFogRadius",0},{"bloom",false},{"shadows",false},{"reflections",false}});
+    store.select({});
+    bool paneReady = makePane(0,{1,1,1,1});
+    const auto opaquePane = settled(glassShot);
+    paneReady &= makePane(1,{1,1,1,1});
+    const auto clearPane = settled(glassShot);
+    paneReady &= makePane(1,{0.34f,1,0.55f,1});
+    const auto tintedPane = settled(glassShot);
+    const auto captureMaterialInPlayer = [&](const Shot &shot,const QImage &editor) {
+        std::ostringstream package;
+        QFile file(playablePath);
+        const bool exportedPane = WorldRuntime::exportScene(store,package) && file.open(QIODevice::WriteOnly);
+        const auto bytes = package.str();
+        const bool written = exportedPane && file.write(bytes.data(),qint64(bytes.size())) == qint64(bytes.size());
+        file.close();
+        return written ? playerCapture(shot,editor.size()) : QImage();
+    };
+    {
+        const auto played = captureMaterialInPlayer(glassShot,tintedPane);
+        const auto alike = difference(played,tintedPane,"rendering-glass-editor-player-diff.png");
+        audit.check(page,"glass","The editor and Player match on tinted thin glass",
+                    paneReady && !played.isNull() && alike.mean <= 1 && alike.share <= 0.005,describe(alike));
+    }
+    const auto paneChange = difference(opaquePane,clearPane,"rendering-glass-transmission-diff.png");
+    const auto tintChange = difference(clearPane,tintedPane,"rendering-glass-tint-diff.png");
+    tintedPane.save(output.filePath("rendering-glass.png"));
+    audit.check(page,"glass","A transparent pane reveals the scene and its base color tints the transmitted light",
+                paneReady && !opaquePane.isNull() && !clearPane.isNull() && !tintedPane.isNull()
+                && paneChange.mean > 2 && tintChange.mean > 2,describe(paneChange)+" / "+describe(tintChange));
+
+    setDisplay({{"sunAzimuth",90},{"sunElevation",12}});
+    const std::array<float,4> waxColor{0.77f,0.43f,0.32f,1};
+    worldforge::MaterialLayers wax;
+    wax.subsurface = 1;
+    wax.thickness = 0.004f;
+    wax.scatteringDistance = 0.06f;
+    bool waxReady = makePane(0,waxColor,wax);
+    const auto thinWax = settled(glassShot);
+    wax.thickness = 0.25f;
+    waxReady &= makePane(0,waxColor,wax);
+    const auto thickWax = settled(glassShot);
+    const auto waxChange = difference(thinWax,thickWax,"rendering-subsurface-thickness-diff.png");
+    const auto inner = [](const QImage &frame) {
+        return frame.copy(frame.width()*4/10,frame.height()*4/10,frame.width()/5,frame.height()/5);
+    };
+    audit.check(page,"advanced materials","A thinner backlit surface passes more scattered light",
+        waxReady && !thinWax.isNull() && !thickWax.isNull() && luminance(inner(thinWax)) > luminance(inner(thickWax))+0.03,
+        describe(waxChange));
+
+    const Shot metalShot{"anisotropy",{-155,-67,0.4f},{-155,-55,2}};
+    setDisplay({{"sunAzimuth",-90},{"sunElevation",10}});
+    const std::array<float,4> metalColor{0.68f,0.63f,0.53f,1};
+    worldforge::MaterialLayers brushed;
+    brushed.anisotropy = 0.83f;
+    bool metalReady = makePane(0,metalColor,brushed,1,0.26f);
+    const auto along = settled(metalShot);
+    brushed.anisotropyRotation = 1.5707963f;
+    metalReady &= makePane(0,metalColor,brushed,1,0.26f);
+    const auto across = settled(metalShot);
+    const auto metalChange = difference(along,across,"rendering-anisotropy-rotation-diff.png");
+    const auto metalPlayer = captureMaterialInPlayer(metalShot,across);
+    const auto metalAlike = difference(metalPlayer,across,"rendering-anisotropy-editor-player-diff.png");
+    audit.check(page,"advanced materials","Rotating the brush direction rotates the highlight in both renderers",
+        metalReady && !along.isNull() && !across.isNull() && !metalPlayer.isNull() && metalChange.mean > 0.3
+        && metalAlike.mean <= 1 && metalAlike.share <= 0.005,describe(metalChange)+" / "+describe(metalAlike));
+    const auto encodeMap = [](const QImage &image) {
+        QByteArray bytes;
+        QBuffer buffer(&bytes);
+        buffer.open(QIODevice::WriteOnly);
+        image.save(&buffer,"PNG");
+        return std::vector<uint8_t>(bytes.begin(),bytes.end());
+    };
+    bool mappedReady = makePane(1,{0.34f,1,0.55f,1});
+    const auto fullTransmission = settled(glassShot);
+    if (const auto *asset = store.meshAsset(paneAsset)) {
+        auto mesh = *asset->mesh;
+        auto &map = mesh.materials.front().layerMaps[worldforge::Transmission];
+        QImage mask(32,32,QImage::Format_RGBA8888);
+        for (int y = 0; y < mask.height(); ++y)
+            for (int x = 0; x < mask.width(); ++x)
+                mask.setPixelColor(x,y,QColor(x < mask.width()/2 ? 0 : 255,130,220));
+        map = encodeMap(mask);
+        mappedReady &= !map.empty() && store.updateMesh(asset->id,std::move(mesh),"Apply a patterned transmission map",coatError);
+    } else
+        mappedReady = false;
+    const auto mappedGlass = settled(glassShot);
+    const auto mapChange = difference(fullTransmission,mappedGlass,"rendering-transmission-map-diff.png");
+    const auto mapPlayer = captureMaterialInPlayer(glassShot,mappedGlass);
+    const auto mapAlike = difference(mapPlayer,mappedGlass,"rendering-transmission-map-editor-player-diff.png");
+    audit.check(page,"material maps","The transmission map changes coverage and matches in both renderers",
+        mappedReady && !mappedGlass.isNull() && !mapPlayer.isNull() && mapChange.mean > 1
+        && mapAlike.mean <= 1 && mapAlike.share <= 0.005,describe(mapChange)+" / "+describe(mapAlike));
+
+    const Shot wetShot{"wet-ground",{-155,-63,4},{-155,-55,2}};
+    setDisplay({{"sunAzimuth",-90},{"sunElevation",30}});
+    worldforge::Mesh groundMesh;
+    groundMesh.vertices = {{-3,-3,0},{3,-3,0},{3,3,0},{-3,3,0}};
+    groundMesh.faces.push_back({{{0,{0,0}},{1,{1,0}},{2,{1,1}},{3,{0,1}}},0});
+    auto &groundMaterial = groundMesh.materials.front();
+    groundMaterial.color = {0.56f,0.49f,0.4f,1};
+    groundMaterial.roughness = 0.81f;
+    QImage packedStreet(48,48,QImage::Format_RGBA8888), streetColor(48,48,QImage::Format_RGBA8888);
+    for (int y = 0; y < packedStreet.height(); ++y)
+        for (int x = 0; x < packedStreet.width(); ++x) {
+            const bool raised = (y/6+x/12)%2 == 0;
+            const int tone = raised ? 167 : 102;
+            packedStreet.setPixelColor(x,y,QColor(255,raised ? 255 : 45,x < packedStreet.width()/2 ? 0 : 255));
+            streetColor.setPixelColor(x,y,QColor(tone,tone,tone));
+        }
+    groundMaterial.occlusionTexture = encodeMap(packedStreet);
+    groundMaterial.baseColorTexture = encodeMap(streetColor);
+    const auto installGround = [&] {
+        return !paneAsset.isEmpty() && store.updateMesh(paneAsset,groundMesh,"Set the pavement material",coatError);
+    };
+    bool streetReady = installGround();
+    const auto dryGround = settled(wetShot);
+    groundMaterial.layers.wetness = 0.76f;
+    streetReady &= installGround();
+    const auto wetGround = settled(wetShot);
+    groundMaterial.layers.puddles = 0.88f;
+    streetReady &= installGround();
+    const auto pooled = settled(wetShot);
+    const auto wetChange = difference(dryGround,wetGround,"rendering-wet-vs-dry-diff.png");
+    const auto poolChange = difference(wetGround,pooled,"rendering-puddles-diff.png");
+    const auto poolPlayer = captureMaterialInPlayer(wetShot,pooled);
+    const auto poolAlike = difference(poolPlayer,pooled,"rendering-puddles-editor-player-diff.png");
+    audit.check(page,"street materials","Wet pavement and masked puddles change the lighting in both renderers",
+        streetReady && !pooled.isNull() && !poolPlayer.isNull() && wetChange.mean > 0.25 && poolChange.mean > 0.15
+        && poolAlike.mean <= 1 && poolAlike.share <= 0.005,
+        describe(wetChange)+" / "+describe(poolChange)+" / "+describe(poolAlike));
+
+    groundMaterial.layers = {};
+    groundMaterial.layers.heightScale = 0.115f;
+    streetReady &= installGround();
+    const auto relief = settled(wetShot);
+    const auto reliefChange = difference(dryGround,relief,"rendering-parallax-diff.png");
+    const auto reliefPlayer = captureMaterialInPlayer(wetShot,relief);
+    const auto reliefAlike = difference(reliefPlayer,relief,"rendering-parallax-editor-player-diff.png");
+    audit.check(page,"street materials","Parallax occlusion shifts the pavement pattern at a grazing angle",
+        streetReady && !relief.isNull() && !reliefPlayer.isNull() && reliefChange.mean > 0.25
+        && reliefAlike.mean <= 1 && reliefAlike.share <= 0.005,describe(reliefChange)+" / "+describe(reliefAlike));
+
+    store.addCube();
+    QString decalAsset;
+    if (const auto *selected = store.selectedObject()) {
+        auto object = *selected;
+        object.position = {-155,-57,2.002f};
+        store.updateObject(object,"Place a decal above the pavement");
+        decalAsset = object.meshAsset;
+    }
+    auto decalMesh = groundMesh;
+    for (auto &vertex : decalMesh.vertices) {
+        vertex[0] *= 0.65f;
+        vertex[1] *= 0.65f;
+    }
+    auto &decalMaterial = decalMesh.materials.front();
+    decalMaterial.color = {1,0.8f,0.42f,0.85f};
+    decalMaterial.occlusionTexture.clear();
+    decalMaterial.layers = {};
+    decalMaterial.layers.decal = true;
+    decalMaterial.layers.decalOpacity = 0.85f;
+    QImage decalImage(48,48,QImage::Format_RGBA8888);
+    for (int y = 0; y < decalImage.height(); ++y)
+        for (int x = 0; x < decalImage.width(); ++x)
+            decalImage.setPixelColor(x,y,QColor(255,205,40,(x/8+y/8)%2 == 0 ? 255 : 0));
+    decalMaterial.baseColorTexture = encodeMap(decalImage);
+    store.select({});
+    if (decalAsset.isEmpty())
+        streetReady = false;
+    else
+        streetReady &= store.updateMesh(decalAsset,decalMesh,"Apply an alpha-masked pavement marking",coatError);
+    const auto decal = settled(wetShot);
+    const auto decalPlayer = captureMaterialInPlayer(wetShot,decal);
+    const auto decalAlike = difference(decalPlayer,decal,"rendering-decal-editor-player-diff.png");
+    decalMaterial.layers.decalOpacity = 0;
+    if (streetReady)
+        streetReady = store.updateMesh(decalAsset,std::move(decalMesh),"Fade the pavement marking",coatError);
+    const auto invisibleDecal = settled(wetShot);
+    const auto decalChange = difference(decal,invisibleDecal,"rendering-decal-opacity-diff.png");
+    const auto transparentChange = difference(relief,invisibleDecal,"rendering-hidden-decal-diff.png");
+    audit.check(page,"street materials","A decal blends its texture alpha and opacity over the pavement",
+        streetReady && !decalPlayer.isNull() && !invisibleDecal.isNull() && decalChange.mean > 0.5
+        && transparentChange.mean < 0.3 && decalAlike.mean <= 1 && decalAlike.share <= 0.005,
+        describe(decalChange)+" / "+describe(transparentChange)+" / "+describe(decalAlike));
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+
+    const Shot probeShot{"probe-gi",{-183,-64,3},{-183,-58,1.6f}};
+    QString probeFloor;
+    const auto probePlane = [&](float height,worldforge::Point3 emission) {
+        store.addCube();
+        if (!store.selectedObject() || !store.selectedMesh())
+            return false;
+        auto object = *store.selectedObject();
+        object.position = {-183,-58,height};
+        if (height == 1)
+            probeFloor = object.meshAsset;
+        auto plane = worldforge::makePrimitive(worldforge::Primitive::Plane,{12,12,0.1f});
+        if (!plane)
+            return false;
+        plane->materials.front().color = {0.48f,0.48f,0.48f,1};
+        plane->materials.front().emissive = emission;
+        store.updateObject(object,"Place world-space probe test geometry");
+        return store.updateMesh(object.meshAsset,std::move(*plane),"Set the probe test surface",coatError);
+    };
+    const bool probeScene = probePlane(1,{}) && probePlane(5,{1,0.04f,0.015f});
+    store.select({});
+    setDisplay({{"fogDensity",0},{"localFogRadius",0},{"bloom",false},{"shadows",false},{"reflections",false},
+                {"ambientOcclusion",false},{"antiAliasing","Off"},{"probeGi",false}});
+    const auto noProbe = settled(probeShot);
+    setDisplay({{"probeGi",true}});
+    const auto withProbe = settled(probeShot);
+    const auto probePlayer = captureMaterialInPlayer(probeShot,withProbe);
+    const auto probeChange = difference(noProbe,withProbe,"rendering-probe-gi-diff.png");
+    const auto probeAlike = difference(probePlayer,withProbe,"rendering-probe-gi-editor-player-diff.png");
+    audit.check(page,"probe GI","A ceiling above the camera adds diffuse bounce in the editor and Player",
+        probeScene && !withProbe.isNull() && luminance(withProbe) > luminance(noProbe)+0.005 && probeChange.mean > 1
+        && probeAlike.mean <= 1.0 && probeAlike.share <= 0.005,describe(probeChange)+" / "+describe(probeAlike));
+
+    const auto beforeScreenSource = store.history().index();
+    store.addCube();
+    bool screenSource = false;
+    if (store.selectedObject() && store.selectedMesh()) {
+        auto object = *store.selectedObject();
+        object.position = {-182,-58,1.8f};
+        object.scale = {1,0.35f,1.6f};
+        auto mesh = *store.selectedMesh()->mesh;
+        mesh.materials.front().emissive = {1.5f,0.015f,0.02f};
+        store.updateObject(object,"Place a visible light source beside the floor");
+        screenSource = store.updateMesh(object.meshAsset,std::move(mesh),"Set the screen-space test surface",coatError);
+    }
+    store.select({});
+    const Shot screenShot{"screen-gi",probeShot.eye,probeShot.target};
+    setDisplay({{"probeGi",false},{"screenSpaceGi",false},{"ambientOcclusion",false}});
+    const auto screenOff = settled(screenShot);
+    setDisplay({{"screenSpaceGi",true}});
+    const auto screenOn = settled(screenShot);
+    const auto screenPlayer = captureMaterialInPlayer(screenShot,screenOn);
+    // Compare the floor below the emitter. Short-range bounce fades out over a few meters.
+    const auto receiver = [](const QImage &image) {
+        return image.copy(image.width()*52/100,image.height()*63/100,image.width()*21/100,image.height()*9/100);
+    };
+    const auto floorOff = receiver(screenOff), floorOn = receiver(screenOn);
+    const auto screenChange = difference(floorOff,floorOn,"rendering-screen-gi-floor-diff.png");
+    const auto screenAlike = difference(screenPlayer,screenOn,"rendering-screen-gi-editor-player-diff.png");
+    audit.check(page,"screen-space GI","Visible emission adds local bounce with ambient occlusion off",
+        screenSource && !floorOff.isNull() && !floorOn.isNull() && luminance(floorOn) > luminance(floorOff)+0.0007
+        && screenChange.mean > 1.0 && screenAlike.mean <= 1.0 && screenAlike.share <= 0.005,
+        describe(screenChange)+" / "+describe(screenAlike));
+    while (store.history().index() > beforeScreenSource && store.history().canUndo())
+        store.history().undo();
+
+    bool mirror = false;
+    if (const auto *asset = store.meshAsset(probeFloor)) {
+        auto floor = *asset->mesh;
+        floor.materials.front().color = {0.7f,0.7f,0.7f,1};
+        floor.materials.front().metallic = 1;
+        floor.materials.front().roughness = 0.14f;
+        mirror = store.updateMesh(probeFloor,std::move(floor),"Make the floor reflective",coatError);
+    }
+    store.select({});
+    const Shot reflectionShot{"reflection-probes",{-183,-62,4},{-183,-58,1}};
+    setDisplay({{"probeGi",false},{"screenSpaceGi",false},{"reflections",false},{"reflectionProbes",false}});
+    const auto reflectionOff = settled(reflectionShot);
+    setDisplay({{"reflectionProbes",true}});
+    const auto reflectionOn = settled(reflectionShot);
+    const auto reflectionPlayer = captureMaterialInPlayer(reflectionShot,reflectionOn);
+    const auto reflectionChange = difference(reflectionOff,reflectionOn,"rendering-reflection-probes-diff.png");
+    const auto reflectionAlike = difference(reflectionPlayer,reflectionOn,"rendering-reflection-probes-editor-player-diff.png");
+    audit.check(page,"reflection probes","A ceiling outside the camera view reflects in a polished floor",
+        mirror && !reflectionOff.isNull() && !reflectionOn.isNull() && reflectionChange.mean > 3.0
+        && reflectionAlike.mean <= 1.0 && reflectionAlike.share <= 0.005,
+        describe(reflectionChange)+" / "+describe(reflectionAlike));
     while (store.history().index() > historyStart && store.history().canUndo())
         store.history().undo();
 
@@ -3457,21 +4429,26 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
 // same frame (Tests/CyclesReference.py), scored with LDR-FLIP (0 identical, 1 completely different). Both
 // render without fog. The scores are compared with Tests/Golden/realism.json so a rendering change cannot
 // make the engine less realistic unnoticed. Set WORLDFORGE_UPDATE_GOLDEN=1 to record new scores, and
-// WORLDFORGE_REALISM_SAMPLES to change the Cycles sample count (default 256).
+// WORLDFORGE_REALISM_SAMPLES to change the Cycles sample count (default 256). Set WORLDFORGE_REALISM_STUDIO
+// to use a specific Studio executable for the reference.
 void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
 {
     const QString page = "Realism";
     QTemporaryDir directory;
-    ProjectStore store;
     QString error;
     // The comparison uses the physical atmosphere, which Cycles receives as the same sky (Player/ReferenceScene.cpp).
-    if (!directory.isValid() || !store.createStarterProject("Realism QA",
+    if (!directory.isValid()) {
+        audit.check(page,"workflow","Create temporary storage for the street",false,directory.errorString());
+        return;
+    }
+    ProjectStore store(QDir(directory.filePath("index")));
+    if (!store.createStarterProject("Realism QA",
         {{"location",directory.filePath("Realism QA")},{"starter","street"},
          {"worldDefaults",QJsonObject{{"skyModel","Physical"}}}},error)) {
         audit.check(page,"workflow","Create the Playable Street starter",false,error);
         return;
     }
-    const auto studio = EmbeddedStudio::installedExecutable();
+    const auto studio = qEnvironmentVariable("WORLDFORGE_REALISM_STUDIO",EmbeddedStudio::installedExecutable());
     if (studio.isEmpty()) {
         audit.record(page,"reference","Render the Cycles references","SKIP",QStringLiteral("WorldForge Studio is not installed."));
         return;
@@ -3577,7 +4554,7 @@ void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
                     rendered ? QString("%1 samples%2 in %3 s with Studio %4").arg(details.value("samples").toInt())
                                    .arg(details.value("denoised").toBool() ? QStringLiteral(", denoised") : QString())
                                    .arg(details.value("seconds").toDouble(),0,'f',1).arg(details.value("version").toString())
-                             : log.right(400));
+                             : (log.trimmed().isEmpty() ? cycles.errorString() : log.right(400)));
         if (!rendered)
             continue;
         const QImage engine(folder.filePath("engine.png")), reference(folder.filePath("cycles.png"));
@@ -4862,6 +5839,8 @@ void surfaceLibraryWorkflow(const QDir &output,Audit &audit)
     surface.metallic = 0.72f;
     surface.roughness = 0.56f;
     surface.emission = 0.85f;
+    surface.clearCoat = 0.7f;
+    surface.clearCoatRoughness = 0.18f;
     const bool materialSaved = std::ranges::none_of(surface.maps,&QString::isEmpty)
         && reopened.saveProjectMaterial(material,surface,error) == material;
     const auto hasChannels = [&](const worldforge::MeshMaterial &slot) {
@@ -4872,6 +5851,7 @@ void surfaceLibraryWorkflow(const QDir &output,Audit &audit)
                 return false;
         }
         return slot.metallic == surface.metallic && slot.roughness == surface.roughness
+            && slot.clearCoat == surface.clearCoat && slot.clearCoatRoughness == surface.clearCoatRoughness
             && slot.emissive == worldforge::Point3{surface.emission,surface.emission,surface.emission};
     };
     const auto pbrFrame = [&] {
@@ -4896,6 +5876,38 @@ void surfaceLibraryWorkflow(const QDir &output,Audit &audit)
         pbrSaved && saved.project() && saved.project()->surfaces.materials.value(material) == surface
         && pbrPlayer.exitCode == 0 && pbrPlayer.report.value("surfaceMaps").toInt() == 8,
         playerSummary(pbrPlayer));
+
+    const auto layeredPreview = [&] {
+        auto mesh = pbrMesh;
+        auto &slot = mesh.materials[mesh.faces.front().material];
+        slot.layers.sheenColor = {0.23f,0.47f,0.63f};
+        slot.layers.sheenRoughness = 0.3f;
+        slot.layers.transmission = 0.72f;
+        slot.layers.ior = 1.41f;
+        slot.layers.coatNormalScale = 0.53f;
+        slot.layers.anisotropy = 0.6f;
+        slot.layers.anisotropyRotation = 0.78f;
+        // Use distinct valid images so swapped channels cannot pass the round-trip.
+        QImage rgbaMap(fresh.size(),QImage::Format_RGBA8888);
+        for (std::size_t i = 0; i < slot.layerMaps.size(); ++i) {
+            rgbaMap.fill(QColor(int(i)*17,120,210,80+int(i)*25));
+            QByteArray bytes;
+            QBuffer buffer(&bytes);
+            buffer.open(QIODevice::WriteOnly);
+            rgbaMap.save(&buffer,"PNG");
+            slot.layerMaps[i].assign(bytes.begin(),bytes.end());
+        }
+        const auto glb = exportGlb(mesh,"Layered Surface",error);
+        const auto importedMesh = importGlb(glb,error);
+        if (!importedMesh || importedMesh->faces.empty())
+            return false;
+        const auto &importedSlot = importedMesh->materials[importedMesh->faces.front().material];
+        return importedSlot.layerMaps == slot.layerMaps && importedSlot.layers == slot.layers
+            && hasChannels(importedSlot) && glb.contains("\"TANGENT\"")
+            && glb.contains("\"KHR_materials_anisotropy\"") && glb.contains("\"KHR_materials_sheen\"")
+            && glb.contains("\"KHR_materials_ior\"") && glb.contains("\"KHR_materials_transmission\"");
+    }();
+    audit.check(page,"layer maps","GLB round-trips five extensions, seven layer maps and a tangent frame",layeredPreview,error);
 
     const auto sculptPath = qEnvironmentVariable("WORLDFORGE_SCULPT_TEST_GLB");
     if (!sculptPath.isEmpty()) {
@@ -4936,6 +5948,25 @@ void surfaceLibraryWorkflow(const QDir &output,Audit &audit)
             audit.check(page,"sculpt delivery","Publish the reduced sculpt and archive its editable source",false,error);
         }
     }
+    auto streetMaterial = surface;
+    streetMaterial.layerMaps[worldforge::CoatNormal] = surface.maps[0];
+    streetMaterial.layers.coatNormalScale = 0.75f;
+    streetMaterial.layers.wetness = 0.41f;
+    streetMaterial.layers.puddles = 0.28f;
+    streetMaterial.layers.heightScale = 0.027f;
+    streetMaterial.layers.decal = true;
+    streetMaterial.layers.decalOpacity = 0.83f;
+    const bool streetSaved = reopened.saveProjectMaterial(material,streetMaterial,error) == material && reopened.save(&error);
+    ProjectStore reopenedStreet;
+    const auto *streetAsset = reopenedStreet.meshAsset(first);
+    const bool streetRestored = streetAsset && std::ranges::any_of(streetAsset->mesh->materials,[&](const auto &slot) {
+        return slot.sharedMaterialId == material.toStdString() && slot.layers == streetMaterial.layers
+            && !slot.layerMaps[worldforge::CoatNormal].empty()
+            && slot.layerMaps[worldforge::CoatNormal] == slot.normalTexture;
+    });
+    audit.check(page,"street materials","Save and reopen restore street controls and linked layer maps",
+        streetSaved && streetRestored && reopenedStreet.project()
+        && reopenedStreet.project()->surfaces.materials.value(material) == streetMaterial,error);
 }
 
 void studioUvRoundTrip(const QDir &output,const QDir &root,Audit &audit)
@@ -6711,7 +7742,21 @@ int main(int argc, char **argv)
     const bool studio = app.arguments().size() == 4 && app.arguments().last() == "--studio-publishing";
     const bool forgeAi = app.arguments().size() == 4 && app.arguments().last() == "--forge-ai";
     const bool streetAudit = app.arguments().size() == 4 && app.arguments().last() == "--street";
+    const bool r3Performance = app.arguments().size() == 4 && app.arguments().last() == "--r3-performance";
+    const bool districtProfile = app.arguments().size() == 4 && app.arguments().last() == "--district-profile";
+    const bool districtLarge = app.arguments().size() == 4 && app.arguments().last() == "--district-large";
+    const bool districtTextured = app.arguments().size() == 4 && app.arguments().last() == "--district-textured";
+    const bool districtStreaming = app.arguments().size() == 4 && app.arguments().last() == "--district-streaming";
+    const bool districtMeshlets = app.arguments().size() == 4 && app.arguments().last() == "--district-meshlets";
+    const bool districtMeshletsIndexed = app.arguments().size() == 4 && app.arguments().last() == "--district-meshlets-indexed";
+    const bool districtCompare = app.arguments().size() == 4 && app.arguments().last() == "--district-compare";
+    const bool districtOcclusion = app.arguments().size() == 4 && app.arguments().last() == "--district-occlusion";
+    const bool districtAudit = districtProfile || districtLarge || districtTextured || districtCompare || districtOcclusion || districtStreaming
+        || districtMeshlets || districtMeshletsIndexed
+        || (app.arguments().size() == 4 && app.arguments().last() == "--district");
     const bool rendering = app.arguments().size() == 4 && app.arguments().last() == "--rendering";
+    const bool sunrise = app.arguments().size() == 4 && app.arguments().last() == "--sunrise";
+    const bool sunset = app.arguments().size() == 4 && app.arguments().last() == "--sunset";
     const bool realism = app.arguments().size() == 4 && app.arguments().last() == "--realism";
     const bool engineSession = app.arguments().size() == 4 && app.arguments().last() == "--engine-session";
     const bool programming = app.arguments().size() == 4 && app.arguments().last() == "--programming";
@@ -6719,7 +7764,7 @@ int main(int argc, char **argv)
     const bool surfaceLibrary = app.arguments().size() == 4 && app.arguments().last() == "--surface-library";
     const bool studioUv = app.arguments().size() == 4 && app.arguments().last() == "--studio-uv";
     const bool studioCharacter = app.arguments().size() == 4 && app.arguments().last() == "--studio-character";
-    if (!authoring && !benchmark && !studio && !forgeAi && !streetAudit && !rendering && !realism && !engineSession
+    if (!authoring && !benchmark && !studio && !forgeAi && !streetAudit && !r3Performance && !districtAudit && !rendering && !sunrise && !sunset && !realism && !engineSession
         && !surfaceLibrary && !studioUv && !studioCharacter && !programming && !nativeGameplay && app.arguments().size() != 3)
         return 2;
     const QDir output(app.arguments().at(1));
@@ -6767,6 +7812,11 @@ int main(int argc, char **argv)
         controls.flush();
         return audit.failures ? 1 : 0;
     }
+    if (sunrise || sunset) {
+        sunSweepWorkflow(output,audit,sunrise);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
     if (realism) {
         realismWorkflow(output,root,audit);
         controls.flush();
@@ -6774,6 +7824,21 @@ int main(int argc, char **argv)
     }
     if (streetAudit) {
         streetWorkflow(output,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (r3Performance) {
+        r3PerformanceWorkflow(output,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (districtAudit) {
+        if (districtOcclusion)
+            qputenv("WORLDFORGE_OCCLUSION","1");
+        const bool textured = districtTextured || districtStreaming;
+        const QString meshlets = districtMeshlets ? "1" : districtMeshletsIndexed ? "indexed" : "";
+        districtWorkflow(output,audit,{.profile = districtProfile,.large = districtLarge || textured,.textured = textured,
+            .compareDirect = districtCompare,.compareOcclusion = districtOcclusion,.streamTextures = districtStreaming,.meshlets = meshlets});
         controls.flush();
         return audit.failures ? 1 : 0;
     }
@@ -6808,7 +7873,7 @@ int main(int argc, char **argv)
         return audit.failures ? 1 : 0;
     }
 
-    const QDir data(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation));
+    const QDir data = ProjectStore::defaultStorageDirectory();
     if (authoring)
         authoringData(root, data, audit);
     else {

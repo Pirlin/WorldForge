@@ -636,6 +636,20 @@ Inspector::Inspector(ProjectStore &store, QWidget *parent)
     intensity_->setAccessibleName(tr("Light intensity"));
     lightForm->addRow(tr("Intensity"), intensity_);
     connect(intensity_, &QDoubleSpinBox::editingFinished, this, &Inspector::apply);
+    lampColor_ = new QPushButton(light);
+    lampColor_->setAccessibleName(tr("Lamp color"));
+    lightForm->addRow(tr("Lamp color"),lampColor_);
+    connect(lampColor_,&QPushButton::clicked,this,[this] {
+        const auto *current = store_.selectedObject();
+        if (!current || (current->type != "Point Light" && current->type != "Spot Light"))
+            return;
+        auto next = *current;
+        const auto color = QColorDialog::getColor(lampColor(next),this,tr("Lamp color"));
+        if (color.isValid() && color != lampColor(next)) {
+            next.details.insert("lightColor",color.name());
+            store_.updateObject(next,tr("Set lamp color"));
+        }
+    });
     // Spot lights: the cone's full angle and how much of its edge fades, as Blender's Spot Size and Blend.
     coneAngle_ = new QDoubleSpinBox(light);
     coneAngle_->setRange(1, 179);
@@ -832,6 +846,8 @@ void Inspector::refresh()
     intensity_->setEnabled(light);
     const bool point = object->type == "Point Light" || object->type == "Spot Light";
     const bool spot = object->type == "Spot Light";
+    qobject_cast<QFormLayout *>(lampColor_->parentWidget()->layout())->setRowVisible(lampColor_,point);
+    lampColor_->setText(lampColor(*object).name());
     coneAngle_->setEnabled(spot);
     coneBlend_->setEnabled(spot);
     coneAngle_->setValue(spot ? spotConeAngle(*object) : defaultConeAngle);

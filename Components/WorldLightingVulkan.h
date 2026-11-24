@@ -31,8 +31,9 @@ struct LightingUniform {
     // to trace, the longest ray in meters.
     float previousViewProjection[16];
     float reflectionSettings[4];
+    std::array<float,4> probeGrid{}, probeSettings{};
 };
-static_assert(sizeof(LightingUniform) == 1984);
+static_assert(sizeof(LightingUniform) == 2016);
 
 class WorldLightingVulkan {
 public:
@@ -53,12 +54,15 @@ public:
     VkFramebuffer framebuffer(int frame) const { return frames_[frame].shadow.framebuffer; }
     // Binding 8: the previous frame's TAA result (HdrFrame::previousFrame), which changes every frame.
     void bindPreviousFrame(int frame,VkSampler sampler,VkImageView view);
+    void bindProbes(int frame,VkBuffer buffer,VkDeviceSize bytes);
     // The sky visibility maps (Engine/Render/SkyVisibility.h), rendered with pass() like the shadow atlas.
     // One set shared by all frames: the viewport re-renders it only when the scene changes.
     VkFramebuffer skyFramebuffer() const { return sky_.framebuffer; }
     // The point light shadow atlas (LightClusters.h), shared by all frames like the sky maps.
     VkFramebuffer pointShadowFramebuffer() const { return pointShadows_.framebuffer; }
     VkRenderPass pass() const { return pass_; }
+    VkFormat depthFormat() const { return depthFormat_; }
+    VkRenderPass pointUpdatePass() const { return pointUpdatePass_; }
     VkDescriptorSetLayout layout() const { return layout_; }
 
 private:
@@ -88,8 +92,10 @@ private:
     bool allocate(VkDeviceMemory &memory,VkMemoryRequirements requirements,VkMemoryPropertyFlags properties);
     QVulkanDeviceFunctions *vk_ = nullptr;
     VkDevice device_{};
+    VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
     VkPhysicalDeviceMemoryProperties memory_{};
     VkRenderPass pass_{};
+    VkRenderPass pointUpdatePass_{};
     VkDescriptorSetLayout layout_{};
     VkDescriptorPool pool_{};
     VkSampler sampler_{};

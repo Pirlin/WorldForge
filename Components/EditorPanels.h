@@ -61,6 +61,7 @@ private:
     QLabel *geometryState_;
     QPushButton *materialColor_;
     QDoubleSpinBox *intensity_;
+    QPushButton *lampColor_ = nullptr;
     QDoubleSpinBox *coneAngle_ = nullptr, *coneBlend_ = nullptr; // spot lights
     QComboBox *bodyMode_;
     QComboBox *colliderShape_ = nullptr;

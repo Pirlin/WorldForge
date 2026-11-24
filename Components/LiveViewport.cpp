@@ -2,6 +2,7 @@
 #include "State/ProjectStore.h"
 #include "State/WorldRuntime.h"
 #include "Engine/Geometry/MeshClip.h"
+#include "Engine/Render/CameraProjection.h"
 #include <QDebug>
 #include <QFileInfo>
 #include "State/WorldScene.h"
@@ -29,6 +30,9 @@
 #include <QTimer>
 #include "Components/WorldLightingVulkan.h"
 #include "Components/ViewportFrameVulkan.h"
+#include "Engine/Render/Vulkan/ProbeTrace.h"
+#include "Engine/Render/Vulkan/DrawCulling.h"
+#include "Engine/Render/Vulkan/OcclusionDepth.h"
 
 #include <algorithm>
 #include <cmath>
@@ -96,10 +100,31 @@ struct Light {
     // Spot lights (State/WorldScene.h): the direction they point, the full cone in radians (0 for a point light), blend.
     QVector3D spotDirection{0,0,-1};
     float spotAngle = 0, spotBlend = 0.15f;
+    wf::color::Rgb color{1,1,1};
 };
 
 using ImageRange = std::array<uint32_t,3>;
-constexpr std::size_t materialWords = 18;
+// An offset and dimensions for each map, followed by the material factors (Scene.frag).
+constexpr std::size_t materialWords = 3*wf::materialTextureCount+21;
+
+void writeMaterialFactors(std::vector<uint32_t> &pixels,std::size_t &header,const wf::MeshMaterial &slot)
+{
+    for (const auto value : slot.emissive)
+        pixels[header++] = std::bit_cast<uint32_t>(value);
+    pixels[header++] = std::bit_cast<uint32_t>(slot.clearCoat);
+    pixels[header++] = std::bit_cast<uint32_t>(slot.clearCoatRoughness);
+    for (const float value : slot.layers.sheenColor)
+        pixels[header++] = std::bit_cast<uint32_t>(value);
+    pixels[header++] = std::bit_cast<uint32_t>(slot.layers.sheenRoughness);
+    pixels[header++] = std::bit_cast<uint32_t>(slot.layers.transmission);
+    pixels[header++] = std::bit_cast<uint32_t>(slot.layers.ior);
+    for (float value : {slot.layers.subsurface,slot.layers.thickness,slot.layers.scatteringDistance,
+                        slot.layers.anisotropy,slot.layers.anisotropyRotation,slot.layers.coatNormalScale})
+        pixels[header++] = std::bit_cast<uint32_t>(value);
+    const float decalOpacity = slot.layers.decal ? slot.layers.decalOpacity*slot.color[3] : -1.0f;
+    for (const float value : {slot.layers.wetness,slot.layers.puddles,slot.layers.heightScale,decalOpacity})
+        pixels[header++] = std::bit_cast<uint32_t>(value);
+}
 
 ImageRange appendMaterialImage(std::vector<uint32_t> &pixels,const QImage &source)
 {
@@ -170,6 +195,8 @@ std::vector<Light> sceneLights(const QList<SceneObject> &objects,const WorldAtmo
         }
         const auto vector = directional ? QQuaternion::fromEulerAngles(object.rotation).rotatedVector({0,0,1}) : object.position;
         Light light{vector,lightUnits(object),directional};
+        if (!directional)
+            light.color = linearLampColor(object);
         if (object.type == "Spot Light") {
             light.spotDirection = spotDirection(object);
             light.spotAngle = float(qDegreesToRadians(spotConeAngle(object)));
@@ -208,6 +235,7 @@ struct Geometry {
     float ambient = 1;
     struct FaceRange { std::size_t triangles,triangleEnd,lines,lineEnd; };
     std::vector<Vertex> triangles, lines, overlays, selectionOutline;
+    std::vector<wf::vk::TriangleRange> transparent;
     std::vector<PickTriangle> picks;
     std::vector<FaceRange> faceRanges;
     std::vector<float> faceLighting;
@@ -278,7 +306,7 @@ struct Geometry {
                 const auto mapCount = std::ranges::count_if(maps,[](const auto *image) { return !image->empty(); })
                     + (hasPaint(i) && slot.baseColorTexture.empty() ? 1 : 0);
                 count += mapCount;
-                materialCount += mapCount > 0 || slot.emissive != wf::Point3{};
+                materialCount += mapCount > 0 || slot.hasAdvancedSurface();
             }
             const auto capacity = std::size_t(WorldLightingVulkan::textureCapacity);
             const auto headers = 1+materialWords*materialCount;
@@ -289,7 +317,7 @@ struct Geometry {
             for (std::size_t i = 0; side > 0 && i < mesh.materials.size(); ++i) {
                 const auto &slot = mesh.materials[i];
                 const auto maps = slot.previewTextures();
-                if (!hasPaint(i) && slot.emissive == wf::Point3{}
+                if (!hasPaint(i) && !slot.hasAdvancedSurface()
                     && std::ranges::none_of(maps,[](const auto *image) { return !image->empty(); }))
                     continue;
                 tiles[i] = uint32_t(header);
@@ -303,8 +331,7 @@ struct Geometry {
                     std::ranges::copy(range,texturePixels.begin()+header);
                     header += range.size();
                 }
-                for (const auto value : slot.emissive)
-                    texturePixels[header++] = std::bit_cast<uint32_t>(value);
+                writeMaterialFactors(texturePixels,header,slot);
             }
         }
         QMatrix4x4 transform;
@@ -435,6 +462,8 @@ struct Geometry {
                 if (pickable)
                     picks.push_back({positions[a.vertex], positions[b.vertex], positions[c.vertex], object.id, int(i)});
             });
+            if (material.layers.isTransparent() && !clay && (!modelOnly || textured) && triangles.size() > firstTriangle)
+                transparent.push_back({firstTriangle,triangles.size()-firstTriangle});
             if (outlineEye) {
                 const auto origin = positions[face.corners.front().vertex];
                 const bool front = QVector3D::dotProduct(transformNormal(defaultNormal),*outlineEye-origin) > 0;
@@ -903,6 +932,13 @@ public:
         framed_ = true;
         invalidate();
     }
+
+    void setDrawCullingEnabled(bool enabled)
+    {
+        cullingEnabled_ = enabled;
+        dirty_ = true;
+        requestUpdate();
+    }
     void setObjectPreview(bool enabled,const SceneObject *object)
     {
         if (objectView_ == enabled && !object && !objectPreview_)
@@ -1102,6 +1138,14 @@ public:
     }
     bool rendered() const { return rendered_; }
     bool temporalSettled() const { return temporalSettled_; }
+    std::optional<float> captureMeteredLuminance()
+    {
+        // The next reuse of each frame slot reads its histogram after the frame fence.
+        meteredLuminance_.reset();
+        for (int frame = 0; frame <= concurrentFrameCount(); ++frame)
+            grab();
+        return meteredLuminance_;
+    }
     void previewTerrain()
     {
         const auto *object = store_.selectedObject();
@@ -1425,14 +1469,16 @@ private:
         QMatrix4x4 projection, view;
         const float aspect = float(size.width()) / std::max(size.height(), 1);
         const float extent = distance_*0.41421356f;
-        const float nearPlane = std::max(0.001f, distance_/1000), farPlane = std::max(100.0f, distance_*100.0f);
+        const bool shot = cameraPreview_.has_value() || (runtime_ && runtime_->gameplay().activeShot());
+        const float nearPlane = shot ? wf::camera::nearPlane : std::max(0.001f,distance_/1000);
+        const float farPlane = shot ? wf::camera::farPlane : std::max(100.0f,distance_*100.0f);
         if (ortho_)
             projection.ortho(-extent*aspect,extent*aspect,-extent,extent,nearPlane,farPlane);
         else
-            projection.perspective(45.0f, aspect, nearPlane, farPlane);
+            projection.perspective(wf::camera::verticalFovDegrees,aspect,nearPlane,farPlane);
         const auto [eye,target] = viewPose();
-        const QVector3D up = std::abs((eye-target).normalized().z()) > 0.99995f
-            ? QVector3D(-std::cos(yaw_),-std::sin(yaw_),0) : QVector3D(0,0,1);
+        const QVector3D poleUp = shot ? QVector3D(0,1,0) : QVector3D(-std::cos(yaw_),-std::sin(yaw_),0);
+        const QVector3D up = std::abs((eye-target).normalized().z()) > 0.99995f ? poleUp : QVector3D(0,0,1);
         view.lookAt(eye,target,up);
         return clipCorrectionMatrix()*projection*view;
     }
@@ -1886,8 +1932,7 @@ private:
                     std::ranges::copy(range,worldTexturePixels_.begin()+header);
                     header += range.size();
                 }
-                for (float value : material.emissive)
-                    worldTexturePixels_[header++] = std::bit_cast<uint32_t>(value);
+                writeMaterialFactors(worldTexturePixels_,header,material);
             }
         }
     }
@@ -2076,6 +2121,7 @@ private:
     bool rendered_ = false;
     // False while a still view is still averaging its TAA samples; captureFrame waits for it.
     bool temporalSettled_ = true;
+    std::optional<float> meteredLuminance_;
     ModelDomain domain_ = ModelDomain::Object;
     std::set<ModelComponent> selection_;
     bool xray_ = false, ortho_ = false;
@@ -2161,6 +2207,7 @@ private:
     std::optional<WorldRuntime> runtime_;
     QTimer timer_;
     QElapsedTimer windClock_;
+    bool cullingEnabled_ = true;
     QElapsedTimer clock_;
     double elapsed_ = 0;
     QVector3D savedTarget_;
@@ -2208,6 +2255,7 @@ public:
         if (window_.owner_.rendererName().isEmpty())
             window_.owner_.setRenderDevice(QString::fromUtf8(window_.physicalDeviceProperties()->deviceName), {}, 0, 0);
         frames_.resize(window_.concurrentFrameCount());
+        probeFrames_.resize(window_.concurrentFrameCount());
         motionFrames_.resize(window_.concurrentFrameCount());
         motionValid_ = false;
         skyValid_ = skyInitialized_ = false;
@@ -2227,6 +2275,20 @@ public:
             window_.report(QObject::tr("Vulkan pipeline layout creation failed."));
         if (!frame_.create(window_))
             window_.report(QObject::tr("Vulkan could not create the HDR scene pass."));
+        else {
+            probeCompute_ = frame_.device().supportsCompute(window_.graphicsQueueFamilyIndex());
+            if (probeCompute_ && !window_.modelOnly_) {
+                VkPhysicalDeviceFeatures features{};
+                const auto &device = frame_.device();
+                device.api->vkGetPhysicalDeviceFeatures(device.physical,&features);
+                // QVulkanWindow enables supported Vulkan 1.0 features for the device it creates.
+                const bool indirectCount = window_.supportedDeviceExtensions().contains(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME)
+                    && qEnvironmentVariableIntValue("WORLDFORGE_FIXED_INDIRECT") != 1;
+                drawCulling_.create(device,uint32_t(window_.concurrentFrameCount()),features.multiDrawIndirect != VK_FALSE,indirectCount);
+                if (qEnvironmentVariableIntValue("WORLDFORGE_OCCLUSION") == 1)
+                    occlusionDepth_.create(device,uint32_t(window_.concurrentFrameCount()));
+            }
+        }
     }
     void initSwapChainResources() override
     {
@@ -2241,6 +2303,8 @@ public:
                                          spirv(":/shaders/BloomDown.frag.spv"),spirv(":/shaders/BloomUp.frag.spv"),
                                          spirv(":/shaders/DepthOfField.frag.spv"),spirv(":/shaders/MotionBlur.frag.spv"));
             triangles_ = pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true);
+            glassTransmission_ = pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,false,Pass::Scene,wf::vk::MaterialPass::Transmission);
+            glassRadiance_ = pipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,false,Pass::Scene,wf::vk::MaterialPass::Radiance);
             lines_ = pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false);
             if (window_.modelOnly_)
                 overlays_ = pipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST,false,Pass::Overlay);
@@ -2256,6 +2320,10 @@ public:
     {
         if (triangles_)
             vk_->vkDestroyPipeline(device_, triangles_, nullptr);
+        for (const auto glass : {glassTransmission_,glassRadiance_})
+            if (glass)
+                vk_->vkDestroyPipeline(device_,glass,nullptr);
+        glassTransmission_ = glassRadiance_ = VK_NULL_HANDLE;
         if (lines_)
             vk_->vkDestroyPipeline(device_, lines_, nullptr);
         if (overlays_)
@@ -2272,6 +2340,11 @@ public:
     }
     void releaseResources() override
     {
+        drawCulling_.destroy();
+        occlusionDepth_.destroy();
+        cullBatches_.clear();
+        probeFrames_.clear();
+        probeField_.clear();
         for (auto &frame : frames_)
             destroy(frame);
         frames_.clear();
@@ -2295,7 +2368,8 @@ public:
         temporal.enabled = environment.temporalAntiAliasing;
         const bool playing = window_.runtime_.has_value();
         const bool changed = !previousValid_ || camera != previousCamera_ || size != previousSize_
-            || window_.geometryRevision_ != previousGeometry_ || window_.textureRevision_ != previousTextures_;
+            || window_.geometryRevision_ != previousGeometry_ || window_.textureRevision_ != previousTextures_
+            || window_.cullingEnabled_ != previousCulling_;
         // Screen-space reflections and contact shadows trace the previous frame, which after a change shows another
         // view or the scene before the edit. The first frame after a change is a warm-up: the average starts over once
         // more after it, so every frame in it traces a frame of the same view, as Player captures do.
@@ -2314,6 +2388,7 @@ public:
         previousSize_ = size;
         previousGeometry_ = window_.geometryRevision_;
         previousTextures_ = window_.textureRevision_;
+        previousCulling_ = window_.cullingEnabled_;
         previousValid_ = true;
         return temporal;
     }
@@ -2324,6 +2399,7 @@ public:
     {
         namespace color = worldforge::color;
         if (!environment.autoExposure) {
+            window_.meteredLuminance_.reset();
             adaptedStops_ = std::numeric_limits<float>::quiet_NaN();
             adaptClock_.invalidate();
             return environment.exposure;
@@ -2333,6 +2409,7 @@ public:
             adaptClock_.start();
         float average = 0;
         if (frame_.takeMeter(frameIndex,average)) {
+            window_.meteredLuminance_ = average;
             const float target = color::autoExposureStops(average,environment.exposureCompensation);
             adaptedStops_ = std::isnan(adaptedStops_) ? target : color::adaptExposure(adaptedStops_,target,std::min(seconds,0.25f));
             if (std::abs(target-adaptedStops_) > 0.01f)
@@ -2386,7 +2463,12 @@ public:
         // The physical sky's sun reaches the ground dimmer and warmer than overhead (sunLight); the gradient sky's
         // sun is as authored.
         const auto &sunLight = skyLight.sunLight;
-        const float sunStrength = 0.2126f*sunLight[0]+0.7152f*sunLight[1]+0.0722f*sunLight[2];
+        const bool physicalWeather = environment.physicalSky && !window_.modelOnly_;
+        const double seconds = window_.runtime_ ? window_.runtime_->clipTime() : 0;
+        const float clouds = physicalWeather ? environment.weather.cloudsAt(seconds) : 0;
+        const float clearSun = 0.2126f*sunLight[0]+0.7152f*sunLight[1]+0.0722f*sunLight[2];
+        const float cloudTransmission = wf::cloudSunTransmission(clouds);
+        const float sunStrength = clearSun*cloudTransmission;
         const float windTime = float(window_.windClock_.elapsed()%1000000)*0.001f;
         const bool shadows = environment.shadows && sunStrength > 0 && !geometry.triangles.empty();
         LightingUniform lighting{};
@@ -2403,8 +2485,10 @@ public:
         const float sunValues[4]{towardSun.x(),towardSun.y(),towardSun.z(),sunStrength};
         std::copy_n(sunValues,4,lighting.sun);
         for (int c = 0; c < 3; ++c)
-            lighting.sunTint[c] = sunStrength > 0 ? sunLight[std::size_t(c)]/sunStrength : 1.0f;
+            lighting.sunTint[c] = clearSun > 0 ? sunLight[std::size_t(c)]/clearSun : 1.0f;
+        lighting.sunTint[3] = clouds;
         lighting.skySettings[2] = environment.physicalSky ? 1.0f : 0.0f;
+        lighting.skySettings[3] = physicalWeather ? environment.weather.haze : 0;
         // Screen-space reflections and contact shadows trace the previous frame, seen through the previous steady
         // camera. Orthographic views have no perspective depth to trace with.
         const bool traceable = !window_.modelOnly_ && !window_.ortho_ && previousValid_ && frame_.previousFrameReady();
@@ -2418,17 +2502,22 @@ public:
         lighting.reflectionSettings[3] = previousWindValid_ ? previousWindTime_ : windTime;
         previousWindTime_ = windTime;
         previousWindValid_ = true;
-        for (std::size_t i = 0; i < 9; ++i)
-            std::copy_n(skyLight.irradiance[i].data(),4,lighting.skyIrradiance[i]);
+        for (std::size_t i = 0; i < 9; ++i) {
+            const float scale = wf::cloudSkyScale(clouds,i == 0);
+            for (std::size_t c = 0; c < 3; ++c)
+                lighting.skyIrradiance[i][c] = skyLight.irradiance[i][c]*scale;
+        }
         std::copy_n(skyLight.horizon.data(),3,lighting.skyHorizon);
         std::copy_n(skyLight.zenith.data(),3,lighting.skyZenith);
+        lighting.skyHorizon[3] = skyLight.sunDiscStrength*cloudTransmission;
+        lighting.skyZenith[3] = skyLight.sunHorizon;
         std::copy_n(skyLight.ground.data(),3,lighting.skyGround);
         // Clustered lights (LightClusters.h): every light but the sun, binned by the clusters of the steady camera.
         std::vector<wf::lights::Light> clusterLights;
         for (std::size_t i = 1; i < lights.size(); ++i)
             if (lights[i].intensity > 0)
                 clusterLights.push_back({{lights[i].vector.x(),lights[i].vector.y(),lights[i].vector.z()},lights[i].intensity,
-                                         {1,1,1},lights[i].directional,
+                                         lights[i].color,lights[i].directional,
                                          {lights[i].spotDirection.x(),lights[i].spotDirection.y(),lights[i].spotDirection.z()},
                                          lights[i].spotAngle,lights[i].spotBlend});
         const auto steady = window_.camera(size);
@@ -2439,7 +2528,7 @@ public:
         std::copy_n(steady.constData(),16,clusterMatrix.begin());
         const auto viewer = window_.viewPose().first;
         const auto lightClusters = wf::lights::build(clusterLights,clusterMatrix,{viewer.x(),viewer.y(),viewer.z()},
-                                                     {forward.x(),forward.y(),forward.z()});
+                                                     {forward.x(),forward.y(),forward.z()},pointShadowsRendered_);
         const float clusterForward[4]{forward.x(),forward.y(),forward.z(),0};
         const float clusterViewport[4]{float(size.width()),float(size.height()),0,0};
         std::copy_n(clusterForward,4,lighting.clusterForward);
@@ -2483,6 +2572,44 @@ public:
         lighting.skySettings[1] = skyVisibility.metersPerTexel;
         const auto frameIndex = window_.currentFrame();
         const auto exposure = exposureFor(environment,frameIndex);
+        const std::span<const wf::vk::TriangleRange> transparent = glassTransmission_ && glassRadiance_
+            ? std::span<const wf::vk::TriangleRange>(geometry.transparent) : std::span<const wf::vk::TriangleRange>{};
+        const auto focus = viewer+forward*6;
+        const auto probeVolume = wf::probes::Volume::around({focus.x(),focus.y(),focus.z()});
+        const auto probeTextures = std::span<const uint32_t>(window_.worldTexturePixels_);
+        if (probeField_.needsUpdate(probeCompute_ && !window_.modelOnly_ && (environment.probeGi || environment.reflectionProbes),
+                environment.reflectionProbes,probeVolume,window_.runtime_ ? 0 : window_.geometryRevision_,
+                {towardSun.x(),towardSun.y(),towardSun.z()},
+                {sunLight[0]*cloudTransmission,sunLight[1]*cloudTransmission,sunLight[2]*cloudTransmission},
+                window_.runtime_.has_value())) {
+            std::vector<wf::probes::SurfaceTriangle> surfaces;
+            wf::vk::drawOpaqueRanges(geometry.triangles.size(),geometry.transparent,[&](uint32_t first,uint32_t count) {
+                for (uint32_t i = first; i+2 < first+count && surfaces.size() < wf::probes::Volume::triangleBudget; i += 3) {
+                    const auto &vertex = geometry.triangles[i];
+                    wf::probes::SurfaceTriangle surface{};
+                    for (uint32_t corner = 0; corner < 3; ++corner)
+                        std::copy_n(geometry.triangles[i+corner].position,3,surface.vertices[corner].begin());
+                    if (!probeVolume.intersects(surface.vertices))
+                        continue;
+                    const float diffuse = 1-vertex.surfaceFactors[0];
+                    const auto emission = std::size_t(vertex.texture[0])+3*wf::materialTextureCount;
+                    for (int c = 0; c < 3; ++c) {
+                        surface.diffuse[c] = std::clamp(vertex.color[c]*diffuse,0.f,1.f);
+                        if (vertex.texture[0] && !vertex.texture[1] && emission+2 < probeTextures.size())
+                            surface.emission[c] = std::bit_cast<float>(probeTextures[emission+c]);
+                    }
+                    surfaces.push_back(surface);
+                }
+            });
+            probeField_.update(frame_.device(),command,surfaces);
+        }
+        lighting.probeGrid = probeField_.grid();
+        lighting.probeSettings[0] = environment.probeGi ? 1.0f : 0.0f;
+        lighting.probeSettings[1] = environment.reflectionProbes ? 1.0f : 0.0f;
+        auto &probeFrame = probeFrames_[std::size_t(frameIndex)];
+        probeFrame = probeField_.trace();
+        lighting_.bindProbes(frameIndex,probeFrame ? probeFrame->output().buffer : VK_NULL_HANDLE,
+                            probeFrame ? probeFrame->output().size : 0);
         const bool ready = triangles_ && lines_ && sky_ && shadow_
             && (!hasGeometry || (upload(frame,geometry,window_.geometryRevision_)
                 && uploadMotion(motionFrames_.at(window_.currentFrame()),geometry,window_.geometryRevision_))) && lighting_.upload(frameIndex,lighting)
@@ -2490,31 +2617,79 @@ public:
                 window_.textureRevision_)
             && lighting_.uploadEnvironment(frameIndex,skyLight.environment,skyRevision)
             && lighting_.uploadClusters(frameIndex,lightClusters);
+        const auto temporal = ready ? temporalFor(environment,geometry,steady,size) : ViewportFrameVulkan::Temporal{};
+        // Use the same jittered projection for depth seeding, visibility, and scene shading.
+        const auto subpixel = temporal.enabled ? frame_.jitter() : std::array<float,2>{};
+        QMatrix4x4 jitter;
+        jitter.translate(2*subpixel[0]/float(size.width()),2*subpixel[1]/float(size.height()),0);
+        const auto sceneCamera = jitter*steady;
+        uint32_t culledBatches = 0;
+        if (ready && probeCompute_ && window_.cullingEnabled_ && !window_.modelOnly_ && geometry.triangles.size() >= 4096) {
+            const bool withGlass = !transparent.empty();
+            if (cullBatches_.empty() || cullRevision_ != window_.geometryRevision_ || culledWithGlass_ != withGlass) {
+                cullBatches_.clear();
+                wf::vk::drawOpaqueRanges(geometry.triangles.size(),transparent,[&](uint32_t first,uint32_t count) {
+                    constexpr uint32_t batchSize = 192;
+                    for (uint32_t offset = 0; offset < count; offset += batchSize)
+                        cullBatches_.push_back(wf::vk::drawBounds(geometry.triangles,first+offset,std::min(batchSize,count-offset)));
+                });
+                cullRevision_ = window_.geometryRevision_;
+                culledWithGlass_ = withGlass;
+            }
+            std::array<wf::shadow::Matrix,1+wf::shadow::cascadeCount> views{};
+            std::copy_n(sceneCamera.constData(),16,views[0].begin());
+            std::ranges::copy(cascades.matrices,views.begin()+1);
+            const wf::vk::Buffer *pyramid = nullptr;
+            if (cullBatches_.size() >= 64 && occlusionDepth_.begin(command,uint32_t(frameIndex),extent,lighting_.depthFormat(),lighting_.pass())) {
+                const auto seeds = wf::vk::occlusionSeeds(cullBatches_,drawCulling_.commands(uint32_t(frameIndex),0),
+                    views[0],{viewer.x(),viewer.y(),viewer.z()});
+                vk_->vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadow_);
+                const VkDeviceSize offset = 0;
+                vk_->vkCmdBindVertexBuffers(command,0,1,&frame.buffer,&offset);
+                ViewUniform uniforms{};
+                std::copy_n(views[0].data(),16,uniforms.matrix);
+                uniforms.eye[3] = windTime;
+                vk_->vkCmdPushConstants(command,layout_,shaderStages,0,sizeof(uniforms),&uniforms);
+                for (const auto seed : seeds) {
+                    const auto &batch = cullBatches_[seed].vertices;
+                    vk_->vkCmdDraw(command,batch[1],1,batch[0],0);
+                }
+                pyramid = &occlusionDepth_.finish(command,uint32_t(frameIndex));
+            }
+            if (drawCulling_.record(command,uint32_t(frameIndex),cullBatches_,std::span(views).first(shadows ? views.size() : 1),0,pyramid,extent))
+                culledBatches = uint32_t(cullBatches_.size());
+        }
         if (ready) {
             // Before anything binds this frame's set: the previous frame's TAA result alternates between two images.
             lighting_.bindPreviousFrame(frameIndex,frame_.nearestSampler(),frame_.previousFrame());
             recordDepthTiles(command,frame,lighting_.framebuffer(frameIndex),WorldLightingVulkan::shadowSize,WorldLightingVulkan::shadowSize,
                              wf::shadow::tileSize,
-                             shadows,geometry.triangles.size(),cascades.matrices,windTime);
+                             shadows,geometry.triangles.size(),transparent,cascades.matrices,windTime,culledBatches);
             if (skyRefresh || !skyInitialized_) {
                 recordDepthTiles(command,frame,lighting_.skyFramebuffer(),wf::sky::atlasSize,wf::sky::atlasSize,wf::sky::tileSize,
-                                 skyRefresh,geometry.triangles.size(),skyVisibility.matrices,windTime);
+                                 skyRefresh,geometry.triangles.size(),transparent,skyVisibility.matrices,windTime);
                 skyInitialized_ = true;
             }
-            // Point light shadow cubes (LightClusters.h): at once after an edit or when the shadowed lights change, and at
-            // most every skyRefreshFrames frames while a running game moves objects.
-            const bool pointChanged = lightClusters.shadowed != pointShadowsRendered_
-                || (pointShadowRevision_ != window_.geometryRevision_ && (!window_.runtime_ || ++pointShadowAge_ >= skyRefreshFrames));
-            if (!pointShadowsInitialized_ || (!lightClusters.shadowed.empty() && pointChanged)) {
+            // Refresh geometry edits immediately, or periodically during Play. A change in the selected lamps
+            // only needs to refresh the cubemaps whose slots changed.
+            const bool refreshPointGeometry = !lightClusters.shadowed.empty() && pointShadowRevision_ != window_.geometryRevision_
+                && (!window_.runtime_ || ++pointShadowAge_ >= skyRefreshFrames);
+            const bool refreshAll = !pointShadowsInitialized_ || refreshPointGeometry;
+            const auto dirtySlots = wf::lights::shadowUpdates(lightClusters.shadowed,pointShadowsRendered_,refreshAll);
+            if (refreshAll || std::ranges::any_of(dirtySlots,std::identity{})) {
+                const bool clearAll = refreshAll || !lighting_.pointUpdatePass();
+                const std::span<const bool> partial = clearAll ? std::span<const bool>{} : std::span<const bool>{dirtySlots};
                 recordDepthTiles(command,frame,lighting_.pointShadowFramebuffer(),wf::lights::shadowAtlasWidth,
                                  wf::lights::shadowAtlasHeight,wf::lights::faceSize,!lightClusters.shadowed.empty(),
-                                 geometry.triangles.size(),std::span(lightClusters.shadowFaces).first(lightClusters.shadowed.size()*6),
-                                 windTime);
+                                 geometry.triangles.size(),transparent,std::span(lightClusters.shadowFaces).first(lightClusters.shadowed.size()*6),
+                    windTime,0,partial);
                 pointShadowsInitialized_ = true;
-                pointShadowsRendered_ = lightClusters.shadowed;
-                pointShadowRevision_ = window_.geometryRevision_;
-                pointShadowAge_ = 0;
+                if (clearAll) {
+                    pointShadowRevision_ = window_.geometryRevision_;
+                    pointShadowAge_ = 0;
+                }
             }
+            pointShadowsRendered_ = lightClusters.shadowed;
         } else {
             skyValid_ = false; // nothing was drawn; render the maps on the next ready frame
         }
@@ -2523,13 +2698,7 @@ public:
             const VkViewport viewport{0, 0, float(size.width()), float(size.height()), 0, 1};
             vk_->vkCmdSetViewport(command, 0, 1, &viewport);
             vk_->vkCmdSetScissor(command, 0, 1, &area);
-            const auto camera = window_.camera(size);
-            const auto temporal = temporalFor(environment,geometry,camera,size);
-            // The scene renders with this frame's TAA jitter; editor overlays use the steady camera.
-            const auto subpixel = temporal.enabled ? frame_.jitter() : std::array<float,2>{};
-            QMatrix4x4 jitter;
-            jitter.translate(2*subpixel[0]/float(size.width()),2*subpixel[1]/float(size.height()),0);
-            const auto sceneCamera = jitter*camera;
+            const auto &camera = steady;
             const auto descriptors = lighting_.descriptor(frameIndex);
             vk_->vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,layout_,0,1,&descriptors,0,nullptr);
             const auto eye = window_.viewPose().first;
@@ -2562,9 +2731,16 @@ public:
                 const VkDeviceSize offsets[]{0,0};
                 vk_->vkCmdBindVertexBuffers(command,0,2,buffers,offsets);
             }
-            if (!geometry.triangles.empty() && (!window_.modelOnly_ || window_.modelShading_ != ModelShading::Wireframe)) {
+            const bool drawTriangles = !geometry.triangles.empty()
+                && (!window_.modelOnly_ || window_.modelShading_ != ModelShading::Wireframe);
+            if (drawTriangles) {
                 vk_->vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, triangles_);
-                vk_->vkCmdDraw(command, uint32_t(geometry.triangles.size()), 1, 0, 0);
+                if (culledBatches)
+                    drawCulling_.draw(command,uint32_t(frameIndex),0,0,culledBatches);
+                else
+                    wf::vk::drawOpaqueRanges(geometry.triangles.size(),transparent,[&](uint32_t first,uint32_t count) {
+                        vk_->vkCmdDraw(command,count,1,first,0);
+                    });
             }
             const auto toWorld = sceneCamera.inverted();
             // Draw the sky at the far plane to skip fog shading behind opaque surfaces.
@@ -2577,9 +2753,27 @@ public:
                 vk_->vkCmdPushConstants(command, layout_, shaderStages, 0, sizeof(skyUniforms), &skyUniforms);
                 vk_->vkCmdDraw(command,3,1,0,0);
             }
+            if (drawTriangles && !transparent.empty()) {
+                std::vector<wf::vk::TriangleRange> ordered(transparent.begin(),transparent.end());
+                const auto depth = [&](const wf::vk::TriangleRange &face) {
+                    const auto &a = geometry.triangles[face.first].position;
+                    const auto &b = geometry.triangles[face.first+1].position;
+                    const auto &c = geometry.triangles[face.first+2].position;
+                    return QVector3D::dotProduct(forward,{a[0]+b[0]+c[0],a[1]+b[1]+c[1],a[2]+b[2]+c[2]});
+                };
+                std::ranges::stable_sort(ordered,std::greater<>{},depth);
+                vk_->vkCmdPushConstants(command,layout_,shaderStages,0,sizeof(uniforms),&uniforms);
+                for (const auto &range : ordered)
+                    for (const auto glass : {glassTransmission_,glassRadiance_}) {
+                        vk_->vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,glass);
+                        vk_->vkCmdDraw(command,uint32_t(range.count),1,uint32_t(range.first),0);
+                    }
+            }
             // Display subpass: tone map the HDR scene, then draw editor lines in display colors.
             ViewportFrameVulkan::Occlusion occlusion;
             occlusion.enabled = environment.ambientOcclusion;
+            occlusion.screenSpaceGi = environment.screenSpaceGi && !window_.modelOnly_;
+            occlusion.probeGi = environment.probeGi && probeFrame;
             std::copy_n(toWorld.constData(),16,occlusion.inverseViewProjection.begin());
             frame_.display(command,exposure,environment.viewTransform,environment.autoExposure ? int(frameIndex) : -1,temporal,
                            occlusion,environment.bloom && !window_.modelOnly_ ? wf::color::bloomStrength : 0.0f,
@@ -2649,7 +2843,7 @@ private:
         camera.depthOfField = environment.depthOfField && !window_.modelOnly_;
         camera.focusDistance = environment.focusDistance;
         camera.fNumber = environment.fNumber;
-        camera.verticalFov = qDegreesToRadians(45.0f);
+        camera.verticalFov = wf::camera::verticalFovRadians;
         camera.motionBlur = environment.motionBlur && !window_.modelOnly_;
         camera.shutter = environment.shutter;
         camera.eye = {eye.x(),eye.y(),eye.z()};
@@ -2683,30 +2877,44 @@ private:
     // Renders the scene's depth into square tiles of an atlas, one per matrix: the sun shadow cascades or the
     // sky visibility maps. The atlas is always cleared, so it is ready to sample even when nothing is drawn.
     void recordDepthTiles(VkCommandBuffer command,const Buffer &frame,VkFramebuffer framebuffer,uint32_t width,uint32_t height,
-                          uint32_t tileSize,bool draw,std::size_t count,std::span<const wf::shadow::Matrix> matrices,float wind)
+                          uint32_t tileSize,bool draw,std::size_t count,std::span<const wf::vk::TriangleRange> transparent,
+                          std::span<const wf::shadow::Matrix> matrices,float wind,uint32_t culledBatches = 0,
+                          std::span<const bool> partial = {})
     {
         const VkRect2D area{{0,0},{width,height}};
         const uint32_t columns = width/tileSize;
         VkClearValue clear{};
         clear.depthStencil = {1,0};
-        const VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,lighting_.pass(),
-            framebuffer,area,1,&clear};
+        const VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,
+            partial.empty() ? lighting_.pass() : lighting_.pointUpdatePass(),framebuffer,area,partial.empty() ? 1u : 0u,&clear};
         vk_->vkCmdBeginRenderPass(command,&pass,VK_SUBPASS_CONTENTS_INLINE);
         if (draw) {
             vk_->vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadow_);
             const VkDeviceSize offset = 0;
             vk_->vkCmdBindVertexBuffers(command,0,1,&frame.buffer,&offset);
             for (std::size_t index = 0; index < matrices.size(); ++index) {
+                if (!partial.empty() && !partial[index/6])
+                    continue;
                 const std::array<uint32_t,2> origin{uint32_t(index)%columns*tileSize,uint32_t(index)/columns*tileSize};
                 const VkViewport viewport{float(origin[0]),float(origin[1]),float(tileSize),float(tileSize),0,1};
                 const VkRect2D tile{{int32_t(origin[0]),int32_t(origin[1])},{tileSize,tileSize}};
+                if (!partial.empty()) {
+                    const VkClearAttachment attachment{VK_IMAGE_ASPECT_DEPTH_BIT,0,clear};
+                    const VkClearRect region{tile,0,1};
+                    vk_->vkCmdClearAttachments(command,1,&attachment,1,&region);
+                }
                 vk_->vkCmdSetViewport(command,0,1,&viewport);
                 vk_->vkCmdSetScissor(command,0,1,&tile);
                 ViewUniform uniforms{};
                 std::copy_n(matrices[index].data(),16,uniforms.matrix);
                 uniforms.eye[3] = wind;
                 vk_->vkCmdPushConstants(command,layout_,shaderStages,0,sizeof(uniforms),&uniforms);
-                vk_->vkCmdDraw(command,uint32_t(count),1,0,0);
+                if (culledBatches)
+                    drawCulling_.draw(command,uint32_t(window_.currentFrame()),uint32_t(index+1),0,culledBatches);
+                else
+                    wf::vk::drawOpaqueRanges(count,transparent,[&](uint32_t first,uint32_t vertices) {
+                        vk_->vkCmdDraw(command,vertices,1,first,0);
+                    });
             }
         }
         vk_->vkCmdEndRenderPass(command);
@@ -2876,7 +3084,8 @@ private:
     }
     enum class Pass { Scene, Sky, Shadow, Overlay, SelectionOutline };
 
-    VkPipeline pipeline(VkPrimitiveTopology topology, bool depthWrite, Pass pass = Pass::Scene)
+    VkPipeline pipeline(VkPrimitiveTopology topology,bool depthWrite,Pass pass = Pass::Scene,
+                        wf::vk::MaterialPass materialPass = wf::vk::MaterialPass::Opaque)
     {
         const bool sky = pass == Pass::Sky, shadow = pass == Pass::Shadow;
         const bool outline = pass == Pass::SelectionOutline;
@@ -2890,9 +3099,9 @@ private:
             // the display transform, and the scene shader keeps their sRGB colors (displayPass).
             const bool inScene = sky || (pass == Pass::Scene && topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
             const uint32_t subpass = inScene ? ViewportFrameVulkan::sceneSubpass : ViewportFrameVulkan::displaySubpass;
-            const VkBool32 displayPass = inScene ? VK_FALSE : VK_TRUE;
-            const VkSpecializationMapEntry constant{0,0,sizeof(VkBool32)};
-            const VkSpecializationInfo specialization{1,&constant,sizeof(displayPass),&displayPass};
+            const uint32_t constants[]{inScene ? VK_FALSE : VK_TRUE,uint32_t(materialPass)};
+            const VkSpecializationMapEntry entries[]{{0,0,sizeof(uint32_t)},{1,sizeof(uint32_t),sizeof(uint32_t)}};
+            const VkSpecializationInfo specialization{2,entries,sizeof(constants),constants};
             const VkPipelineShaderStageCreateInfo stages[]{
                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertex, "main", nullptr},
                 {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragment, "main", &specialization}};
@@ -2931,6 +3140,7 @@ private:
             depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
             VkPipelineColorBlendAttachmentState blend{};
             blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            blend = wf::vk::materialBlend(materialPass,blend);
             // The scene pass has targets for the sky-light part, the surface albedo and motion, which only Scene.frag writes.
             VkPipelineColorBlendAttachmentState blends[wf::vk::HdrFrame::sceneColorAttachments]{blend,blend,blend,blend};
             if (sky)
@@ -2968,6 +3178,7 @@ private:
     QVulkanDeviceFunctions *vk_{};
     VkPipelineLayout layout_{};
     VkPipeline triangles_{};
+    VkPipeline glassTransmission_{}, glassRadiance_{};
     VkPipeline overlays_{};
     VkPipeline outline_{};
     VkPipeline lines_{};
@@ -2975,6 +3186,14 @@ private:
     VkPipeline shadow_{};
     WorldLightingVulkan lighting_;
     ViewportFrameVulkan frame_;
+    wf::vk::ProbeField probeField_;
+    wf::vk::DrawCulling drawCulling_;
+    wf::vk::OcclusionDepth occlusionDepth_;
+    std::vector<wf::vk::DrawBounds> cullBatches_;
+    quint64 cullRevision_ = 0;
+    bool culledWithGlass_ = false;
+    std::vector<std::shared_ptr<const wf::vk::ProbeTrace>> probeFrames_;
+    bool probeCompute_ = false;
     std::vector<Buffer> frames_;
     // Per frame, the previous frame's vertex positions (uploadMotion), and the triangles' positions as last rendered.
     std::vector<Buffer> motionFrames_;
@@ -2987,6 +3206,7 @@ private:
     // TAA: what the previous frame showed, to restart or reproject the history.
     QMatrix4x4 previousCamera_;
     bool warmUpFrame_ = false; // the next frame restarts the TAA average once more (temporalFor)
+    bool previousCulling_ = true;
     // The previous frame's wind time, for the motion of swaying foliage (SceneMotion.glsl).
     float previousWindTime_ = 0;
     bool previousWindValid_ = false;
@@ -3040,6 +3260,8 @@ LiveViewport::LiveViewport(ProjectStore &store, bool modelOnly, QWidget *parent)
                 break;
             }
         }
+        if (!modelOnly && qEnvironmentVariableIntValue("WORLDFORGE_FIXED_INDIRECT") != 1)
+            window_->setDeviceExtensions({VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME});
         container_ = QWidget::createWindowContainer(window_, this);
         container_->setMinimumSize(160, 140);
         container_->setFocusPolicy(Qt::StrongFocus);
@@ -3260,6 +3482,16 @@ void LiveViewport::setCameraPreview(QVector3D eye,QVector3D target)
 #endif
 }
 
+void LiveViewport::setDrawCullingEnabled(bool enabled)
+{
+#ifdef WORLDFORGE_VULKAN
+    if (window_)
+        window_->setDrawCullingEnabled(enabled);
+#else
+    Q_UNUSED(enabled)
+#endif
+}
+
 bool LiveViewport::runtimeShowsHud() const
 {
 #ifdef WORLDFORGE_VULKAN
@@ -3445,6 +3677,15 @@ QImage LiveViewport::captureFrame()
             image = window_->grab();
         return image;
     }
+#endif
+    return {};
+}
+
+std::optional<float> LiveViewport::captureMeteredLuminance()
+{
+#ifdef WORLDFORGE_VULKAN
+    if (hasRenderedFrame() && window_->supportsGrab())
+        return window_->captureMeteredLuminance();
 #endif
     return {};
 }

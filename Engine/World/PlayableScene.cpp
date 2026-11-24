@@ -128,10 +128,34 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
     const bool display = scene.exposure != 0 || scene.viewTransform != color::ViewTransform::AgX || scene.autoExposure
         || scene.exposureCompensation != 0 || !scene.temporalAntiAliasing || !scene.ambientOcclusion;
     const bool spots = std::ranges::any_of(scene.lights,[](const PlayLight &light) { return light.spotAngle > 0; });
-    const int version = !scene.contactShadows ? 20 : !scene.reflections ? 19 : scene.depthOfField || scene.motionBlur ? 18 : spots ? 17 : !scene.bloom ? 16 : scene.physicalSky ? 15 : display ? 14 : !scene.nativeInstances.empty() ? 13 : !scene.nativeBodies.empty() ? 12
+    const auto hasCoat = [](const PlayMesh &mesh) { return mesh.clearCoat != 0 || mesh.clearCoatRoughness != 0; };
+    const auto hasLayers = [](const PlayMesh &mesh) { return mesh.layers != MaterialLayers{}; };
+    const auto hasLayerMaps = [](const PlayMesh &mesh) {
+        return mesh.layers.coatNormalScale != 1
+            || std::ranges::any_of(std::span(mesh.surfaceMaps).last<LayerMapCount>(),[](const auto &map) { return !map.empty(); });
+    };
+    const bool coloredLamps = std::ranges::any_of(scene.lights,[](const PlayLight &light) { return light.color != Point3{1,1,1}; });
+    const int version = coloredLamps ? 29 : scene.weather.authored() ? 28
+        : scene.probeGi || scene.screenSpaceGi || scene.reflectionProbes ? 27
+        : std::ranges::any_of(scene.meshes,[](const PlayMesh &mesh) { return mesh.layers.hasStreetLayers(); }) ? 26
+        : std::ranges::any_of(scene.meshes,hasLayerMaps) ? 25
+        : std::ranges::any_of(scene.meshes,[](const PlayMesh &mesh) { return mesh.layers.hasScatteringOrAnisotropy(); }) ? 24
+        : std::ranges::any_of(scene.meshes,[](const PlayMesh &mesh) { return mesh.layers.hasOptics(); }) ? 23
+        : std::ranges::any_of(scene.meshes,hasLayers) ? 22
+        : std::ranges::any_of(scene.meshes,hasCoat) ? 21
+        : !scene.contactShadows ? 20 : !scene.reflections ? 19 : scene.depthOfField || scene.motionBlur ? 18 : spots ? 17 : !scene.bloom ? 16 : scene.physicalSky ? 15 : display ? 14 : !scene.nativeInstances.empty() ? 13 : !scene.nativeBodies.empty() ? 12
         : hasRemoteLaunch ? 11 : hasLaunch ? 10 : 9;
     if (!std::isfinite(scene.exposure) || scene.exposure < color::minimumExposure || scene.exposure > color::maximumExposure
         || !std::isfinite(scene.exposureCompensation) || std::abs(scene.exposureCompensation) > color::maximumCompensation)
+        return false;
+    const auto inRange = [](float value,float maximum) { return value >= 0 && value <= maximum; };
+    const auto &weather = scene.weather;
+    if (!inRange(weather.haze,Weather::maximumHaze) || !inRange(weather.cloudCover,1)
+        || !inRange(weather.targetCloudCover,1) || !inRange(weather.cloudTransition,Weather::maximumTransition))
+        return false;
+    if (coloredLamps && !std::ranges::all_of(scene.lights,[&](const PlayLight &light) {
+            return std::ranges::all_of(light.color,[&](float channel) { return inRange(channel,1); });
+        }))
         return false;
     out << "WORLDFORGE_PLAY " << version << '\n'
         << world.bodies.size() << ' ' << world.terrains.size() << ' '
@@ -158,6 +182,10 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
         out << scene.reflections << ' ';
     if (version >= 20)
         out << scene.contactShadows << ' ';
+    if (version >= 27)
+        out << scene.probeGi << ' ' << scene.screenSpaceGi << ' ' << scene.reflectionProbes << ' ';
+    if (version >= 28)
+        out << weather.haze << ' ' << weather.cloudCover << ' ' << weather.targetCloudCover << ' ' << weather.cloudTransition << ' ';
     out << '\n';
     for (const auto &body : world.bodies) {
         writeVector(out,body.position);
@@ -192,11 +220,16 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
             writeVector(out,light.spotDirection);
             out << light.spotAngle << ' ' << light.spotBlend;
         }
+        if (version >= 29) {
+            out << ' ';
+            writeVector(out,light.color);
+        }
         out << '\n';
     }
     std::size_t remainingClipSamples = MeshClip::maxSamples*3;
     for (const auto &mesh : scene.meshes) {
-        if (mesh.baseColorTexture.size() > MeshMaterial::maxTextureBytes)
+        if (mesh.baseColorTexture.size() > MeshMaterial::maxTextureBytes || !mesh.layers.valid()
+            || !(mesh.clearCoat >= 0 && mesh.clearCoat <= 1 && mesh.clearCoatRoughness >= 0 && mesh.clearCoatRoughness <= 1))
             return false;
         out << mesh.body << ' ' << mesh.vertices.size() << ' ' << mesh.lodVertices.size() << ' ' << mesh.lodDistance << ' ';
         writeVector(out,mesh.lodOrigin);
@@ -205,14 +238,38 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
             writeBase64(out,mesh.baseColorTexture);
             out << '\n';
         }
-        out << mesh.advancedSurface << '\n';
-        if (mesh.advancedSurface) {
+        const bool advanced = mesh.advancedSurface || hasCoat(mesh) || hasLayers(mesh) || hasLayerMaps(mesh);
+        out << advanced << '\n';
+        if (advanced) {
             out << mesh.metallic << ' ' << mesh.roughness << ' ';
             writeVector(out,mesh.emissive);
-            out << '\n';
-            for (const auto &map : mesh.surfaceMaps) {
-                if (map.size() > MeshMaterial::maxTextureBytes)
+            if (version >= 21)
+                out << mesh.clearCoat << ' ' << mesh.clearCoatRoughness << ' ';
+            if (version >= 22) {
+                writeVector(out,mesh.layers.sheenColor);
+                out << mesh.layers.sheenRoughness << ' ';
+            }
+            if (version >= 23)
+                out << mesh.layers.transmission << ' ' << mesh.layers.ior << ' ';
+            if (version >= 24)
+                out << mesh.layers.subsurface << ' ' << mesh.layers.thickness << ' ' << mesh.layers.scatteringDistance
+                    << ' ' << mesh.layers.anisotropy << ' ' << mesh.layers.anisotropyRotation << ' ';
+            if (version >= 25)
+                out << mesh.layers.coatNormalScale << ' ';
+            if (version >= 26) {
+                if (!(mesh.surfaceAlpha >= 0 && mesh.surfaceAlpha <= 1))
                     return false;
+                out << mesh.layers.wetness << ' ' << mesh.layers.puddles << ' ' << mesh.layers.heightScale << ' '
+                    << mesh.layers.decal << ' ' << mesh.layers.decalOpacity << ' ' << mesh.surfaceAlpha << ' ';
+            }
+            out << '\n';
+            const auto mapCount = version >= 25 ? mesh.surfaceMaps.size() : baseMaterialTextureCount-1;
+            std::size_t textureBytes = mesh.baseColorTexture.size();
+            for (const auto &map : std::span(mesh.surfaceMaps).first(mapCount)) {
+                if (map.size() > MeshMaterial::maxTextureBytes
+                    || (version >= 25 && map.size() > MeshMaterial::maxTextureBytes-textureBytes))
+                    return false;
+                textureBytes += map.size();
                 out << map.size() << '\n';
                 if (!map.empty()) {
                     writeBase64(out,map);
@@ -356,7 +413,7 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     std::string signature;
     int version;
     std::size_t bodies,terrains,joints,meshes,lights;
-    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 20
+    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 29
         || !(in >> bodies >> terrains >> joints >> meshes >> lights >> scene.player)
         || bodies > 257 || terrains > 256 || joints > 256 || meshes > 4096 || lights > 256 || scene.player >= bodies
         || !readValue(in,world.gravity,0,50) || !(in >> scene.sky)
@@ -386,6 +443,12 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     if (version >= 19 && !(in >> scene.reflections))
         return {};
     if (version >= 20 && !(in >> scene.contactShadows))
+        return {};
+    if (version >= 27 && !(in >> scene.probeGi >> scene.screenSpaceGi >> scene.reflectionProbes))
+        return {};
+    if (version >= 28 && (!readValue(in,scene.weather.haze,0,Weather::maximumHaze)
+        || !readValue(in,scene.weather.cloudCover,0,1) || !readValue(in,scene.weather.targetCloudCover,0,1)
+        || !readValue(in,scene.weather.cloudTransition,0,Weather::maximumTransition)))
         return {};
     world.bodies.resize(bodies);
     for (auto &body : world.bodies) {
@@ -439,7 +502,7 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     for (auto &light : scene.lights)
         if (!readVector(in,light.vector) || !readValue(in,light.intensity,0,4) || !(in >> light.directional)
             || (version >= 17 && (!readVector(in,light.spotDirection,-1,1) || !readValue(in,light.spotAngle,0,3.1416f)
-                                  || !readValue(in,light.spotBlend,0,1))))
+                                  || !readValue(in,light.spotBlend,0,1))) || (version >= 29 && !readVector(in,light.color,0,1)))
             return {};
     scene.meshes.resize(meshes);
     std::size_t remaining = 1500000;
@@ -468,13 +531,27 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
                 return {};
             if (mesh.advancedSurface) {
                 if (!readValue(in,mesh.metallic,0,1) || !readValue(in,mesh.roughness,0,1)
-                    || !readVector(in,mesh.emissive,0,64))
+                    || !readVector(in,mesh.emissive,0,64)
+                    || (version >= 21 && (!readValue(in,mesh.clearCoat,0,1) || !readValue(in,mesh.clearCoatRoughness,0,1)))
+                    || (version >= 22 && (!readVector(in,mesh.layers.sheenColor,0,1) || !readValue(in,mesh.layers.sheenRoughness,0,1)))
+                    || (version >= 23 && (!readValue(in,mesh.layers.transmission,0,1) || !readValue(in,mesh.layers.ior,1,3)))
+                    || (version >= 24 && (!readValue(in,mesh.layers.subsurface,0,1) || !readValue(in,mesh.layers.thickness,0,2)
+                        || !readValue(in,mesh.layers.scatteringDistance,0.0001f,2) || !readValue(in,mesh.layers.anisotropy,0,1)
+                        || !readValue(in,mesh.layers.anisotropyRotation,-MaterialLayers::fullTurn,MaterialLayers::fullTurn)))
+                    || (version >= 25 && !readValue(in,mesh.layers.coatNormalScale,-MaterialLayers::maxCoatNormalScale,MaterialLayers::maxCoatNormalScale))
+                    || (version >= 26 && (!readValue(in,mesh.layers.wetness,0,1) || !readValue(in,mesh.layers.puddles,0,1)
+                        || !readValue(in,mesh.layers.heightScale,0,MaterialLayers::maxHeightScale) || !(in >> mesh.layers.decal)
+                        || !readValue(in,mesh.layers.decalOpacity,0,1) || !readValue(in,mesh.surfaceAlpha,0,1))))
                     return {};
-                for (auto &map : mesh.surfaceMaps) {
+                const auto mapCount = version >= 25 ? mesh.surfaceMaps.size() : baseMaterialTextureCount-1;
+                auto textureBytes = mesh.baseColorTexture.size();
+                for (auto &map : std::span(mesh.surfaceMaps).first(mapCount)) {
                     std::size_t bytes;
                     if (!(in >> bytes) || bytes > MeshMaterial::maxTextureBytes
+                        || (version >= 25 && bytes > MeshMaterial::maxTextureBytes-textureBytes)
                         || (bytes && !readBase64(in,bytes,map)))
                         return {};
+                    textureBytes += bytes;
                 }
             }
         }

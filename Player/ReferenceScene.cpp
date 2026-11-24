@@ -133,6 +133,8 @@ bool writeReference(const std::filesystem::path &folder,const std::vector<PlayVe
         write(json,{light.vector[0],light.vector[1],light.vector[2]});
         json << ", \"intensity\": ";
         write(json,light.intensity);
+        json << ", \"color\": ";
+        write(json,{light.color[0],light.color[1],light.color[2]});
         if (!light.directional && light.spotAngle > 0) {
             json << ", \"spot\": {\"direction\": ";
             write(json,{light.spotDirection[0],light.spotDirection[1],light.spotDirection[2]});
@@ -160,6 +162,25 @@ bool writeReference(const std::filesystem::path &folder,const std::vector<PlayVe
         write(json,material.metallic);
         json << ", \"roughness\": ";
         write(json,material.roughness);
+        if (material.clearCoat != 0 || material.clearCoatRoughness != 0) {
+            json << ", \"clearCoat\": ";
+            write(json,material.clearCoat);
+            json << ", \"clearCoatRoughness\": ";
+            write(json,material.clearCoatRoughness);
+        }
+        if (material.layers.sheenColor != Point3{} || material.layers.sheenRoughness != 0) {
+            json << ", \"sheenColor\": ";
+            const auto &color = material.layers.sheenColor;
+            write(json,{color[0],color[1],color[2]});
+            json << ", \"sheenRoughness\": ";
+            write(json,material.layers.sheenRoughness);
+        }
+        if (material.layers.hasOptics()) {
+            json << ", \"transmission\": ";
+            write(json,material.layers.transmission);
+            json << ", \"ior\": ";
+            write(json,material.layers.ior);
+        }
         json << ", \"advanced\": " << (material.advanced ? "true" : "false") << '}';
     }
     json << "]\n}\n";

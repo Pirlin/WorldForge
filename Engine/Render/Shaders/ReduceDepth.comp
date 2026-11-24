@@ -1,0 +1,32 @@
+#version 450
+
+// The first level covers 8 x 8 pixels per tile. Higher levels combine 2 x 2 children.
+// Storing the farthest depth preserves holes: any uncovered pixel contributes depth 1.
+layout(local_size_x = 8,local_size_y = 8) in;
+layout(set = 0,binding = 0) uniform sampler2D depthImage;
+layout(std430,set = 0,binding = 1) buffer Pyramid { float depth[]; } pyramid;
+layout(push_constant) uniform Reduction {
+    uvec2 inputSize;
+    uvec2 outputSize;
+    uint inputOffset;
+    uint outputOffset;
+    uint first;
+} level;
+
+void main()
+{
+    uvec2 tile = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(tile,level.outputSize)))
+        return;
+    uint footprint = level.first != 0u ? 8u : 2u;
+    uvec2 start = tile*footprint;
+    uvec2 end = min(start+footprint,level.inputSize);
+    float farthest = 0.0;
+    for (uint y = start.y; y < end.y; ++y)
+        for (uint x = start.x; x < end.x; ++x) {
+            float depth = level.first != 0u ? texelFetch(depthImage,ivec2(x,y),0).r
+                : pyramid.depth[level.inputOffset+y*level.inputSize.x+x];
+            farthest = max(farthest,depth);
+        }
+    pyramid.depth[level.outputOffset+tile.y*level.outputSize.x+tile.x] = farthest;
+}

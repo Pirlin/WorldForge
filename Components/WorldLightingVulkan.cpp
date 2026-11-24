@@ -22,15 +22,18 @@ bool WorldLightingVulkan::create(QVulkanWindow &window,QVulkanDeviceFunctions *v
     }
     if (format == VK_FORMAT_UNDEFINED)
         return false;
+    depthFormat_ = format;
     const VkAttachmentDescription depth{0,format,VK_SAMPLE_COUNT_1_BIT,VK_ATTACHMENT_LOAD_OP_CLEAR,
         VK_ATTACHMENT_STORE_OP_STORE,VK_ATTACHMENT_LOAD_OP_DONT_CARE,VK_ATTACHMENT_STORE_OP_DONT_CARE,
         VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
     const VkAttachmentReference depthReference{0,VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     const VkSubpassDescription subpass{0,VK_PIPELINE_BIND_POINT_GRAPHICS,0,nullptr,0,nullptr,nullptr,&depthReference,0,nullptr};
     const VkSubpassDependency dependencies[]{
-        {VK_SUBPASS_EXTERNAL,0,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        {VK_SUBPASS_EXTERNAL,0,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+             | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
          VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-         VK_ACCESS_SHADER_READ_BIT,VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,0},
+         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,0},
         {0,VK_SUBPASS_EXTERNAL,VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
          VK_ACCESS_SHADER_READ_BIT,0}
@@ -38,6 +41,13 @@ bool WorldLightingVulkan::create(QVulkanWindow &window,QVulkanDeviceFunctions *v
     const VkRenderPassCreateInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,nullptr,0,1,&depth,1,&subpass,2,dependencies};
     if (vk_->vkCreateRenderPass(device_,&pass,nullptr,&pass_) != VK_SUCCESS)
         return false;
+    auto updateDepth = depth;
+    updateDepth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    updateDepth.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    auto updatePass = pass;
+    updatePass.pAttachments = &updateDepth;
+    if (vk_->vkCreateRenderPass(device_,&updatePass,nullptr,&pointUpdatePass_) != VK_SUCCESS)
+        pointUpdatePass_ = VK_NULL_HANDLE;
     const VkDescriptorSetLayoutBinding bindings[]{
         {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
@@ -46,14 +56,15 @@ bool WorldLightingVulkan::create(QVulkanWindow &window,QVulkanDeviceFunctions *v
         {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {8,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
+        {8,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {9,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr}
     };
-    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,8,bindings};
+    const VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,9,bindings};
     if (vk_->vkCreateDescriptorSetLayout(device_,&layout,nullptr,&layout_) != VK_SUCCESS)
         return false;
     const auto count = uint32_t(window.concurrentFrameCount());
     const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,4*count},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,3*count}};
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,count},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,4*count}};
     const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,count,3,sizes};
     if (vk_->vkCreateDescriptorPool(device_,&pool,nullptr,&pool_) != VK_SUCCESS)
         return false;
@@ -181,6 +192,15 @@ void WorldLightingVulkan::bindPreviousFrame(int index,VkSampler sampler,VkImageV
     vk_->vkUpdateDescriptorSets(device_,1,&write,0,nullptr);
 }
 
+void WorldLightingVulkan::bindProbes(int index,VkBuffer buffer,VkDeviceSize bytes)
+{
+    const auto &frame = frames_[std::size_t(index)];
+    const VkDescriptorBufferInfo data{buffer ? buffer : frame.clusters,0,buffer ? bytes : VkDeviceSize(16)};
+    const VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,9,0,1,
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&data,nullptr};
+    vk_->vkUpdateDescriptorSets(device_,1,&write,0,nullptr);
+}
+
 bool WorldLightingVulkan::allocate(VkDeviceMemory &memory,VkMemoryRequirements requirements,VkMemoryPropertyFlags flags)
 {
     for (uint32_t i = 0; i < memory_.memoryTypeCount; ++i)
@@ -266,6 +286,7 @@ void WorldLightingVulkan::destroy()
     destroyDepthTarget(pointShadows_);
     if (sampler_) vk_->vkDestroySampler(device_,sampler_,nullptr);
     if (pass_) vk_->vkDestroyRenderPass(device_,pass_,nullptr);
+    if (pointUpdatePass_) vk_->vkDestroyRenderPass(device_,pointUpdatePass_,nullptr);
     if (layout_) vk_->vkDestroyDescriptorSetLayout(device_,layout_,nullptr);
     *this = {};
 }

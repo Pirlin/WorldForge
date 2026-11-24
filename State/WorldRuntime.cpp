@@ -512,6 +512,7 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QS
     scene.temporalAntiAliasing = atmosphere.temporalAntiAliasing;
     scene.ambientOcclusion = atmosphere.ambientOcclusion;
     scene.physicalSky = atmosphere.physicalSky;
+    scene.weather = atmosphere.weather;
     scene.bloom = atmosphere.bloom;
     scene.depthOfField = atmosphere.depthOfField;
     scene.focusDistance = atmosphere.focusDistance;
@@ -519,6 +520,9 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QS
     scene.motionBlur = atmosphere.motionBlur;
     scene.shutter = atmosphere.shutter;
     scene.reflections = atmosphere.reflections;
+    scene.probeGi = atmosphere.probeGi;
+    scene.screenSpaceGi = atmosphere.screenSpaceGi;
+    scene.reflectionProbes = atmosphere.reflectionProbes;
     scene.contactShadows = atmosphere.contactShadows;
     scene.exposureCompensation = atmosphere.exposureCompensation;
     scene.viewTransform = atmosphere.viewTransform;
@@ -539,6 +543,8 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QS
             hasSun |= directional;
             const auto direction = object.id == "sun" && object.rotation.isNull() ? sunDirection(atmosphere) : q.rotatedVector({0,0,1});
             worldforge::PlayLight light{point(directional ? direction : object.position),lightUnits(object),directional};
+            if (!directional)
+                light.color = linearLampColor(object);
             if (object.type == "Spot Light") {
                 light.spotDirection = point(spotDirection(object));
                 light.spotAngle = float(qDegreesToRadians(spotConeAngle(object)));
@@ -600,6 +606,10 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QS
                 draw.advancedSurface = slot.hasAdvancedSurface();
                 draw.metallic = slot.metallic;
                 draw.roughness = slot.roughness;
+                draw.clearCoat = slot.clearCoat;
+                draw.clearCoatRoughness = slot.clearCoatRoughness;
+                draw.layers = slot.layers;
+                draw.surfaceAlpha = slot.color[3];
                 draw.emissive = slot.emissive;
                 const auto maps = slot.previewTextures();
                 for (std::size_t i = 0; i < draw.surfaceMaps.size(); ++i)

@@ -13,8 +13,8 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     vec4 settings;         // local density, shadows enabled, TAA frame index, ambient light scale from the sky
     vec4 sun;              // direction toward the sun, intensity in scene units
     vec4 skyIrradiance[9]; // spherical-harmonic coefficients of sky irradiance / pi (Engine/Render/SkyLight.h)
-    vec4 skyHorizon;       // linear sky radiance at the horizon
-    vec4 skyZenith;        // linear sky radiance at the zenith
+    vec4 skyHorizon;       // linear sky radiance at the horizon, solar disc strength in w
+    vec4 skyZenith;        // linear sky radiance at the zenith, geometric horizon cosine in w
     vec4 skyGround;        // linear radiance of the ground below the horizon
     // Clustered lights (Engine/Render/LightClusters.h): the camera's forward axis (xyz), and the viewport size in
     // pixels (xy).
@@ -24,8 +24,8 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     // the directions toward the sky with the sky's luminance in each (w).
     mat4 skyMatrices[16];
     vec4 skyDirections[16];
-    vec4 skySettings;      // sky visibility maps on, their meters per texel, physical sky on, unused
-    vec4 sunTint;          // the color of sunlight at the ground, luminance 1 (white for the gradient sky)
+    vec4 skySettings;      // sky visibility maps on, their meters per texel, physical sky on, aerosol extinction per km
+    vec4 sunTint;          // sunlight color at luminance 1, cloud cover in w
     // The previous frame: its clip space without jitter (always set; the current one on the first frame), and settings
     // (screen-space reflections on, the longest reflection ray in meters, contact shadows on, each on only when there
     // is a previous frame to trace; the previous frame's wind time in seconds). Screen-space reflections and contact
@@ -33,6 +33,8 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     // (SceneMotion.glsl) for each surface's motion.
     mat4 previousViewProjection;
     vec4 reflectionSettings;
+    vec4 probeGrid;        // origin in world meters, spacing (0 when disabled)
+    vec4 probeSettings;    // diffuse GI on, reflection probes on
 } lighting;
 layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles, one per sky direction, nearest
 // The sky's environment (Engine/Render/SkyLight.h): a 128 x 64 radiance map with rows closer near the horizon, then
@@ -54,6 +56,15 @@ layout(set = 0, binding = 7) uniform sampler2D pointShadowMap;
 // The previous frame's TAA result (Engine/Render/Vulkan/HdrFrame.h): linear HDR light, with each pixel's depth along the
 // camera's forward axis in alpha (0 for sky). Screen-space reflections trace it.
 layout(set = 0, binding = 8) uniform sampler2D previousFrame;
+layout(std430, set = 0, binding = 9) readonly buffer LightProbes { vec4 probeData[]; };
+
+uvec2 pointLightCluster(float depth)
+{
+    const float nearDepth = 0.1, farDepth = 1000.0;
+    int slice = depth <= nearDepth ? 0 : clamp(int(log(depth/nearDepth)/log(farDepth/nearDepth)*24.0),0,23);
+    ivec2 tile = clamp(ivec2(gl_FragCoord.xy/max(lighting.clusterViewport.xy,vec2(1.0))*vec2(16.0,9.0)),ivec2(0),ivec2(15,8));
+    return clusterRanges[(slice*9+tile.y)*16+tile.x];
+}
 
 // How much of a shadowed point light at lightPosition reaches position (on a surface facing normal): the cube face
 // the point lies in, looked up with four samples around it.
@@ -83,6 +94,35 @@ float pointShadow(uint slot,vec3 position,vec3 normal,vec3 lightPosition)
 
 const float skyPi = 3.14159265359;
 
+// Inverse-square lamp irradiance scattered toward the eye at one sample along a mist ray.
+vec3 lampMistLight(vec3 position,vec3 direction,float depth)
+{
+    uvec2 range = pointLightCluster(depth);
+    vec3 incident = vec3(0.0);
+    for (uint k = 0; k < range.y; ++k) {
+        uint index = 4u*lightIndices[range.x+k];
+        vec4 place = lightData[index];
+        vec3 offset = place.xyz-position;
+        float squared = max(dot(offset,offset),0.01);
+        float relative = squared/(place.w*place.w);
+        if (relative >= 1.0)
+            continue;
+        vec3 toward = offset*inversesqrt(squared);
+        vec4 cone = lightData[index+2u];
+        float spot = smoothstep(0.0,1.0,(dot(-toward,cone.xyz)-cone.w)*lightData[index+3u].x);
+        if (spot <= 0.0)
+            continue;
+        vec4 lamp = lightData[index+1u];
+        float visibility = lamp.w >= 2.0 && squared > 0.01
+            ? pointShadow(uint(lamp.w-1.5),position,vec3(0.0),place.xyz) : 1.0;
+        const float g = 0.45;
+        float phase = (1.0-g*g)/(4.0*pow(1.0+g*g-2.0*g*clamp(dot(direction,toward),-1.0,1.0),1.5));
+        float fade = 1.0-relative*relative;
+        incident += lamp.rgb*(visibility*spot*phase*fade*fade/squared);
+    }
+    return incident;
+}
+
 // Bilinear lookup in direction d (unit, z up) of the map at offset, wrapping around the vertical.
 vec3 skyMapSample(int offset,int width,int height,vec3 d)
 {
@@ -101,9 +141,12 @@ vec3 skyMapSample(int offset,int width,int height,vec3 d)
 // The sky in direction d: level 0 is its radiance, levels 1 to 3 its reflection by roughness 1/3, 2/3 and 1.
 vec3 skyEnvironment(vec3 d,int level)
 {
-    if (level == 0)
-        return skyMapSample(0,128,64,d);
-    return skyMapSample(128*64+(level-1)*64*32,64,32,d);
+    vec3 radiance = level == 0 ? skyMapSample(0,128,64,d)
+        : skyMapSample(128*64+(level-1)*64*32,64,32,d);
+    float cover = lighting.sunTint.w;
+    if (cover > 0.0)
+        radiance = mix(radiance*(1.0-0.35*cover),lighting.skyIrradiance[0].rgb*0.282095,0.75*cover);
+    return radiance;
 }
 
 const float sunAngularDiameter = 0.00925; // radians, as in ShadowCascades.h
@@ -217,6 +260,23 @@ float heightFogTransmission(float distance,float logAtEye,float logSlope,float d
     return exp(-min(40.0,density*distance*integral/abs(change)));
 }
 
+void physicalFogLighting(vec3 direction,vec3 tint,out vec3 ambient,out vec3 direct)
+{
+    // The constant SH term gives the mean sky radiance incident on the droplets.
+    ambient = tint*lighting.skyIrradiance[0].rgb*0.282095;
+    // Henyey-Greenstein phase function times pi: the sun's scene units are irradiance divided by pi.
+    const float g = 0.7;
+    float towardSun = clamp(dot(direction,lighting.sun.xyz),-1.0,1.0);
+    float phase = (1.0-g*g)/(4.0*pow(1.0+g*g-2.0*g*towardSun,1.5));
+    direct = tint*lighting.sunTint.rgb*lighting.sun.w*phase;
+}
+
+float fogShadowJitter()
+{
+    float pixelNoise = fract(52.9829189*fract(dot(gl_FragCoord.xy,vec2(0.06711056,0.00583715))));
+    return fract(pixelNoise+lighting.settings.z*0.61803399);
+}
+
 // RGB is in-scattered light and alpha is the fraction of the background that reaches the eye.
 vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,float falloff,float base)
 {
@@ -227,19 +287,23 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
     float logSlope = -direction.z*falloff;
     float transmission = heightFogTransmission(distance,logAtEye,logSlope,density);
     float opacity = 1.0-transmission;
-    float towardSun = max(0.0,dot(direction,lighting.sun.xyz));
-    float sunShare = clamp(lighting.sun.w,0.0,1.0)*(0.30+0.22*pow(towardSun,12.0));
-    vec3 scatter = tint*(1.0-sunShare);
-    if (lighting.skySettings.z > 0.5)
-        scatter = tint*lighting.skyIrradiance[0].rgb*0.282095; // mean sky radiance from the constant SH term
-    vec3 sunlight = tint*lighting.sunTint.rgb*sunShare;
+    bool physical = lighting.skySettings.z > 0.5;
+    vec3 scatter, sunlight;
+    if (physical) {
+        physicalFogLighting(direction,tint,scatter,sunlight);
+    } else {
+        float towardSun = max(0.0,dot(direction,lighting.sun.xyz));
+        float sunShare = clamp(lighting.sun.w,0.0,1.0)*(0.30+0.22*pow(towardSun,12.0));
+        scatter = tint*(1.0-sunShare);
+        sunlight = tint*lighting.sunTint.rgb*sunShare;
+    }
     float blocked = 0.0;
-    if (lighting.settings.y > 0.5 && sunShare > 0.0 && opacity > 0.0001) {
+    if (lighting.settings.y > 0.5 && lighting.sun.w > 0.0 && opacity > 0.0001) {
         // Spend the samples within shadow map range. Fog beyond it still attenuates and scatters light.
         float shadowRange = lighting.cascadeScales[3].z/max(0.2,dot(direction,lighting.clusterForward.xyz));
         float marchEnd = min(distance,shadowRange);
         vec2 pixel = gl_FragCoord.xy+5.588238*lighting.settings.z;
-        float jitter = fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
+        float jitter = physical ? fogShadowJitter() : fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
         const int steps = 8; // TAA turns the jitter each frame, so a still view averages 128 samples
         float start = 0.0, before = 1.0;
         for (int i = 0; i < steps; ++i) {
@@ -255,6 +319,8 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
             }
             if (after < 0.001)
                 break;
+            if (physical)
+                jitter = fract(jitter+0.61803399);
             start = end;
             before = after;
         }
@@ -262,9 +328,23 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
     return vec4(scatter*opacity+sunlight*max(0.0,opacity-blocked),transmission);
 }
 
+vec4 surfaceFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,float falloff,float base)
+{
+    vec4 fog = heightFog(eye,direction,distance,tint,density,falloff,base);
+    float haze = lighting.skySettings.w;
+    if (haze > 0.0) {
+        // The aerosol density falls with altitude. Use the physical sky toward the horizon as the distant source.
+        const float aerosolScale = 1.0/1200.0;
+        float transmission = heightFogTransmission(distance,-eye.z*aerosolScale,-direction.z*aerosolScale,haze*0.001);
+        vec3 air = skyEnvironment(normalize(vec3(direction.xy,max(0.02,direction.z))),0);
+        fog.rgb += air*(1.0-transmission)*fog.a;
+        fog.a *= transmission;
+    }
+    return fog;
+}
+
 vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, float sunlight)
 {
-    const int steps = 10;
     float radius = lighting.fogCenterRadius.w;
     if (radius <= 0.0 || lighting.settings.x <= 0.0)
         return vec4(0.0);
@@ -273,22 +353,63 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
     float d = b*b-dot(origin,origin)+radius*radius;
     if (d <= 0.0)
         return vec4(0.0);
-    float nearHit = max(0.0,-b-sqrt(d));
-    float farHit = min(distanceToSurface,-b+sqrt(d));
+    float halfChord = sqrt(d);
+    float nearHit = max(0.0,-b-halfChord);
+    float farHit = min(distanceToSurface,-b+halfChord);
     if (farHit <= nearHit)
         return vec4(0.0);
-    float stepSize = (farHit-nearHit)/float(steps);
+    bool physical = lighting.skySettings.z > 0.5;
+    vec3 ambient = tint*0.27;
+    vec3 direct = tint*min(0.73,0.62*sunlight);
+    if (physical)
+        physicalFogLighting(direction,tint,ambient,direct);
+    bool shadowed = lighting.settings.y > 0.5 && any(greaterThan(direct,vec3(0.0)));
+    bool lamps = physical && clusterHeader.x > clusterHeader.y;
+    float jitter = physical && (shadowed || lamps) ? fogShadowJitter() : 0.5;
+    // Keep ten density samples. In physical mode two neighboring samples share one shadow query,
+    // with each half selected in proportion to its contribution to the segment's optical depth.
+    int segments = physical ? 5 : 10;
+    float stepSize = (farHit-nearHit)/float(segments);
     float transmission = 1.0;
-    vec3 inscatter = vec3(0.0);
-    for (int i = 0; i < steps; ++i) {
-        vec3 p = eye+direction*(nearHit+(float(i)+0.5)*stepSize);
-        float edge = 1.0-smoothstep(0.60,1.0,length(p-lighting.fogCenterRadius.xyz)/radius);
-        float opacity = 1.0-exp(-lighting.settings.x*edge*stepSize);
-        float illumination = 0.27 + min(0.73,0.62*sunlight)*sunVisibility(p,vec3(0.0),false);
-        inscatter += transmission*opacity*tint*illumination;
-        transmission *= 1.0-opacity;
+    float blocked = 0.0;
+    vec3 lamplight = vec3(0.0);
+    float radialOffset = max(0.0,dot(origin,origin)-b*b)/(radius*radius);
+    float densityStep = lighting.settings.x*stepSize;
+    for (int i = 0; i < segments; ++i) {
+        float start = nearHit+float(i)*stepSize;
+        float fraction = physical ? 0.25 : 0.5;
+        float along = (b+start+fraction*stepSize)/radius;
+        float first = 1.0-smoothstep(0.60,1.0,sqrt(radialOffset+along*along));
+        float density = first;
+        if (physical) {
+            along += 0.5*stepSize/radius;
+            float second = 1.0-smoothstep(0.60,1.0,sqrt(radialOffset+along*along));
+            density = (first+second)*0.5;
+        }
+        float after = transmission*exp(-densityStep*density);
+        float weight = transmission-after;
+        if ((shadowed || lamps) && weight > 0.00001) {
+            float sampleAt = 0.5;
+            if (physical) {
+                // Pick the subsegment by its extinction weight, including attenuation by the first half.
+                float midpoint = transmission*exp(-0.5*densityStep*first);
+                float nearWeight = (transmission-midpoint)/weight;
+                sampleAt = jitter < nearWeight ? 0.5*jitter/max(nearWeight,1e-6)
+                    : 0.5+0.5*(jitter-nearWeight)/max(1.0-nearWeight,1e-6);
+            }
+            float distance = start+sampleAt*stepSize;
+            vec3 point = eye+direction*distance;
+            if (shadowed)
+                blocked += weight*(1.0-sunVisibility(point,vec3(0.0),false));
+            if (lamps)
+                lamplight += weight*lampMistLight(point,direction,distance*dot(direction,lighting.clusterForward.xyz));
+        }
+        transmission = after;
+        if (physical)
+            jitter = fract(jitter+0.61803399);
     }
-    return vec4(inscatter,1.0-transmission);
+    float opacity = 1.0-transmission;
+    return vec4(ambient*opacity+direct*max(0.0,opacity-blocked)+tint*lamplight,opacity);
 }
 
 // This surface's own motion on the previous frame's screen in UV units (HdrFrame::velocityFormat), from the two clip

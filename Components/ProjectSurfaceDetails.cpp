@@ -1,4 +1,5 @@
 #include "Components/ProjectSurfaceDetails.h"
+#include "Components/MaterialLayerControls.h"
 #include "State/ProjectStore.h"
 
 #include <QBuffer>
@@ -16,6 +17,7 @@
 #include <QMessageBox>
 #include <QPixmap>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QVBoxLayout>
 #include <algorithm>
 
@@ -127,8 +129,13 @@ QString projectSurfaces::editMaterial(ProjectStore &store,const QString &id,cons
     dialog.setObjectName("projectMaterialDetails");
     dialog.setWindowTitle(id.isEmpty() ? tr("New Material") : tr("%1 — Material Details").arg(material.name));
     auto *layout = new QVBoxLayout(&dialog);
-    auto *form = new QFormLayout;
-    layout->addLayout(form);
+    auto *scroll = new QScrollArea(&dialog);
+    scroll->setWidgetResizable(true);
+    auto *properties = new QWidget(scroll);
+    auto *form = new QFormLayout(properties);
+    scroll->setWidget(properties);
+    layout->addWidget(scroll);
+    dialog.resize(540,650);
     auto *name = new QLineEdit(material.name,&dialog);
     name->setObjectName("projectMaterialName");
     name->setMaxLength(120);
@@ -144,20 +151,23 @@ QString projectSurfaces::editMaterial(ProjectStore &store,const QString &id,cons
     form->addRow(tr("Name"),name);
     form->addRow(tr("Base-color texture"),texture);
     form->addRow(tr("Base-color tint"),tint);
-    const std::array mapLabels{tr("Normal"),tr("Metallic (B) / Roughness (G)"),tr("Occlusion (R)"),tr("Emissive")};
-    std::array<QComboBox *,4> maps{};
+    auto mapLabels = materialMapNames();
+    mapLabels[2] = tr("Metallic (B) / Roughness (G)");
+    mapLabels[3] = tr("Occlusion (R)");
+    std::array<QComboBox *,worldforge::materialTextureCount-1> maps{};
     for (std::size_t i = 0; i < maps.size(); ++i) {
         auto *map = new QComboBox(&dialog);
         map->setObjectName(QStringLiteral("projectMaterialMap%1").arg(i));
         map->addItem(tr("None"),QString{});
         for (auto it = project->surfaces.textures.cbegin(); it != project->surfaces.textures.cend(); ++it)
             map->addItem(it->name,it.key());
-        map->setCurrentIndex(std::max(0,map->findData(material.maps[i])));
-        form->addRow(mapLabels[i],map);
+        map->setCurrentIndex(std::max(0,map->findData(material.map(i))));
+        form->addRow(mapLabels[i+1],map);
         maps[i] = map;
     }
     const auto addFactor = [&](const QString &label,float value) {
         auto *box = new QDoubleSpinBox(&dialog);
+        box->setAccessibleName(label);
         box->setRange(0,1);
         box->setDecimals(3);
         box->setSingleStep(0.05);
@@ -167,6 +177,11 @@ QString projectSurfaces::editMaterial(ProjectStore &store,const QString &id,cons
     };
     const auto *metallic = addFactor(tr("Metallic factor"),material.metallic);
     const auto *roughness = addFactor(tr("Roughness factor"),material.roughness);
+    const auto *clearCoat = addFactor(tr("Clear coat weight"),material.clearCoat);
+    const auto *coatRoughness = addFactor(tr("Clear coat roughness"),material.clearCoatRoughness);
+    auto *layers = new MaterialLayerControls(&dialog);
+    layers->setLayers(material.layers);
+    form->addRow(layers);
     const auto *emission = addFactor(tr("Emission strength"),material.emission);
     layout->addWidget(image);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save|QDialogButtonBox::Close,&dialog);
@@ -178,9 +193,12 @@ QString projectSurfaces::editMaterial(ProjectStore &store,const QString &id,cons
         draft.name = name->text().trimmed();
         draft.textureId = texture->currentData().toString();
         for (std::size_t i = 0; i < maps.size(); ++i)
-            draft.maps[i] = maps[i]->currentData().toString();
+            draft.map(i) = maps[i]->currentData().toString();
         draft.metallic = float(metallic->value());
         draft.roughness = float(roughness->value());
+        draft.clearCoat = float(clearCoat->value());
+        draft.clearCoatRoughness = float(coatRoughness->value());
+        draft.layers = layers->layers();
         draft.emission = float(emission->value());
         return draft;
     };
@@ -201,8 +219,9 @@ QString projectSurfaces::editMaterial(ProjectStore &store,const QString &id,cons
     QObject::connect(texture,&QComboBox::currentIndexChanged,&dialog,refresh);
     for (const auto *map : maps)
         QObject::connect(map,&QComboBox::currentIndexChanged,&dialog,refresh);
-    for (const auto *factor : {metallic,roughness,emission})
+    for (const auto *factor : {metallic,roughness,clearCoat,coatRoughness,emission})
         QObject::connect(factor,&QDoubleSpinBox::valueChanged,&dialog,refresh);
+    layers->onChanged(refresh);
     QObject::connect(tint,&QPushButton::clicked,&dialog,[&] {
         const auto picked = QColorDialog::getColor(QColor::fromRgbF(material.tint[0],material.tint[1],material.tint[2]),
             &dialog,tr("Base-color Tint"));

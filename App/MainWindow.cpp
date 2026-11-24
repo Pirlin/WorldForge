@@ -865,7 +865,14 @@ void MainWindow::editAtmosphere()
     const auto initial = readAtmosphere(details);
     QDialog dialog(this);
     dialog.setWindowTitle(tr("Sky, Fog & Gravity"));
-    auto *form = new QFormLayout(&dialog);
+    auto *rows = new QVBoxLayout(&dialog);
+    auto *scroll = new QScrollArea(&dialog);
+    scroll->setWidgetResizable(true);
+    auto *settings = new QWidget(scroll);
+    auto *form = new QFormLayout(settings);
+    scroll->setWidget(settings);
+    rows->addWidget(scroll);
+    dialog.resize(560,650);
     auto *sky = new QCheckBox(tr("Show gradient sky"),&dialog);
     sky->setChecked(initial.sky);
     form->addRow(sky);
@@ -923,6 +930,19 @@ void MainWindow::editAtmosphere()
         form->addRow(name,field);
         return field;
     };
+    auto *aerialHaze = scalar(tr("Distance haze"),0,worldforge::Weather::maximumHaze,initial.weather.haze);
+    aerialHaze->setToolTip(tr("Extinction per kilometer at ground level in the physical atmosphere."));
+    auto *cloudCover = scalar(tr("Cloud cover"),0,1,initial.weather.cloudCover);
+    auto *targetCloudCover = scalar(tr("Cloud cover during play"),0,1,initial.weather.targetCloudCover);
+    auto *cloudTransition = scalar(tr("Cloud transition"),0,worldforge::Weather::maximumTransition,initial.weather.cloudTransition);
+    cloudTransition->setSuffix(tr(" s"));
+    cloudTransition->setToolTip(tr("Time from the initial cloud cover to the target during Play. Zero holds the initial cover."));
+    const auto weatherControls = [skyModel,aerialHaze,cloudCover,targetCloudCover,cloudTransition] {
+        for (auto *field : {aerialHaze,cloudCover,targetCloudCover,cloudTransition})
+            field->setEnabled(skyModel->currentIndex() == 1);
+    };
+    weatherControls();
+    connect(skyModel,&QComboBox::currentIndexChanged,&dialog,weatherControls);
     auto *sunAzimuth = scalar(tr("Default sun azimuth"),-180,180,initial.sunAzimuth);
     auto *sunElevation = scalar(tr("Default sun elevation"),-20,90,initial.sunElevation);
     sunAzimuth->setSuffix("°");
@@ -993,6 +1013,15 @@ void MainWindow::editAtmosphere()
     ambientOcclusion->setChecked(initial.ambientOcclusion);
     ambientOcclusion->setToolTip(tr("Darkens sky light in corners, creases and openings that the sky cannot reach."));
     form->addRow(ambientOcclusion);
+    auto *probeGi = new QCheckBox(tr("Probe global illumination"),&dialog);
+    probeGi->setChecked(initial.probeGi);
+    probeGi->setToolTip(tr("Adds diffuse light from sunlit and emissive geometry around the camera, including objects outside the view."));
+    form->addRow(probeGi);
+    auto *screenSpaceGi = new QCheckBox(tr("Screen-space global illumination"),&dialog);
+    screenSpaceGi->setAccessibleName(tr("Screen-space global illumination"));
+    screenSpaceGi->setChecked(initial.screenSpaceGi);
+    screenSpaceGi->setToolTip(tr("Adds nearby light and color reflected from surfaces visible in the current view."));
+    form->addRow(screenSpaceGi);
     auto *bloom = new QCheckBox(tr("Bloom"),&dialog);
     bloom->setAccessibleName(tr("Bloom"));
     bloom->setChecked(initial.bloom);
@@ -1005,6 +1034,11 @@ void MainWindow::editAtmosphere()
     reflections->setToolTip(tr("Glossy surfaces reflect the buildings and objects on screen, not only the sky. "
                                "Surfaces with roughness above 0.55 are unaffected."));
     form->addRow(reflections);
+    auto *reflectionProbes = new QCheckBox(tr("Reflection probes"),&dialog);
+    reflectionProbes->setAccessibleName(tr("Reflection probes"));
+    reflectionProbes->setChecked(initial.reflectionProbes);
+    reflectionProbes->setToolTip(tr("Reflects nearby geometry outside the camera view. Uses world-space probe distance to adjust the reflection."));
+    form->addRow(reflectionProbes);
     auto *contactShadows = new QCheckBox(tr("Contact shadows"),&dialog);
     contactShadows->setAccessibleName(tr("Contact shadows"));
     contactShadows->setChecked(initial.contactShadows);
@@ -1061,7 +1095,7 @@ void MainWindow::editAtmosphere()
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel,&dialog);
     connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept);
     connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);
-    form->addRow(buttons);
+    rows->addWidget(buttons);
     if (dialog.exec() == QDialog::Accepted)
         store_.setAtmosphere({{"sky",sky->isChecked()},{"horizon",horizon->text()},{"zenith",zenith->text()},
                               {"fogColor",fogColor->text()},{"fogDensity",fog->value()},{"fogFalloff",falloff->value()},
@@ -1069,8 +1103,12 @@ void MainWindow::editAtmosphere()
                               {"sunAzimuth",sunAzimuth->value()},{"sunElevation",sunElevation->value()},
                               {"shadows",shadows->isChecked()},{"localFogRadius",localRadius->value()},
                               {"localFogDensity",localDensity->value()},
+                              {"aerialHaze",aerialHaze->value()},{"cloudCover",cloudCover->value()},
+                              {"targetCloudCover",targetCloudCover->value()},{"cloudTransition",cloudTransition->value()},
                               {"ev100",exposure->value()},{"exposureMode",exposureMode->currentData().toString()},
                               {"exposureCompensation",compensation->value()},{"viewTransform",viewTransform->currentData().toString()},{"antiAliasing",antiAliasing->currentData().toString()},{"ambientOcclusion",ambientOcclusion->isChecked()},{"skyModel",skyModel->currentData().toString()},{"bloom",bloom->isChecked()},{"reflections",reflections->isChecked()},{"contactShadows",contactShadows->isChecked()},{"depthOfField",depthOfField->isChecked()},{"focusDistance",focusDistance->value()},{"fNumber",fNumber->value()},{"motionBlur",motionBlur->isChecked()},{"shutter",shutter->value()},
+                              {"probeGi",probeGi->isChecked()},{"screenSpaceGi",screenSpaceGi->isChecked()},
+                              {"reflectionProbes",reflectionProbes->isChecked()},
                               {"localFogCenter",QJsonArray{localCenter[0]->value(),localCenter[1]->value(),localCenter[2]->value()}}});
 }
 

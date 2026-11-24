@@ -1,0 +1,106 @@
+#version 450
+
+layout(local_size_x = 64) in;
+struct Batch {
+    vec4 center;
+    vec4 extent;
+    uvec4 vertices; // first, count
+};
+layout(std430,set = 0,binding = 0) readonly buffer InputBatches { Batch batches[]; };
+layout(std430,set = 0,binding = 1) writeonly buffer IndirectDraws { uvec4 draws[]; };
+// One count per workgroup, followed by the groups' compacted commands in original draw order.
+layout(std430,set = 0,binding = 2) writeonly buffer CompactDraws { uvec4 compactDraws[]; };
+layout(std430,set = 0,binding = 3) readonly buffer OcclusionDepth { float depth[]; } pyramid;
+layout(push_constant) uniform CullView {
+    mat4 matrix;
+    uint count;
+    uint base;
+    uint compactBase;
+    uint countBase;
+    uvec2 depthSize;
+} view;
+shared uint visibleMask[2];
+
+bool outside(vec4 plane,Batch batch)
+{
+    float reach = dot(abs(plane.xyz),batch.extent.xyz);
+    float distance = dot(plane.xyz,batch.center.xyz)+plane.w;
+    return distance+reach < -0.0001*length(plane.xyz);
+}
+
+bool occluded(Batch batch)
+{
+    vec2 lo = vec2(1.0), hi = vec2(-1.0);
+    float nearest = 1.0;
+    for (uint corner = 0u; corner < 8u; ++corner) {
+        vec3 sign = vec3((corner & 1u) != 0u ? 1.0 : -1.0,(corner & 2u) != 0u ? 1.0 : -1.0,
+                         (corner & 4u) != 0u ? 1.0 : -1.0);
+        vec4 clip = view.matrix*vec4(batch.center.xyz+sign*batch.extent.xyz,1.0);
+        // Clipping at the near plane can create new extrema. Keep such batches.
+        if (clip.w <= 0.0 || clip.z <= 0.0)
+            return false;
+        vec3 ndc = clip.xyz/clip.w;
+        lo = min(lo,ndc.xy);
+        hi = max(hi,ndc.xy);
+        nearest = min(nearest,ndc.z);
+    }
+    if (any(greaterThan(lo,hi)))
+        return false;
+    // Pad for rasterization and arithmetic rounding. The pyramid uses this frame's exact viewport and jitter.
+    vec2 size = vec2(view.depthSize);
+    ivec2 first = ivec2(floor(clamp((lo*0.5+0.5)*size-1.0,vec2(0.0),size-1.0)));
+    ivec2 last = ivec2(floor(clamp((hi*0.5+0.5)*size+1.0,vec2(0.0),size-1.0)));
+    first /= 8;
+    last /= 8;
+    uvec2 tiles = (view.depthSize+7u)/8u;
+    uint offset = 0u;
+    while (any(greaterThan(last-first,ivec2(2)))) {
+        offset += tiles.x*tiles.y;
+        tiles = (tiles+1u)/2u;
+        first /= 2;
+        last /= 2;
+    }
+    for (int y = first.y; y <= last.y; ++y)
+        for (int x = first.x; x <= last.x; ++x)
+            if (nearest <= pyramid.depth[offset+uint(y)*tiles.x+uint(x)]+0.000025)
+                return false;
+    return true;
+}
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    uvec4 draw = uvec4(0u);
+    if (index < view.count) {
+        Batch batch = batches[index];
+        mat4 rows = transpose(view.matrix);
+        bool hidden = outside(rows[3]+rows[0],batch) || outside(rows[3]-rows[0],batch)
+            || outside(rows[3]+rows[1],batch) || outside(rows[3]-rows[1],batch)
+            || outside(rows[2],batch) || outside(rows[3]-rows[2],batch);
+        const bool behindOccluder = !hidden && batch.vertices.y != 0u && view.depthSize.x != 0u && occluded(batch);
+        draw = uvec4(hidden || behindOccluder ? 0u : batch.vertices.y,behindOccluder ? 0u : 1u,batch.vertices.x,0u);
+        draws[view.base+index] = draw;
+    }
+    if (view.compactBase == 0u)
+        return;
+
+    uint lane = gl_LocalInvocationIndex;
+    uint word = lane >> 5;
+    uint bit = 1u << (lane & 31u);
+    if (lane < 2u)
+        visibleMask[lane] = 0u;
+    barrier();
+    if (draw.x != 0u)
+        atomicOr(visibleMask[word],bit);
+    barrier();
+
+    uint group = gl_WorkGroupID.x;
+    if (lane == 0u)
+        compactDraws[view.countBase+group] = uvec4(bitCount(visibleMask[0])+bitCount(visibleMask[1]),0,0,0);
+    if (draw.x != 0u) {
+        uint prefix = uint(bitCount(visibleMask[word] & (bit-1u)));
+        if (word != 0u)
+            prefix += uint(bitCount(visibleMask[0]));
+        compactDraws[view.compactBase+group*gl_WorkGroupSize.x+prefix] = draw;
+    }
+}

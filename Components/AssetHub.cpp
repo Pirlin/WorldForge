@@ -29,7 +29,8 @@ QStringList usage(const Project &project,const QString &id)
         materials.insert(id);
     QStringList lines;
     for (auto it = project.surfaces.materials.cbegin(); it != project.surfaces.materials.cend(); ++it)
-        if (it->textureId == id || std::ranges::find(it->maps,id) != it->maps.end()) {
+        if (it->textureId == id || std::ranges::find(it->maps,id) != it->maps.end()
+            || std::ranges::find(it->layerMaps,id) != it->layerMaps.end()) {
             lines << QObject::tr("Material · %1").arg(it->name);
             materials.insert(it.key());
         }

@@ -722,6 +722,11 @@ std::string validateMesh(const Mesh &mesh)
     for (const auto &material : mesh.materials) {
         if (!finite(material.color) || !finite(material.emissive) || !std::isfinite(material.roughness) || !std::isfinite(material.metallic))
             return "Material contains non-finite values.";
+        if (!(material.clearCoat >= 0 && material.clearCoat <= 1
+            && material.clearCoatRoughness >= 0 && material.clearCoatRoughness <= 1))
+            return "Clear coat weight and roughness must be between zero and one.";
+        if (!material.layers.valid())
+            return "Material layers contain values outside the supported range.";
         for (const auto *image : material.previewTextures())
             textureBytes += image->size();
         if (textureBytes > MeshMaterial::maxTextureBytes)
