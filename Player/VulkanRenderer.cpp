@@ -259,6 +259,7 @@ private:
     vk::DrawCulling drawCulling_;
     vk::OcclusionDepth occlusionDepth_;
     std::vector<vk::DrawBounds> cullBatches_;
+    std::vector<std::pair<float,uint32_t>> opaqueOrder_; // squared distance to the camera, range index
     uint32_t rejectedDraws_ = 0, rejectedTriangles_ = 0, occludedDraws_ = 0;
     bool probeCompute_ = false;
     VkInstance instance_{};
@@ -1653,9 +1654,24 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         api_.vkCmdBindVertexBuffers(command,0,2,buffers,offsets);
         if (frame.meshletsBound)
             api_.vkCmdBindIndexBuffer(command,meshletIndices_.buffer,0,VK_INDEX_TYPE_UINT32);
-        for (const auto &range : ranges)
-            if (!isTransparent(range))
-                drawRange(range,false);
+        // Nearest first, so the depth test rejects most hidden fragments before they run the shading (the fog
+        // marches, shadows and lights). The culling bounds give each range's box; without them the list order stays.
+        opaqueOrder_.clear();
+        for (std::size_t i = 0; i < ranges.size(); ++i)
+            if (!isTransparent(ranges[i]))
+                opaqueOrder_.push_back({0,uint32_t(i)});
+        if (culled && cullBatches_.size() == ranges.size())
+            for (auto &[distance,index] : opaqueOrder_) {
+                const auto &bounds = cullBatches_[index];
+                const float eye[3]{view.eye.x,view.eye.y,view.eye.z};
+                for (std::size_t axis = 0; axis < 3; ++axis) {
+                    const float gap = std::max(std::abs(eye[axis]-bounds.center[axis])-bounds.extent[axis],0.0f);
+                    distance += gap*gap;
+                }
+            }
+        std::ranges::stable_sort(opaqueOrder_,{},&std::pair<float,uint32_t>::first);
+        for (const auto &entry : opaqueOrder_)
+            drawRange(ranges[entry.second],false);
     }
     // The far-plane sky shades only pixels left uncovered by geometry.
     if (sky) {
