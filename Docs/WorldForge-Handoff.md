@@ -76,6 +76,7 @@ Settings flow through these files:
 **What changed:**
 - **Lamp ranges** follow the exposure: an 1800 cd lamp no longer reaches 85 m by day.
 - **Draw order:** opaque ranges draw nearest first.
+- **Sky irradiance** adds spherical-harmonic band 4 (9 more coefficients at the end of the lighting block, 2160 bytes): upward surfaces at twilight were 11% too bright.
 - **Split lookups under TAA:** sky openness, PCSS, GTAO, the height fog's shadow march and the local mist are split across pixels and frames. Both renderers pass the flag in `probeSettings.z`. Without TAA every lookup is taken as before. See playbook section 10.0 for the lessons, including what not to do in the scene shader.
 
 **Checks:** realism is 95.0 (FLIP 0.0498), rendering 50/50, the full audit 1375 PASS, and `--street-profile` breaks the street's GPU time down by feature.
