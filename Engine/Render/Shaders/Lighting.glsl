@@ -227,8 +227,12 @@ float sunVisibility(vec3 position,vec3 normal,bool soft)
     mat2 rotation = mat2(cos(angle),sin(angle),-sin(angle),cos(angle));
     // Blocker search: occluders up to 40 m toward the sun can widen the penumbra over this point.
     float searchTexels = clamp(0.5*sunAngularDiameter*40.0/scale.x,1.5,16.0);
+    // With TAA (a nonzero sample index) each pixel takes every other tap of both disks, alternating in a
+    // checkerboard that flips each frame, and the resolve averages the halves. Without TAA every tap is taken.
+    int stride = lighting.settings.z > 0.5 ? 2 : 1;
+    int first = stride == 2 ? (int(gl_FragCoord.x)+int(gl_FragCoord.y)+int(lighting.settings.z)) & 1 : 0;
     float blockers = 0.0, count = 0.0;
-    for (int i = 0; i < 16; ++i) {
+    for (int i = first; i < 16; i += stride) {
         float depth = cascadeDepth(cascade,coordinates.xy+rotation*shadowDisk[i]*searchTexels/texels);
         if (depth < receiver) {
             blockers += depth;
@@ -241,9 +245,9 @@ float sunVisibility(vec3 position,vec3 normal,bool soft)
     float distanceToBlockers = (receiver-blockers/count)*scale.y;
     float filterTexels = clamp(0.5*sunAngularDiameter*distanceToBlockers/scale.x,0.75,24.0);
     float visibility = 0.0;
-    for (int i = 0; i < 16; ++i)
+    for (int i = first; i < 16; i += stride)
         visibility += step(receiver,cascadeDepth(cascade,coordinates.xy+rotation*shadowDisk[i]*filterTexels/texels));
-    return visibility/16.0;
+    return visibility*float(stride)/16.0;
 }
 
 // Integrate the clamped exponential height profile over a ray segment. Outside the exponential part the
@@ -305,22 +309,45 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
         vec2 pixel = gl_FragCoord.xy+5.588238*lighting.settings.z;
         float jitter = physical ? fogShadowJitter() : fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
         const int steps = 8; // TAA turns the jitter each frame, so a still view averages 128 samples
+        // With TAA (a nonzero sample index), neighboring segments share one shadow lookup, placed in either by its
+        // share of their extinction, as the local mist does. Without TAA each segment takes its own.
+        bool paired = lighting.settings.z > 0.5;
         float start = 0.0, before = 1.0;
-        for (int i = 0; i < steps; ++i) {
-            float fraction = float(i+1)/float(steps);
-            float end = marchEnd*fraction*fraction;
+        for (int i = 0; i < steps; i += 2) {
+            float middle = marchEnd*float((i+1)*(i+1))/float(steps*steps);
+            float end = marchEnd*float((i+2)*(i+2))/float(steps*steps);
+            float between = heightFogTransmission(middle,logAtEye,logSlope,density);
             float after = heightFogTransmission(end,logAtEye,logSlope,density);
-            float weight = before-after;
-            if (weight > 0.00001) {
-                float sampleAt = mix(start,end,jitter);
-                float shadow = 1.0-sunVisibility(eye+direction*sampleAt,vec3(0.0),false);
-                shadow *= 1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt);
-                blocked += weight*shadow;
+            float nearWeight = before-between, farWeight = between-after;
+            if (paired) {
+                float weight = nearWeight+farWeight;
+                if (weight > 0.00001) {
+                    float share = nearWeight/weight;
+                    float sampleAt = jitter < share ? mix(start,middle,jitter/max(share,1e-6))
+                        : mix(middle,end,(jitter-share)/max(1.0-share,1e-6));
+                    float shadow = 1.0-sunVisibility(eye+direction*sampleAt,vec3(0.0),false);
+                    blocked += weight*shadow*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
+                }
+                if (physical)
+                    jitter = fract(jitter+0.61803399);
+            } else {
+                if (nearWeight > 0.00001) {
+                    float sampleAt = mix(start,middle,jitter);
+                    float shadow = 1.0-sunVisibility(eye+direction*sampleAt,vec3(0.0),false);
+                    blocked += nearWeight*shadow*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
+                }
+                if (physical)
+                    jitter = fract(jitter+0.61803399);
+                if (farWeight > 0.00001) {
+                    float sampleAt = mix(middle,end,jitter);
+                    float shadow = 1.0-sunVisibility(eye+direction*sampleAt,vec3(0.0),false);
+                    blocked += farWeight*shadow*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
+                }
+                if (physical)
+                    jitter = fract(jitter+0.61803399);
             }
             if (after < 0.001)
                 break;
-            if (physical)
-                jitter = fract(jitter+0.61803399);
             start = end;
             before = after;
         }
