@@ -66,6 +66,22 @@ Settings flow through these files:
 - Player format, now v21 for clear coat: `Engine/World/PlayableScene.*`
 - Player `View`: `Player/PlayerRender.h`, which must stay a multiple of 16 bytes for D3D11
 
+## Status (2026-11-25)
+**Frame times** (GTX 1650 laptop, Windows "Power saver"):
+- The street runs at 11.4–11.7 ms average and 12.5–13.0 ms p95.
+- With all R3 lighting it is 14.0 ms p95; with height fog and a 9 m local mist as well, 16.3 ms.
+- The 6 × 6 district runs at 9.8 ms average and 14.6 ms p95 over the whole route. The textured 12 × 12 district is 16.4 ms p95.
+- Every route is under the 16.7 ms budget.
+
+**What changed:**
+- **Lamp ranges** follow the exposure: an 1800 cd lamp no longer reaches 85 m by day.
+- **Draw order:** opaque ranges draw nearest first.
+- **Split lookups under TAA:** sky openness, PCSS, GTAO, the height fog's shadow march and the local mist are split across pixels and frames. Both renderers pass the flag in `probeSettings.z`. Without TAA every lookup is taken as before. See playbook section 10.0 for the lessons, including what not to do in the scene shader.
+
+**Checks:** realism is 95.0 (FLIP 0.0498), rendering 50/50, the full audit 1375 PASS, and `--street-profile` breaks the street's GPU time down by feature.
+
+**Still to check:** how the split lookups look in motion. This is playbook 10.0.1, item 1.
+
 ## Status (2026-11-22)
 **Realism** is 94.9 over 4 views (mean FLIP 0.0508). The Cycles comparison runs with fog disabled.
 
@@ -99,7 +115,7 @@ The GTX 1650 passed the GPU probe test and all 45 rendering checks. Editor and P
 **Atmosphere before R4:** The physical sky uses a more precise lookup for grazing sunlight. The visible sun disc matches the angular size used by the shadow filter. Height fog and local mist now receive the same physical sunlight and skylight, and fog shadow samples vary across pixels and frames to reduce visible bands.
 
 ## Next, in order
-The detailed, step-by-step version of this list, with files, methods, tests and acceptance criteria, is section 10 of the [development playbook](WorldForge-Development-Playbook.md#10-the-plan-what-to-do-next). Start there with the district's frame cost (10.1).
+The detailed, step-by-step version of this list, with files, methods, tests and acceptance criteria, is section 10 of the [development playbook](WorldForge-Development-Playbook.md#10-the-plan-what-to-do-next). Start with its next 8-hour plan (10.0.1): a temporal stability check for the split lookups, then a half-resolution volumetric pass. The paragraphs below are history.
 
 The district profiling audit will reuse the same exported starter and camera route for the original settings and five single-feature variations. The Player's timestamps will give street and rooftop scene-pass times for each. Each run must complete on Vulkan. Compare the variations in the same session before changing the scene shaders. The street-level target is 16.7 ms p95.
 

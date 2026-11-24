@@ -253,7 +253,9 @@ Use the Playable Street for fixed clear-day, low-sun, twilight, and lamp-lit nig
 - [ ] Refine evening and night lighting. Verify warm and cool lamps, shadow falloff, light in mist, and exposure transitions from the street into lit interiors.
 - [ ] Add distance-dependent aerial perspective for streets, rooftops, and the far skyline. Verify that clear air, haze, and dense fog retain depth as the camera moves.
 - [ ] Add cloud cover and weather transitions that change both the visible sky and the light reaching the scene. Check the transitions at street and rooftop height.
-- [ ] Profile and reduce the cost of local mist when the camera looks through the volume. Repeat the mission with both fog types enabled against the 16.7 ms p95 street budget.
+- [x] Profile and reduce the cost of local mist when the camera looks through the volume. Repeat the mission with both fog types enabled against the 16.7 ms p95 street budget.
+  - **Result** (2026-11-25, `--r3-performance`): the street mission with all R3 lighting, height fog and a 9 m local mist runs at 16.3 ms p95 (it was 21.1 ms); with R3 lighting alone it is 14.0 ms. `--street-profile` found the cost in shadow lookups, not lamps. Under TAA the sun-shadow, sky-visibility, fog and mist lookups are split across frames and pixels, and the resolve averages them; without TAA every lookup is taken as before.
+  - **Still to check:** how the split lookups look in motion (flicker in shadowed fog). The audits compare settled frames only.
 - [ ] Review stills and moving shots on the GTX 1650. Record scene settings, reference comparisons, editor and Player differences, frame-time percentiles, worst frames, and peak memory before starting city-scale rendering.
 
 The Vulkan rendering audit passed all 47 checks. In the fixed Playable Street sunset view, height fog and local mist changed the image by 32.49 display levels on average. The editor and Player differed by 0.25 levels. The dusk fixture confirmed that local mist dims with the physical sky, and the updated shadow sampling reduced visible bands in the sunset view.
@@ -271,7 +273,7 @@ On the GTX 1650, the 5.5-second street mission with R3 lighting and physical hei
   - **Route:** the Player's `--verify-district` flies a ring-road lap at eye height, then a rooftop orbit.
   - **Report:** frame, CPU and per-pass GPU times (Vulkan timestamps), draw calls, triangles and memory. The editor audit's `--district` mode runs it.
   - **Baseline** (6 × 6 blocks, 2026-11-24, "Power saver"): 24.7 ms average, 43.6 ms p95, with the scene pass at 12.4 ms (street) and 32.5 ms (rooftops) of GPU time. It is per-pixel shading cost; geometry is only 4,500 triangles.
-  - **Now** (2026-11-25, after the lamp-range and draw-order changes): 13.5 ms average, 20.7 ms p95 (street 11.7–13.3 ms, rooftops 21 ms). Scene GPU time is 6.0 ms on the street and 14.5 ms on the rooftops. Streaming stalls are reported on the textured route (longest 22.1 ms).
+  - **Now** (2026-11-25, after the lamp-range, draw-order and TAA-split changes): 9.8 ms average, 14.6 ms p95 over the whole route (street and rooftops), under the 16.7 ms budget. Scene GPU time is 4.2 ms on the street and 9.5 ms on the rooftops; the textured 12 × 12 route is 16.4 ms p95. Streaming stalls are reported on the textured route (longest 22.1 ms).
   - **Next step:** see the [development playbook](WorldForge-Development-Playbook.md#101-immediately).
 - [x] Move instance frustum culling and indirect drawing to Vulkan. Compare visible geometry and shadows with the current draw path in the editor and Player.
   - **Result** (6 × 6, 2026-11-25, "Power saver", `--district-compare`): 179 draws and 2,355 triangles rejected per frame. Route p95 is 21.5 ms indirect versus 26.1 ms direct (street 13.7 versus 15.9 ms). The sun cascades used compacted indirect draws on all 1,500 frames. Editor and Player images match (mean error 0.000 levels) and the rendering goldens are unchanged.

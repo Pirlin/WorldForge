@@ -336,25 +336,40 @@ The user is asleep. Work through these blocks in order without asking. Each bloc
 - Record the numbers in the roadmap's R4 checklist, ticking an item only when its acceptance criteria in section 10.3 are met.
 - Write down what each unticked item still needs.
 
-**Block 6 (about 1 h): documentation and a final combined run.**
-- [ ] Run the combined verification again.
-- [ ] Update the roadmap, the handoff and this playbook.
-- [ ] Commit and push.
-- [ ] Leave the user a short report: what is now true, the numbers, what failed, and what is next.
+**Block 6 (about 1 h): documentation and a final combined run.** **Done 2026-11-25:** ctest 9/9, rendering 50/50, realism 95.0 (FLIP 0.0498), street 12/12 (12.5–13.0 ms p95), r3-performance 4/4, district 14.6 ms p95, textured district 16.4 ms p95, sunrise and sunset 3/3, full audit 1375 PASS. The roadmap, the handoff and this playbook are updated.
 
-### 10.0.1 The next 8 hours (after the overnight plan)
+**What else the night did (after block 5):**
+- `--street-profile` runs the street mission once per disabled feature, and the street report records GPU time per pass. The street's scene pass was 11.7 ms: sun shadows 6.9 ms, height fog 3.6 ms, ambient occlusion 3.4 ms (plus 2.8 ms in post-process).
+- Under TAA, both renderers pass a TAA flag (`probeSettings.z`), and the costly lookups are split across pixels and frames for the resolve to average:
+  - sky openness tests 8 of 16 directions per pixel;
+  - PCSS takes 8 of its 16 blocker and 16 filter taps;
+  - GTAO traces one slice per frame;
+  - the height fog's eight segments share four shadow lookups, two per frame;
+  - the local mist's segments alternate frames.
+  Without TAA every lookup is taken as before. The street scene pass is now 7.8 ms.
+- **Lessons** (keep them):
+  - Two rewrites that added work or live values to the scene shader made it slower: transforming the fog ray once per cascade (+50% fog cost), and a second importance-sampling loop for the mist (+1.7 ms). The scene shader is large and register-bound, so extra registers cost more than the arithmetic they save.
+  - A per-pixel checkerboard on a branch saves nothing: every warp still takes both sides. Split a lookup by changing a loop's start index (all pixels run the same count), or alternate whole frames.
+  - Keying the split on a nonzero TAA sample index made every sixteenth frame take the full path, which set the p95. Use an explicit flag.
 
-Start these after block 6, or in the next long session:
-1. **R4.6 world partitions and impostors.**
-   - Split the 12 × 12 district into cells.
-   - Stream cell geometry around the camera and replace far cells with per-cell merged low-poly proxies.
-   - Extend the district route with three repeated laps and check that the working set does not grow from lap to lap.
-2. **Lamp color and night lighting (realism pass item 2).**
-   - Verify the version 29 lamp colors.
-   - Add a lit-interior exposure transition audit.
-3. **Local mist cost (realism pass item 5).** The mist must fit the street budget with both fog types on.
-4. **Cloud layer (realism pass item 4).** A 2D cloud layer in `Sky.frag` tied to `cloudCover`, checked at street and rooftop height.
-5. **R4.7 combined check.** Run every district, street and realism audit together, and record sustained frame times and memory.
+### 10.0.1 The next 8 hours
+
+In order. The same rules as section 10.0: each block ends with its checks passing and a pushed commit.
+
+1. **Temporal stability check (about 1.5 h).** The audits compare settled frames, so they cannot see flicker from the split lookups.
+   - Add a rendering-audit case that captures 16 consecutive frames of a still view with shadowed height fog and local mist, and one of a slow pan.
+   - Measure the per-pixel standard deviation over the frames, in display levels.
+   - Accept when the still view's mean deviation is under 1 level and the pan shows no pixel band brighter than 4 levels between frames. If it fails, lower the split (for example, keep two fog lookups per frame) and remeasure.
+2. **Rooftop fog cost (about 2 h).** Height fog is still the largest share of the rooftop scene pass (2.1 of 9.5 ms).
+   - Plan and build a half-resolution volumetric pass: march height fog and mist into an RGBA target (in-scatter, transmission) after a depth prepass, then upsample with depth rejection in the scene shader.
+   - This removes the fog and mist from the scene shader's register budget entirely. Compare against the current path in the same session; keep the editor and Player matching.
+3. **Night lighting (realism pass item 2, about 1.5 h).** Warm and cool lamps in mist are checked. Still missing:
+   - shadow falloff from a lamp;
+   - exposure adapting from the street into a lit interior.
+   Add both audit cases, fix what they find, then tick the roadmap item.
+4. **Aerial perspective (realism pass item 3, about 1 h).** Add the skyline contrast-over-distance audit on the district at clear air, haze and dense fog.
+5. **Cloud transitions (realism pass item 4, about 1 h).** The 2D cloud layer exists and the overcast view matches across renderers. Add the transition check at street and rooftop height. This needs the Player to render at given play times.
+6. **R4.6 world partitions** (start only with the above done). The district is 52 k vertices and fits easily, so partitions need two things first: cell streaming from disk (playable format 30 with per-cell chunks) and content dense enough to show a gain. Write the design into section 10.3 before coding.
 
 ### 10.1 Immediately
 
