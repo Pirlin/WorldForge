@@ -270,12 +270,19 @@ On the GTX 1650, the 5.5-second street mission with R3 lighting and physical hei
   - **Route:** the Player's `--verify-district` flies a ring-road lap at eye height, then a rooftop orbit.
   - **Report:** frame, CPU and per-pass GPU times (Vulkan timestamps), draw calls, triangles and memory. The editor audit's `--district` mode runs it.
   - **Baseline** (6 × 6 blocks, 2026-11-24, "Power saver"): 24.7 ms average, 43.6 ms p95, with the scene pass at 12.4 ms (street) and 32.5 ms (rooftops) of GPU time. It is per-pixel shading cost; geometry is only 4,500 triangles.
-  - **Not yet measured:** streaming stalls, which wait for streaming to exist.
+  - **Now** (2026-11-25, after the lamp-range and draw-order changes): 13.5 ms average, 20.7 ms p95 (street 11.7–13.3 ms, rooftops 21 ms). Scene GPU time is 6.0 ms on the street and 14.5 ms on the rooftops. Streaming stalls are reported on the textured route (longest 22.1 ms).
   - **Next step:** see the [development playbook](WorldForge-Development-Playbook.md#101-immediately).
-- [ ] Move instance frustum culling and indirect drawing to Vulkan. Compare visible geometry and shadows with the current draw path in the editor and Player.
-- [ ] Add occlusion culling and test it during camera turns, fast movement, and across district boundaries.
+- [x] Move instance frustum culling and indirect drawing to Vulkan. Compare visible geometry and shadows with the current draw path in the editor and Player.
+  - **Result** (6 × 6, 2026-11-25, "Power saver", `--district-compare`): 179 draws and 2,355 triangles rejected per frame. Route p95 is 21.5 ms indirect versus 26.1 ms direct (street 13.7 versus 15.9 ms). The sun cascades used compacted indirect draws on all 1,500 frames. Editor and Player images match (mean error 0.000 levels) and the rendering goldens are unchanged.
+  - **Still open:** compacting the camera draws by material bucket. Camera ranges still bind their material one draw at a time.
+- [x] Add occlusion culling and test it during camera turns, fast movement, and across district boundaries.
+  - **Result** (`--district-occlusion`): the previous frame's depth pyramid rejects 19.8 more draws per frame than frustum culling alone (92 visible versus 112). The turn frames are pixel-identical with occlusion on and off. p95 is 20.5 ms versus 21.0 ms with frustum culling alone; the district is shading-bound, not geometry-bound.
 - [ ] Add meshlets and cluster LOD. Enable the mesh shader path on supported devices and verify the indexed draw path on devices that lack it.
-- [ ] Stream texture mip levels and evaluate virtual textures against the district's residency and upload budgets. Verify quality when textures enter view.
+  - **Meshlets are done** (`--district-meshlets`, `--district-meshlets-indexed`): the mesh shader path (463,500 mesh workgroups over the route) and the indexed fallback, with the extension forced off (435,000 indexed draws), both match the editor and the goldens. Frame times are the same within noise (p95 20.8 versus 20.7 ms).
+  - **Still open:** cluster LOD (simplified meshlet groups). It waits for meshes dense enough to need it: the district has 5 k triangles in view.
+- [x] Stream texture mip levels and evaluate virtual textures against the district's residency and upload budgets. Verify quality when textures enter view.
+  - **Result** (12 × 12 textured, `--district-streaming`): 5 promotions to full detail, each within 4 frames of the texture entering view. 7.5 MiB of detail is streamed, the working set peaks at 195 MiB, and the longest upload stall is 22.1 ms.
+  - **Virtual textures:** not needed at this scale. All facade textures together are 8.7 MiB. Revisit when R4.6 streams partitions with unique textures per building.
 - [ ] Add distant impostors and stream world partitions in the editor and Player. Test transitions, long traversals, and repeated boundary crossings for visual pops and memory growth.
 - [ ] Run combined district rendering, lighting, streaming, and performance checks on the GTX 1650. Record sustained frame times and memory alongside the Playable Street regression results.
 

@@ -305,25 +305,25 @@ The renderer retains the atlas slots of lamps that stay in range, replaces only 
 
 The user is asleep. Work through these blocks in order without asking. Each block ends with its checks passing and a commit pushed to master, so an interruption loses at most one block. Tick the boxes and add measured numbers as you go. If a block cannot be finished, write down what is left, then move to the next block instead of stopping.
 
-**Block 1 (about 1.5 h): verify and commit everything that is uncommitted.**
+**Block 1 (about 1.5 h): verify and commit everything that is uncommitted.** **Done 2026-11-25 (commit 982400e):** ctest 9/9, rendering 50/50, realism 95.0, street 12/12, all district modes pass, full audit 1375 PASS.
 - [ ] Build.
 - [ ] Run `Tests/Run-Verification.ps1 -Modes rendering,realism,street,district,district-compare,district-occlusion,district-textured,district-streaming,district-meshlets,district-meshlets-indexed,sunrise,sunset,full -Tag night1 -CTest`.
 - [ ] Review the new R4 code against section 6: `DrawCulling`, `OcclusionDepth`, `CullDraws.comp`, `ReduceDepth.comp`, `Meshlets.h`, `PlayMeshlets.mesh`, texture streaming, the point-shadow slot reuse, and the light-cluster changes. Fix what is wrong.
 - [ ] Commit in logical commits where the files allow it (R2/R3; review fixes; district and GPU timing; culling and occlusion; meshlets; streaming; docs). Otherwise commit once, with a message that lists every part. Push.
 
-**Block 2 (about 1 h): fix the sunrise exposure step.**
+**Block 2 (about 1 h): fix the sunrise exposure step.** **Done 2026-11-25:** `--sunrise` and `--sunset` pass 3/3 each.
 - The `--sunrise` audit measured a 0.508-stop step against the 0.5-stop limit after the sun crosses the horizon.
 - Find which frames step (print the per-frame log2 average) and whether the cause is the sun disc's visible fraction, skylight from the Earth's shadow edge, or the auto-exposure adaptation itself.
 - Fix the cause, not the limit. Check `--sunset` too.
 - Commit.
 
-**Block 3 (about 1.5 h): remove the district's worst-frame hitches.**
+**Block 3 (about 1.5 h): remove the district's worst-frame hitches.** **Done 2026-11-25:** the worst frames on every district route are now 38–48 ms (they were 119–155 ms), under the 50 ms target.
 - The latest routes recorded worst frames of 119 ms (6 × 6) and 155 ms (12 × 12).
 - Log the frame index and per-pass GPU times of every frame over 50 ms in the `--verify-district` report. Find what runs on those frames: probe refresh, point-shadow refresh, sky map refresh, pipeline creation or texture upload.
 - Spread or remove the work, for example a time budget per frame for refreshes, or creating pipelines up front.
 - **Accept when** the worst frame is under 50 ms on both routes in the same session.
 
-**Block 4 (about 2 h): bring the street-level half of the district under 16.7 ms p95.**
+**Block 4 (about 2 h): bring the street-level half of the district under 16.7 ms p95.** **Done 2026-11-25 (commits ccb3ae3, ae69eab):** the district street p95 is 11.7–13.3 ms (it was 19–20.7 ms). Lamp ranges now stop where the current exposure can no longer show their light (an 1800 cd lamp reached 85 m by day; now about 3 m), and opaque ranges draw nearest first. Scene GPU time fell from 10.06 to 6.0 ms on the street and 25.77 to 14.5 ms on the rooftops. Tried and reverted: transforming the fog march ray once per cascade instead of per sample. It made fog 50% slower, most likely from register pressure in the scene shader. The rooftop p95 is still 21 ms; height fog is its largest cost (5.8 ms), and the separate street route stays near 17 ms p95 under Power saver, as it has all evening.
 - Use `--district-profile` to measure the cost of each scene-shader feature.
 - Work on the largest per-pixel cost, which the last profile showed is lamp shading. Options:
   - a tighter light range from an illuminance cutoff;
@@ -331,7 +331,7 @@ The user is asleep. Work through these blocks in order without asking. Each bloc
   - cheaper cluster lists from tile-sphere tests.
 - Re-measure in the same session, and keep the rendering audit's images unchanged (or re-record goldens only for intended changes, with a reason).
 
-**Block 5 (about 1 h): finish the R4 checklist items that have code but no recorded result.**
+**Block 5 (about 1 h): finish the R4 checklist items that have code but no recorded result.** **Done 2026-11-25:** all seven district audits pass. The roadmap now records the results, with R4.2 (culling and indirect draws), R4.3 (occlusion) and R4.5 (mip streaming) ticked. R4.4 stays open for cluster LOD; its meshlets and indexed fallback are done. One `--district-compare` run recorded an 88.6 ms worst frame, above block 3's 50 ms target; the other six routes stayed at 23–37 ms.
 - For occlusion culling, meshlets (with the indexed fallback) and texture streaming, run their audits.
 - Record the numbers in the roadmap's R4 checklist, ticking an item only when its acceptance criteria in section 10.3 are met.
 - Write down what each unticked item still needs.
