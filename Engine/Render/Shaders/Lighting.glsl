@@ -312,6 +312,9 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
         // With TAA, neighboring segments share one shadow lookup, placed in either by its
         // share of their extinction, as the local mist does. Without TAA each segment takes its own.
         bool paired = lighting.probeSettings.z > 0.5;
+        // Pairs also alternate between frames (the same pairs across the screen, so neighboring pixels branch
+        // alike), each taking its lookup at twice the weight.
+        int parity = int(lighting.settings.z) & 1;
         float start = 0.0, before = 1.0;
         for (int i = 0; i < steps; i += 2) {
             float middle = marchEnd*float((i+1)*(i+1))/float(steps*steps);
@@ -321,12 +324,12 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
             float nearWeight = before-between, farWeight = between-after;
             if (paired) {
                 float weight = nearWeight+farWeight;
-                if (weight > 0.00001) {
+                if (weight > 0.00001 && ((i/2+parity) & 1) == 0) {
                     float share = nearWeight/weight;
                     float sampleAt = jitter < share ? mix(start,middle,jitter/max(share,1e-6))
                         : mix(middle,end,(jitter-share)/max(1.0-share,1e-6));
                     float shadow = 1.0-sunVisibility(eye+direction*sampleAt,vec3(0.0),false);
-                    blocked += weight*shadow*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
+                    blocked += 2.0*weight*shadow*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
                 }
                 if (physical)
                     jitter = fract(jitter+0.61803399);
