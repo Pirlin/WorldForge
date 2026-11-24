@@ -2608,7 +2608,9 @@ public:
         lighting.probeGrid = probeField_.grid();
         lighting.probeSettings[0] = environment.probeGi ? 1.0f : 0.0f;
         lighting.probeSettings[1] = environment.reflectionProbes ? 1.0f : 0.0f;
-        lighting.probeSettings[2] = environment.temporalAntiAliasing ? 1.0f : 0.0f; // TAA averages split lookups
+        // TAA averages lookups split across frames; the rendering audit compares flicker with every lookup taken.
+        const bool fullLookups = qEnvironmentVariableIntValue("WORLDFORGE_FULL_LOOKUPS") == 1;
+        lighting.probeSettings[2] = environment.temporalAntiAliasing && !fullLookups ? 1.0f : 0.0f;
         auto &probeFrame = probeFrames_[std::size_t(frameIndex)];
         probeFrame = probeField_.trace();
         lighting_.bindProbes(frameIndex,probeFrame ? probeFrame->output().buffer : VK_NULL_HANDLE,
@@ -2777,6 +2779,7 @@ public:
             occlusion.enabled = environment.ambientOcclusion;
             occlusion.screenSpaceGi = environment.screenSpaceGi && !window_.modelOnly_;
             occlusion.probeGi = environment.probeGi && probeFrame;
+            occlusion.splitSlices = qEnvironmentVariableIntValue("WORLDFORGE_FULL_LOOKUPS") != 1;
             std::copy_n(toWorld.constData(),16,occlusion.inverseViewProjection.begin());
             frame_.display(command,exposure,environment.viewTransform,environment.autoExposure ? int(frameIndex) : -1,temporal,
                            occlusion,environment.bloom && !window_.modelOnly_ ? wf::color::bloomStrength : 0.0f,

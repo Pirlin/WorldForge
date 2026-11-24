@@ -85,6 +85,9 @@ public:
         bool enabled = false;
         bool screenSpaceGi = false;
         bool probeGi = false;
+        // With TAA, trace one slice a frame instead of two (the resolve averages them). The rendering audit turns it off
+        // to compare flicker (WORLDFORGE_FULL_LOOKUPS).
+        bool splitSlices = true;
         // This frame's clip space (with its jitter) to world space, column-major as GLSL reads it.
         std::array<float,16> inverseViewProjection{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         float radius = 1.5f; // meters

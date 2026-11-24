@@ -669,7 +669,7 @@ void HdrFrame::display(VkCommandBuffer command,float exposureStops,color::ViewTr
         vk.vkCmdSetViewport(command,0,1,&ambientViewport);
         vk.vkCmdSetScissor(command,0,1,&ambientArea);
         struct { std::array<float,16> inverseViewProjection; float settings[4]; } constants{occlusion.inverseViewProjection,
-            {occlusion.radius,(occlusion.enabled ? 1.0f : 0.0f)+(occlusion.screenSpaceGi ? 2.0f : 0.0f)+(temporal.enabled ? 4.0f : 0.0f),
+            {occlusion.radius,(occlusion.enabled ? 1.0f : 0.0f)+(occlusion.screenSpaceGi ? 2.0f : 0.0f)+(temporal.enabled && occlusion.splitSlices ? 4.0f : 0.0f),
              float(sample_%temporalSamples),occlusion.probeGi ? 1.0f : 0.0f}};
         vk.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,ambient_);
         vk.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_GRAPHICS,occlusionLayout_,0,1,&occlusionSet_,0,nullptr);

@@ -3705,6 +3705,39 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
                 && sunsetAlike.mean <= 1 && sunsetAlike.share <= 0.005,
                 QString("Fog changes the view by %1. Editor and Player: %2").arg(describe(sunsetFog),describe(sunsetAlike)));
 
+    // Under TAA the costly lookups (sky openness, PCSS, ambient occlusion, fog and mist shadows) are split across
+    // frames and the resolve averages them. They must not flicker: a slow pan through the misty sunset street is
+    // captured with the lookups split and with every lookup taken, and the split may add little frame-to-frame change.
+    const auto panChange = [&](bool full) {
+        if (full)
+            qputenv("WORLDFORGE_FULL_LOOKUPS","1");
+        settled(sunsetShot);
+        const auto side = QVector3D::crossProduct(sunsetShot.target-sunsetShot.eye,QVector3D(0,0,1)).normalized();
+        QImage previous;
+        double total = 0, worst = 0;
+        int count = 0;
+        for (int step = 0; step <= 12; ++step) {
+            const auto offset = side*(0.03f*float(step));
+            const auto frame = capture(sunsetShot.eye+offset,sunsetShot.target+offset);
+            if (!previous.isNull() && !frame.isNull()) {
+                const auto change = difference(frame,previous,QString("rendering-pan-%1-diff.png").arg(full ? "full" : "split"));
+                total += change.mean;
+                worst = std::max(worst,change.share);
+                ++count;
+            }
+            previous = frame;
+        }
+        qunsetenv("WORLDFORGE_FULL_LOOKUPS");
+        return std::pair{count ? total/count : 255.0,worst};
+    };
+    const auto [splitChange,splitShare] = panChange(false);
+    const auto [fullChange,fullShare] = panChange(true);
+    audit.check(page,"temporal","Lookups split across TAA frames do not flicker during a slow pan",
+                splitChange < fullChange+0.5 && splitShare <= fullShare+0.002,
+                QString("Mean change between pan frames: %1 levels split, %2 with every lookup; worst share over 24 levels "
+                        "%3% split, %4% with every lookup")
+                    .arg(splitChange,0,'f',2).arg(fullChange,0,'f',2).arg(splitShare*100,0,'f',3).arg(fullShare*100,0,'f',3));
+
     const auto captureWeatherPlayer = [&](const Shot &shot,const QImage &editor) {
         std::ostringstream weatherBytes;
         QFile package(playablePath);
