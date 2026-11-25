@@ -267,6 +267,7 @@ private:
     std::vector<vk::DrawBounds> cullBatches_;
     std::vector<std::pair<float,uint32_t>> opaqueOrder_; // squared distance to the camera, range index
     std::vector<vk::DrawBounds> orderBounds_; // range boxes for that order when the frame is not GPU-culled
+    std::vector<vk::DrawBounds> casterBounds_; // range boxes for culling point-shadow casters by each lamp's range
     uint32_t rejectedDraws_ = 0, rejectedTriangles_ = 0, occludedDraws_ = 0;
     bool probeCompute_ = false;
     VkInstance instance_{};
@@ -1588,6 +1589,40 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         const VkRenderPassBeginInfo pointBegin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,nullptr,
             clearAll ? shadowPass_ : pointUpdatePass_,pointShadowFramebuffer_,atlas,clearAll ? 1u : 0u,&clearDepth};
         api_.vkCmdBeginRenderPass(command,&pointBegin,VK_SUBPASS_CONTENTS_INLINE);
+        // A lamp's cube draws only the opaque ranges whose boxes reach its range: drawing every caster for every face
+        // cost 17 ms on a detailed 12 x 12 district. The boxes are kept, recomputed only for ranges that changed or move.
+        casterBounds_.resize(ranges.size());
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            const auto &range = ranges[i];
+            const auto end = std::size_t(range.start)+range.count;
+            if (isTransparent(range) || !range.count || end > vertexCount)
+                continue;
+            auto &bounds = casterBounds_[i];
+            const bool moves = !view.movingVertices || end > view.cachedMeshVertices
+                || std::ranges::any_of(*view.movingVertices,[&](const VertexUpload &update) {
+                    return update.first < end && update.first+update.count > range.start;
+                });
+            if (moves || bounds.vertices[0] != range.start || bounds.vertices[1] != range.count)
+                bounds = vk::drawBounds(vertices,range.start,range.count);
+        }
+        const auto drawCastersNear = [&](const std::array<float,4> &lamp) {
+            for (std::size_t i = 0; i < ranges.size(); ++i) {
+                const auto &range = ranges[i];
+                if (isTransparent(range) || !range.count || std::size_t(range.start)+range.count > vertexCount)
+                    continue;
+                const auto &bounds = casterBounds_[i];
+                float gap = 0;
+                for (std::size_t axis = 0; axis < 3; ++axis) {
+                    const float outside = std::max(std::abs(lamp[axis]-bounds.center[axis])-bounds.extent[axis],0.0f);
+                    gap += outside*outside;
+                }
+                if (gap > lamp[3]*lamp[3])
+                    continue;
+                api_.vkCmdDraw(command,range.count,1,range.start,0);
+                ++stats_.depthDraws;
+                stats_.depthTriangles += range.count/3;
+            }
+        };
         if (vertexCount && !clusters_.shadowed.empty()) {
             api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline_);
             api_.vkCmdBindVertexBuffers(command,0,1,&vertexRing_[ring_].buffer,&offset);
@@ -1609,7 +1644,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
                 std::memcpy(&camera.matrix,clusters_.shadowFaces[tile].data(),sizeof(camera.matrix));
                 camera.eye.w = view.lighting.z;
                 api_.vkCmdPushConstants(command,shadowLayout_,VK_SHADER_STAGE_VERTEX_BIT,0,sizeof(camera),&camera);
-                drawShadowCasters();
+                drawCastersNear(clusters_.shadowed[tile/6]);
                 ++stats_.pointShadowFaces;
             }
         }

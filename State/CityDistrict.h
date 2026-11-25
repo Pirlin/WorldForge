@@ -16,6 +16,9 @@ struct Layout {
     int lotsPerSide = 2;      // building lots along each side of a block
     std::uint32_t seed = 7;
     bool texturedFacades = false;
+    // Each building its own mesh with ledges, pilasters and rooftop units and its own 128-pixel facade texture: dense
+    // content for world partitions (R4.6). Implies textured facades.
+    bool detailed = false;
     // The width of the whole district in meters.
     float extent() const { return float(blocks)*blockSize+float(blocks+1)*roadWidth; }
 };

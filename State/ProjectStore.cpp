@@ -1644,6 +1644,7 @@ bool ProjectStore::createStarterProject(const QString &name,QJsonObject configur
         district::Layout layout;
         layout.blocks = std::clamp(configuration.value("districtBlocks").toInt(layout.blocks),1,district::maximumBlocks);
         layout.texturedFacades = configuration.value("districtTexturedFacades").toBool();
+        layout.detailed = configuration.value("districtDetailed").toBool();
         district::addStarter(created,layout);
     }
     const auto settings = configuration.value("worldDefaults").toObject();

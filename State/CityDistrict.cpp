@@ -37,14 +37,15 @@ public:
         return float(state_ & 0xffffff)/float(0x1000000);
     }
     float between(float low,float high) { return low+(high-low)*uniform(); }
+    std::uint32_t next() { uniform(); return state_; }
 
 private:
     std::uint32_t state_;
 };
 
-std::vector<std::uint8_t> facadeTexture(int style,const std::array<float,4> &color)
+std::vector<std::uint8_t> facadeTexture(int style,const std::array<float,4> &color,int size = 512)
 {
-    constexpr int size = 512, bay = 128;
+    const int bay = size/4;
     QImage image(size,size,QImage::Format_RGB32);
     const auto shade = [](const std::array<float,4> &base,float light) {
         const auto channel = [&](float value) { return int(std::clamp(value*light,0.0f,1.0f)*255+0.5f); };
@@ -57,17 +58,20 @@ std::vector<std::uint8_t> facadeTexture(int style,const std::array<float,4> &col
         const int vertical = y%bay;
         for (int x = 0; x < size; ++x) {
             const int horizontal = x%bay;
-            const int inset = style == 3 ? 10 : 24;
-            const bool window = horizontal >= inset && horizontal < bay-inset && vertical >= 20 && vertical < 102;
+            // Measures in pixels of a 128-pixel bay, scaled to this size (512 pixels gives the original maps).
+            const auto px = [bay](int pixels) { return std::max(1,pixels*bay/128); };
+            const int inset = px(style == 3 ? 10 : 24);
+            const bool window = horizontal >= inset && horizontal < bay-inset && vertical >= px(20) && vertical < px(102);
             if (window) {
-                const bool trim = horizontal < inset+4 || horizontal >= bay-inset-4 || std::abs(horizontal-bay/2) <= 2
-                    || vertical < 24 || vertical >= 98;
-                const float reflection = 0.84f+0.003f*float(vertical)+0.025f*float((x/bay+3*(y/bay)+style)%4);
+                const bool trim = horizontal < inset+px(4) || horizontal >= bay-inset-px(4) || std::abs(horizontal-bay/2) <= px(2)
+                    || vertical < px(24) || vertical >= px(98);
+                const float reflection = 0.84f+0.003f*float(vertical)*128.0f/float(bay)+0.025f*float((x/bay+3*(y/bay)+style)%4);
                 row[x] = trim ? shade(frame,0.82f) : shade(glass,reflection);
                 continue;
             }
-            const bool joint = style == 1 ? y%16 < 2 || (x+((y/16)%2)*16)%32 < 2 : vertical < 3 || horizontal < 2;
-            const int panel = (x/16+11*(y/16)+7*style)%9;
+            const int brick = px(16);
+            const bool joint = style == 1 ? y%brick < px(2) || (x+((y/brick)%2)*brick)%(2*brick) < px(2) : vertical < px(3) || horizontal < px(2);
+            const int panel = (x/brick+11*(y/brick)+7*style)%9;
             row[x] = shade(color,joint ? 0.66f : 0.91f+0.013f*float(panel));
         }
     }
@@ -77,6 +81,64 @@ std::vector<std::uint8_t> facadeTexture(int style,const std::array<float,4> &col
         return {};
     const auto *begin = reinterpret_cast<const std::uint8_t *>(png.constData());
     return {begin,begin+png.size()};
+}
+
+// Adds an axis-aligned box to mesh: its six faces in material, each mapped 0 to 1 in uv.
+void appendBox(wf::Mesh &mesh,wf::Point3 center,wf::Point3 size,std::uint32_t material)
+{
+    const auto first = wf::VertexIndex(mesh.vertices.size());
+    for (int corner = 0; corner < 8; ++corner)
+        mesh.vertices.push_back({center[0]+size[0]*((corner&1) ? 0.5f : -0.5f),center[1]+size[1]*((corner&2) ? 0.5f : -0.5f),
+                                 center[2]+size[2]*((corner&4) ? 0.5f : -0.5f)});
+    // Corner bits: x 1, y 2, z 4; each face wound counterclockwise seen from outside.
+    constexpr std::array<std::array<int,4>,6> faces{{{0,2,3,1},{4,5,7,6},{0,1,5,4},{1,3,7,5},{3,2,6,7},{2,0,4,6}}};
+    constexpr std::array<wf::Point2,4> uv{{{0,0},{1,0},{1,1},{0,1}}};
+    for (const auto &indices : faces) {
+        wf::MeshFace face;
+        face.material = material;
+        for (std::size_t i = 0; i < indices.size(); ++i)
+            face.corners.push_back({first+wf::VertexIndex(indices[i]),uv[i]});
+        mesh.faces.push_back(std::move(face));
+    }
+}
+
+// A building with detail, in meters around its center: the body (material 1, its facade texture), a ledge around every
+// floor and pilasters up each side (material 0), a roof slab and rooftop units. About 1,000-2,500 vertices once drawn.
+wf::Mesh detailedBuilding(float width,float depth,float height,std::uint32_t seed)
+{
+    wf::Mesh mesh;
+    mesh.materials.resize(2);
+    appendBox(mesh,{0,0,0},{width,depth,height},1);
+    const float bottom = -height/2;
+    const int floors = std::clamp(int(height/3.5f),1,12);
+    for (int floor = 1; floor <= floors; ++floor) {
+        const float z = bottom+height*float(floor)/float(floors+1);
+        appendBox(mesh,{0,depth/2+0.08f,z},{width+0.3f,0.16f,0.22f},0);
+        appendBox(mesh,{0,-depth/2-0.08f,z},{width+0.3f,0.16f,0.22f},0);
+        appendBox(mesh,{width/2+0.08f,0,z},{0.16f,depth,0.22f},0);
+        appendBox(mesh,{-width/2-0.08f,0,z},{0.16f,depth,0.22f},0);
+    }
+    const auto pilasters = [&](float length,bool alongX) {
+        const int count = std::clamp(int(length/4),1,5);
+        for (int i = 0; i <= count; ++i) {
+            const float at = -length/2+length*float(i)/float(count);
+            for (const float side : {-1.0f,1.0f}) {
+                const wf::Point3 center = alongX ? wf::Point3{at,side*(depth/2+0.1f),0} : wf::Point3{side*(width/2+0.1f),at,0};
+                appendBox(mesh,center,alongX ? wf::Point3{0.35f,0.2f,height} : wf::Point3{0.2f,0.35f,height},0);
+            }
+        }
+    };
+    pilasters(width,true);
+    pilasters(depth,false);
+    appendBox(mesh,{0,0,height/2+0.15f},{width*0.96f,depth*0.96f,0.3f},0);
+    // Rooftop units: a few boxes placed by the seed.
+    std::uint32_t state = seed*747796405u+2891336453u;
+    const auto next = [&] { state = state*747796405u+2891336453u; return float((state >> 8) & 0xffff)/65535.0f; };
+    for (int unit = 0; unit < 3; ++unit) {
+        const float w = 1.2f+2.0f*next(), d = 1.2f+2.0f*next(), h = 0.8f+1.6f*next();
+        appendBox(mesh,{(next()-0.5f)*(width-w-1),(next()-0.5f)*(depth-d-1),height/2+0.3f+h/2},{w,d,h},0);
+    }
+    return mesh;
 }
 
 }
@@ -164,8 +226,34 @@ void addStarter(Project &project,Layout layout)
                                               center.y()-layout.blockSize/2+lot*(float(ly)+0.5f),0};
                     const float width = lot*random.between(0.62f,0.84f), depth = lot*random.between(0.62f,0.84f);
                     const float height = random.between(6,14)+random.between(0,46)*centrality*centrality;
-                    const auto &facade = facades[std::size_t(random.uniform()*float(facades.size()))%facades.size()].first;
+                    const auto style = std::size_t(random.uniform()*float(facades.size()))%facades.size();
+                    const auto &facade = facades[style].first;
                     const auto name = QString("%1 %2").arg(block).arg(ly*layout.lotsPerSide+lx+1);
+                    if (layout.detailed) {
+                        // Its own mesh at its real size and its own facade: the style's color, varied per building.
+                        auto mesh = detailedBuilding(width,depth,height,random.next());
+                        auto color = facades[style].second;
+                        for (int c = 0; c < 3; ++c)
+                            color[std::size_t(c)] = std::clamp(color[std::size_t(c)]*random.between(0.85f,1.12f),0.0f,1.0f);
+                        mesh.materials[0].name = "Trim";
+                        mesh.materials[0].color = {color[0]*0.7f,color[1]*0.7f,color[2]*0.7f,1};
+                        mesh.materials[1].name = "Facade";
+                        mesh.materials[1].color = {1,1,1,1};
+                        mesh.materials[1].roughness = style == 3 ? 0.25f : 0.7f;
+                        mesh.materials[1].baseColorTexture = facadeTexture(int(style),color,128);
+                        MeshAsset created{id(),tr("Building %1").arg(name),{},{},false,QSharedPointer<wf::Mesh>::create(std::move(mesh)),{}};
+                        SceneObject object;
+                        object.id = id();
+                        object.name = tr("Building %1").arg(name);
+                        object.type = "Static Mesh";
+                        object.group = tr("Buildings");
+                        object.position = lotCenter+QVector3D(0,0,0.2f+height/2);
+                        object.scale = {1,1,1};
+                        object.meshAsset = created.id;
+                        project.assets.insert(created.id,std::move(created));
+                        project.objects.append(object);
+                        continue;
+                    }
                     add(tr("Building %1").arg(name),"Static Mesh",facade,tr("Buildings"),
                         lotCenter+QVector3D(0,0,0.2f+height/2),{width,depth,height});
                     add(tr("Roof %1").arg(name),"Static Mesh",tr("Roof"),tr("Buildings"),

@@ -2911,7 +2911,7 @@ void districtWorkflow(const QDir &output,Audit &audit,const DistrictAuditOptions
     if (large)
         layout.blocks = 12;
     if (!store.createStarterProject("City District",{{"location",directory.filePath("City District")},{"starter","district"},
-            {"districtBlocks",layout.blocks},{"districtTexturedFacades",textured}},error)) {
+            {"districtBlocks",layout.blocks},{"districtTexturedFacades",textured},{"districtDetailed",streamCells}},error)) {
         audit.check(page,"workflow","Create the City District starter",false,error);
         return;
     }
@@ -2920,7 +2920,7 @@ void districtWorkflow(const QDir &output,Audit &audit,const DistrictAuditOptions
     const auto expectedBuildings = layout.blocks*layout.blocks*layout.lotsPerSide*layout.lotsPerSide;
     const auto lamps = (layout.blocks+1)*(layout.blocks+1);
     audit.check(page,"workflow","The City District starter lays out blocks, buildings and street lamps",
-                count("Point Light") == lamps && count("Static Mesh") == 1+layout.blocks*layout.blocks+2*expectedBuildings+lamps,
+                count("Point Light") == lamps && count("Static Mesh") == 1+layout.blocks*layout.blocks+(streamCells ? 1 : 2)*expectedBuildings+lamps,
                 QString("%1 meshes, %2 lamps for %3 x %3 blocks").arg(count("Static Mesh")).arg(count("Point Light"))
                     .arg(layout.blocks));
     std::stringstream playable;
@@ -2945,11 +2945,13 @@ void districtWorkflow(const QDir &output,Audit &audit,const DistrictAuditOptions
                 }
             }
         }
-        const bool sized = std::ranges::all_of(textures,[](const auto &png) {
-            return QImage::fromData(png.data(),int(png.size()),"PNG").size() == QSize(512,512);
+        const bool sized = std::ranges::all_of(textures,[streamCells = streamCells](const auto &png) {
+            return QImage::fromData(png.data(),int(png.size()),"PNG").size() == (streamCells ? QSize(128,128) : QSize(512,512));
         });
-        audit.check(page,"textures","Every district building exports a facade from the five 512-pixel materials",
-                    textures.size() == 5 && texturedMeshes == expectedBuildings && sized,
+        audit.check(page,"textures",streamCells ? "Every detailed district building exports its own 128-pixel facade"
+                        : "Every district building exports a facade from the five 512-pixel materials",
+                    textures.size() == (streamCells ? std::size_t(expectedBuildings) : 5u) && texturedMeshes == expectedBuildings
+                        && sized,
                     QString("%1 unique textures, %2 textured meshes, %3 MiB playable")
                         .arg(textures.size()).arg(texturedMeshes).arg(double(bytes.size())/1048576,0,'f',2));
     }
