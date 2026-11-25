@@ -83,7 +83,7 @@ Read the playbook's section 10.0.3 for the next 10 hours (pending items listed t
 - The street is about 13 ms p95; with all R3 lighting about 13.9 ms. With height fog and a 9 m local mist it is 15.95 ms (16.4 last night).
 - The 6 × 6 district is 13.6–14.2 ms p95; the textured 12 × 12 district is 17–18 ms p95 fully resident in this session, 18.9 ms streaming cells.
 
-**Checks:** realism 95.2 with probe GI (FLIP 0.0480), rendering 62/62, aerial perspective 8/8, ctest 9/9, the full audit 1374–1375 PASS.
+**Checks:** realism 95.4 with probe GI (FLIP 0.0463, after reflection-direction sky occlusion on 2026-11-26), rendering 62/62, aerial perspective 8/8, ctest 9/9, the full audit 1374–1375 PASS.
 
 **Night:** probe GI now has a coarse 6 m grid and the sky term above the horizon where probes reach, which closed the night walls' bounce-light gap; probe GI is on in the realism views.
 

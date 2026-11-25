@@ -265,7 +265,7 @@ Use the Playable Street for fixed clear-day, low-sun, twilight, and lamp-lit nig
 
     | Check | Result |
     | --- | --- |
-    | Cycles (LDR-FLIP, 256 samples) | shop front 0.0386, street corner 0.0577, aerial 0.0250, night 0.0708; realism score 95.2 |
+    | Cycles (LDR-FLIP, 256 samples) | shop front 0.0388, street corner 0.0563, aerial 0.0249, night 0.0652; realism score 95.4 (reflection-direction sky occlusion, 2026-11-26) |
     | Editor and Player | street views 0.09 levels; fog 0.06; lamp falloff 0.05; reflections 0.32; contact shadows 0.22; TAA off 0.20 |
     | Street mission | p95 9.5–9.6 ms, p99 11 ms, worst 19–38 ms, peak working set 166 MiB |
     | Street with R3 lighting / with fog and mist | p95 15.0 / 16.1 ms, worst 263 / 70 ms (single frames) |

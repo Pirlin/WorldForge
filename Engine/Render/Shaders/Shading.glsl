@@ -218,10 +218,14 @@ vec4 reflectionFromProbes(vec3 position,vec3 normal,vec3 reflection,float roughn
 // The share of sky light that reaches position on a surface facing normal: each sky direction counts by its
 // brightness times the cosine to the normal (plus a little, so surfaces facing down still see the sky around
 // them), and only when its depth map shows nothing between the point and the sky. 1 when the maps are off.
-float skyOpenness(vec3 position,vec3 normal)
+// y: the same share for the sky reflected in direction r, each direction weighted by a lobe around r as wide as the
+// roughness makes the reflection. A low sun's glow fills the reflection on a street seen toward the sun, and inside a
+// building's shadow the building hides exactly that part of the sky, which the share of the whole sky (x) barely
+// shows. The same depth lookups serve both.
+vec2 skyOpenness(vec3 position,vec3 normal,vec3 r,float roughness)
 {
     if (lighting.skySettings.x < 0.5)
-        return 1.0;
+        return vec2(1.0);
     float texel = lighting.skySettings.y;
     float texels = float(textureSize(skyVisibilityMap,0).x)*0.25;
     // Off the surface by about two texels; the lookup moves within a texel each TAA frame, which smooths the
@@ -230,7 +234,11 @@ float skyOpenness(vec3 position,vec3 normal)
     vec2 pixel = gl_FragCoord.xy+5.588238*lighting.settings.z;
     float noise = fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
     vec2 jitter = (vec2(noise,fract(noise*7.31+0.37))-0.5)/texels;
-    float open = 0.0, total = 0.0;
+    float open = 0.0, total = 0.0, openReflected = 0.0, totalReflected = 0.0;
+    // A spherical Gaussian as wide as the GGX lobe (sharpness 2 / alpha^2, alpha = roughness^2), no sharper than the
+    // spacing of the 16 directions resolves.
+    float alpha = max(roughness*roughness,0.05);
+    float sharpness = clamp(2.0/(alpha*alpha),2.0,6.0);
     // With TAA each pixel tests every other direction, alternating in a checkerboard that
     // flips each frame, and the resolve averages the halves: each half of the spiral covers the whole sky. Without
     // TAA every direction is tested.
@@ -240,6 +248,8 @@ float skyOpenness(vec3 position,vec3 normal)
         vec3 direction = lighting.skyDirections[i].xyz;
         // w: the sky's luminance in that direction, the same for every pixel, so the renderer computes it once.
         float weight = lighting.skyDirections[i].w*(max(dot(normal,direction),0.0)+0.05);
+        float lobe = dot(normal,direction) > 0.0
+            ? lighting.skyDirections[i].w*exp(sharpness*(dot(r,direction)-1.0)) : 0.0;
         vec3 c = (lighting.skyMatrices[i]*vec4(lifted,1.0)).xyz;
         vec2 uv = c.xy*0.5+0.5+jitter;
         float visible = 1.0;
@@ -250,8 +260,13 @@ float skyOpenness(vec3 position,vec3 normal)
         }
         open += weight*visible;
         total += weight;
+        openReflected += lobe*visible;
+        totalReflected += lobe;
     }
-    return total > 0.0 ? open/total : 1.0;
+    float diffuseShare = total > 0.0 ? open/total : 1.0;
+    // A reflection pointing below the lowest directions (or under the surface) has no lobe here: it keeps the share
+    // of the whole sky.
+    return vec2(diffuseShare,totalReflected > 1e-4*total ? openReflected/totalReflected : diffuseShare);
 }
 
 // The sky reflected in direction r by a surface of the given roughness: the radiance map for a mirror, then its
@@ -797,8 +812,10 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,vec3 shadowBiasNormal,o
     // Occlusion: diffuse sky light keeps the share of the sky the point sees (the material's own occlusion times the
     // large-scale openness). Reflections come from a narrower cone, so they lose more of it, the more for glossy
     // surfaces seen head-on (specular occlusion, Lagarde and de Rousiers 2014).
-    float ambient = surface.occlusion*skyOpenness(position,surface.normal);
-    float specularOcclusion = reflectionOcclusion(nv,ambient,skyRoughness);
+    // The reflection's own share of open sky (skyOpenness y) stands in for the whole sky's in specular occlusion.
+    vec2 openness = skyOpenness(position,surface.normal,r,skyRoughness);
+    float ambient = surface.occlusion*openness.x;
+    float specularOcclusion = reflectionOcclusion(nv,surface.occlusion*openness.y,skyRoughness);
     // Where a screen-space reflection finds a surface, it replaces the sky reflection. It already shows what blocks the
     // sky, so it skips specular occlusion, and it stays out of indirect, which ambient occlusion would darken again.
     vec4 traced = vec4(0.0);
@@ -809,7 +826,10 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,vec3 shadowBiasNormal,o
     }
     vec4 probeReflection = reflectionFromProbes(position,surface.normal,r,skyRoughness);
     reflected = reflected*(1.0-probeReflection.a)+probeReflection.rgb;
-    indirect = diffuse*ambient+reflected*specularColor*specularOcclusion*(1.0-traced.a);
+    // What hides the sky from the reflection is a surface, not black: about as bright as ground of albedo 0.25 under
+    // the sky this point sees.
+    vec3 occluder = irradiance*(0.25*ambient);
+    indirect = diffuse*ambient+mix(occluder,reflected,specularOcclusion)*specularColor*(1.0-traced.a);
     if (sheenResponse > 0.0)
         indirect += skyReflection(r,max(0.65,surface.sheen.w))*surface.sheen.rgb*(sheenResponse*ambient*throughCoat);
     vec3 screenLight = traced.rgb*specularColor*traced.a;
