@@ -376,6 +376,21 @@ In order. The same rules as section 10.0: each block ends with its checks passin
 5. **Cloud transitions (realism pass item 4, about 1 h).** The 2D cloud layer exists and the overcast view matches across renderers. Add the transition check at street and rooftop height. This needs the Player to render at given play times.
    **Done 2026-11-25:** `WORLDFORGE_CAPTURE_SECONDS` sets the Player's play time for `--capture`. The rendering audit renders a clear-to-overcast transition at five moments at street and rooftop height: one-way, smooth, and halfway equal to the editor holding the halfway coverage (0.25–0.30 levels).
 6. **R4.6 world partitions** (start only with the above done). The district is 52 k vertices and fits easily, so partitions need two things first: cell streaming from disk (playable format 30 with per-cell chunks) and content dense enough to show a gain. Write the design into section 10.3 before coding.
+   **Progress 2026-11-25:** designed (section 10.3) and built for the Player: format 30 cells with proxies, `readPlayableIndex` / `readPlayableCell`, residency with worker-thread loads and batched layout rebuilds (`WORLDFORGE_CELL_STREAMING=1`), and `--district-cells` (three laps; 4/4 partition checks). Lessons: rebuilding the mesh layout for every finished cell cost 5 ms of CPU at p95 (batch the changes, 30 frames); hashing each mesh's facade PNG to find its texture on every rebuild was the largest part (materials now move with their meshes); a box proxy costs more than a box building (small meshes are their own proxy). Capping cell joins at four per rebuild made it worse (cells waited up to 12 s, memory grew) and did not remove the CPU spikes (31–35 ms worst), so their cause is still open. The frame-time check passed in one run (p95 18.9 against 17.6 ms) and missed in two (by 0.3 ms with a 78 ms frame; 55 ms worst), so treat it as unsettled. The Player's GPU timing now has a `fogVolume` pass: 0.46 ms on the misty street, so the mist's extra 1.5 ms is in the scene shader's reads. See the roadmap's R4 entry for what is still open.
+
+### 10.0.2 The next 8 hours (planned 2026-11-25)
+
+Same rules: each block ends with its checks passing and a pushed commit.
+
+1. **Mist cost (about 1 h).** The street with fog and mist is 15.95 ms p95; its scene pass is 10.5 ms against 9.0 ms for the ring-prone column version. The fog-volume dispatch now has its own GPU timestamp (0.46 ms), so the 1.5 ms is in the mist's five reads per pixel; cut it (for example: one read per two segments, or lamps only in froxels the mist reaches). Keep `lamp-mist.png` and `fog-sunset.png` matching. Target: 14.5 ms p95.
+2. **Night bounce light (about 2 h).** The night walls miss bounce light (Cycles with no diffuse bounces shows the same gap). Grow the probe field: a second, coarser grid (8 m spacing, about 50 m across) blended beyond the 2 m grid, both traced with `HitLighting`. Turn probe GI on in the realism views (the `WORLDFORGE_REALISM_PROBE_GI` switch does it for experiments) only if all four views improve or hold. Target: night FLIP under 0.065 and walls within 3 levels of Cycles.
+3. **R4.6 follow-ups (about 2 h).**
+   - Sun-shadow cost while streaming (1.6 against 0.7 ms): give each proxy its own draw range, or keep proxies out of the finer cascades.
+   - Denser content: a district option with per-building detail (window insets, ledges, rooftop units) and a unique facade texture per building, so partitions have memory to save. Then record full residency against streaming on it.
+   - Accept per section 10.3 item 5, then tick R4.6 for the Player; the editor's streaming and impostors stay open.
+4. **R4.7 combined check (about 1 h).** Run district, street and realism together on the GTX 1650 and record sustained frame times, worst frames and memory in the roadmap.
+5. **R4.4 cluster LOD design (about 1 h).** Write the design for a meshlet LOD hierarchy (cluster groups simplified per level, selected by projected error) into section 10.3 before coding.
+6. **Realism review (about 1 h).** The realism pass's last item: record stills and moving shots on the GTX 1650 (settings, reference comparisons, editor/Player differences, frame-time percentiles, worst frames, peak memory) in the roadmap.
 
 ### 10.1 Immediately
 

@@ -43,7 +43,7 @@ Put Qt on PATH first (`%LOCALAPPDATA%/WorldForge/Qt/6.8.3/msvc2022_64/bin`), the
 - Timings depend on the Windows power plan. Before blaming a change, measure the previous commit in the same session.
 
 ## Frame architecture (`Engine/Render/Vulkan/HdrFrame.*`, shared by the editor and the Player)
-0. **Fog volume** (`FogVolume.comp`, `Vulkan/FogVolume.*`). After the shadow maps, a compute pass sums the shadowed share of height fog and local mist and the mist's lamp light along each of 160 × 90 froxel columns (64 log-spaced slices to `probeSettings.w` meters). The scene and sky shaders read it at set 0 binding 12.
+0. **Fog volume** (`FogVolume.comp`, `Vulkan/FogVolume.*`). After the shadow maps, a compute pass walks each of 160 × 90 froxel columns (64 log-spaced slices to `probeSettings.w` meters). It stores the height fog's shadowed share per unit of opacity (a pixel reads one texel and multiplies by its own opacity) and, near the local mist, each froxel's sun visibility and lamp light (read at each step of the mist's march). The scene and sky shaders read it at set 0 binding 12.
 1. **Scene pass.** Writes four color targets (scene; indirect sky light with the depth along the camera's forward axis in alpha; albedo plus fog transmission; each surface's own motion, from previous vertex positions as a second vertex stream, see `SceneMotion.glsl`) and depth. Shading is in `Shaders/Shading.glsl` and `Lighting.glsl`. Screen-space reflections and contact shadows trace the previous frame's TAA result here (binding 8, `HdrFrame::previousFrame`), which the renderers rebind every frame. The editor restarts the TAA average one frame after a camera move or edit, so averaged frames never trace another view.
 2. **Occlusion pass.** GTAO plus screen-space bounce light (`Ambient.frag`).
 3. **Bloom.** Built from the previous frame's history (`BloomDown`/`BloomUp.frag`).
@@ -68,7 +68,22 @@ Settings flow through these files:
 - Player format, now v21 for clear coat: `Engine/World/PlayableScene.*`
 - Player `View`: `Player/PlayerRender.h`, which must stay a multiple of 16 bytes for D3D11
 
-## Status (2026-11-25)
+## Status (2026-11-25, day)
+Read the playbook's section 10.0.2 for what comes next.
+
+**What changed today:**
+- **Fog volume** (`FogVolume.comp`, `Engine/Render/Vulkan/FogVolume.*`): height fog's sun shadows come from a 160 × 90 × 64 froxel volume filled after the shadow maps, read once per pixel. Height fog now costs about 0.14 ms of the street's scene pass. The local mist reads the volume's point values at each step of its march.
+- **Probe hit lighting:** probe rays light the surfaces they hit with the sky and the nearest 32 lamps (`ProbeGeometry.h` `HitLighting`). The night view's wall gap is bounce light (Cycles with no diffuse bounces shows it), but the probe grid is too small to reach those walls yet.
+- **New checks:** `--aerial-perspective`; in `--rendering`, lamp falloff and shadow, auto exposure walking into a lit room, cloud transitions at five play times (`WORLDFORGE_CAPTURE_SECONDS`), and golden images `fog-sunset.png` and `lamp-mist.png`. The rendering ctest timeout is now 300 s.
+- **World partitions (R4.6, Player side):** playable format 30 groups static meshes into 64 m cells (`readPlayableIndex`, `readPlayableCell`); the Player streams them with `WORLDFORGE_CELL_STREAMING=1`; `--district-cells` checks three laps.
+
+**Frame times** (GTX 1650, Windows "Power saver"):
+- The street is about 13 ms p95; with all R3 lighting about 13.9 ms. With height fog and a 9 m local mist it is 15.95 ms (16.4 last night).
+- The 6 × 6 district is 13.6–14.2 ms p95; the textured 12 × 12 district is 17–18 ms p95 fully resident in this session, 18.9 ms streaming cells.
+
+**Checks:** realism 95.0 (FLIP 0.0497), rendering 62/62, aerial perspective 8/8, ctest 9/9, the full audit 1375 PASS.
+
+## Status (2026-11-25, morning)
 **Frame times** (GTX 1650 laptop, Windows "Power saver"):
 - The street runs at 11.4–11.7 ms average and 12.5–13.0 ms p95.
 - With all R3 lighting it is 14.0 ms p95; with height fog and a 9 m local mist as well, 16.3 ms.

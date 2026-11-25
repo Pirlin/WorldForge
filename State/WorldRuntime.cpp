@@ -681,6 +681,13 @@ bool WorldRuntime::exportScene(const ProjectStore &store,std::ostream &output,QS
         scene.lights.insert(scene.lights.begin(),{point(sunDirection(atmosphere)),1,true});
     if (scene.foliage.size() > 256 || scene.lights.size() > 256 || scene.simulation.joints.size() > 256)
         return false;
+    // City-sized scenes are written in 64 m cells (playable format 30), so the Player can keep only the cells around the
+    // camera loaded. Small scenes keep the plain layout.
+    const auto staticMeshes = std::ranges::count_if(scene.meshes,[](const worldforge::PlayMesh &mesh) {
+        return mesh.body < 0 && !mesh.clip;
+    });
+    if (staticMeshes >= cellularMeshes)
+        scene.partitions.cellSize = 64;
     return worldforge::writePlayable(output,scene);
 }
 

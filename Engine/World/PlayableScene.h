@@ -7,7 +7,11 @@
 #include "Engine/Render/ColorPipeline.h"
 #include "Engine/Render/Weather.h"
 
+#include <array>
+#include <cstdint>
 #include <iosfwd>
+#include <optional>
+#include <vector>
 
 namespace worldforge {
 
@@ -47,8 +51,31 @@ struct PlayLight {
     Point3 color{1,1,1}; // scene-linear lamp tint, format 29
 };
 
+// A world partition cell (format 30): static meshes (no body, no clip) whose bounds center falls in one square of the
+// ground grid, stored as one block of the file's mesh section so a reader can load the cell on its own.
+struct PlayCell {
+    std::array<int,2> grid{};                 // floor(center / cellSize) along x and y
+    Point3 minimum{}, maximum{};              // bounds of its meshes
+    std::size_t firstMesh = 0, meshCount = 0; // its meshes in PlayableScene::meshes as readPlayable returns them
+    std::uint64_t offset = 0, bytes = 0;      // its block within the mesh section
+    // Kept loaded and drawn while the cell itself is not: each mesh no larger than a box as itself (vertex colors, no
+    // textures), any larger one as its bounding box in its mean color.
+    std::vector<PlayVertex> proxy;
+};
+
+struct PlayPartitions {
+    // Positive: writePlayable groups static meshes into cells this many meters wide (format 30). Zero: no cells.
+    float cellSize = 0;
+    // Filled by the readers: the cells, how many meshes come before them (bodies, clips and anything else global), and
+    // the byte offset of the mesh section in the stream, for readPlayableCell.
+    std::vector<PlayCell> cells;
+    std::size_t globalMeshes = 0;
+    std::uint64_t section = 0;
+};
+
 struct PlayableScene {
     WorldSimulation simulation;
+    PlayPartitions partitions;
     std::vector<PlayMesh> meshes;
     struct Foliage { int density; unsigned seed; float wind = 0.09f; };
     std::vector<Foliage> foliage;
@@ -98,6 +125,11 @@ std::vector<PlayVertex> makePlayVertices(const Mesh &mesh, const Heightfield *te
                                          std::vector<VertexIndex> *vertices = nullptr);
 bool writePlayable(std::ostream &output, const PlayableScene &scene);
 std::optional<PlayableScene> readPlayable(std::istream &input);
+// Format 30 with cells: everything but the cells' meshes (meshes holds the global ones only), with the cell table in
+// partitions. Earlier formats and scenes without cells read in full, as readPlayable does.
+std::optional<PlayableScene> readPlayableIndex(std::istream &input);
+// One cell's meshes, from a stream holding the same file that readPlayableIndex read.
+std::optional<std::vector<PlayMesh>> readPlayableCell(std::istream &input,const PlayableScene &index,std::size_t cell);
 void drivePlayer(BoxBody &body, Point3 spawn, float yaw, int forward, int sideways, bool jump, int &jumpBuffer);
 
 }

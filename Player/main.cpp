@@ -27,6 +27,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <deque>
+#include <future>
 #include <memory>
 #include <numeric>
 #include <sstream>
@@ -532,14 +534,25 @@ public:
     int uploadTextures(Renderer &renderer,std::vector<Image> *decoded = nullptr)
     {
         int failed = 0;
+        renderer_ = &renderer;
         fixedMeshLayout_ = std::ranges::none_of(playable_.meshes,[](const wf::PlayMesh &mesh) { return !mesh.lodVertices.empty(); });
         meshOffsets_.clear();
         materials_.clear();
         textured_ = 0;
         surfaceMaps_ = 0;
-        // Playable files embed maps in each material. Reuse the decoded GPU texture for identical bytes.
-        std::unordered_map<std::string_view,int> uploaded;
-        for (const auto &mesh : playable_.meshes) {
+        // Playable files embed maps in each material. Reuse the decoded GPU texture for identical bytes, also across calls:
+        // streamed cells come and go, and their textures stay uploaded.
+        auto &uploaded = textureCache_;
+        for (std::size_t index = 0; index < playable_.meshes.size(); ++index) {
+            const auto &mesh = playable_.meshes[index];
+            // A mesh that was already drawn keeps its material (rebuildMeshes): finding a texture hashes its bytes.
+            if (index < knownMaterials_.size() && knownMaterials_[index]) {
+                const auto &known = *knownMaterials_[index];
+                textured_ += known.textures[0] >= 0;
+                surfaceMaps_ += int(std::ranges::count_if(std::span(known.textures).subspan(1),[](int t) { return t >= 0; }));
+                materials_.push_back(known);
+                continue;
+            }
             MaterialDraw material;
             material.advanced = mesh.advancedSurface;
             material.metallic = mesh.metallic;
@@ -554,15 +567,18 @@ public:
                 if (bytes.empty())
                     continue;
                 const std::string_view source(reinterpret_cast<const char *>(bytes.data()),bytes.size());
-                const auto [entry,newTexture] = uploaded.try_emplace(source,-1);
-                if (newTexture) {
+                auto entry = uploaded.find(source);
+                if (entry == uploaded.end()) {
                     auto image = decodeImage(bytes);
-                    entry->second = renderer.addTexture(image);
-                    if (decoded && entry->second >= 0) {
-                        const auto index = std::size_t(entry->second);
+                    const int texture = renderer.addTexture(image);
+                    if (decoded && texture >= 0) {
+                        const auto index = std::size_t(texture);
                         decoded->resize(std::max(decoded->size(),index+1));
                         (*decoded)[index] = std::move(image);
                     }
+                    // The key views a copy the scene owns: a streamed cell frees its own bytes when it unloads.
+                    textureOwners_.emplace_back(source);
+                    entry = uploaded.emplace(std::string_view(textureOwners_.back()),texture).first;
                 }
                 material.textures[i] = entry->second;
                 failed += material.textures[i] < 0;
@@ -571,7 +587,146 @@ public:
             textured_ += material.textures[0] >= 0;
             materials_.push_back(material);
         }
+        knownMaterials_.clear();
         return failed;
+    }
+
+    // World partition streaming (playable format 30, read with readPlayableIndex; WORLDFORGE_CELL_STREAMING=1). Only the
+    // cells within fullRadius meters of the camera keep their meshes loaded, read from file on worker threads; every
+    // other cell draws its box proxies. Cells unload past fullRadius + hysteresis, so a camera moving back and forth
+    // across a boundary does not reload them each time.
+    static constexpr float fullRadius = 160, hysteresis = 32;
+    struct Streaming {
+        std::size_t cells = 0, resident = 0, loads = 0, unloads = 0, failed = 0;
+        double longestLoadMs = 0;
+    };
+    void prepareStreaming(std::filesystem::path file)
+    {
+        const auto &partitions = playable_.partitions;
+        cellFile_ = std::move(file);
+        cellIndex_.partitions = partitions;
+        cellIndex_.simulation.bodies.resize(playable_.simulation.bodies.size());
+        globals_ = std::move(playable_.meshes);
+        playable_.meshes.clear();
+        cellMeshes_.assign(partitions.cells.size(),{});
+        resident_.assign(partitions.cells.size(),false);
+        inLayout_.assign(partitions.cells.size(),false);
+        loads_.clear();
+        loads_.resize(partitions.cells.size());
+        requested_.assign(partitions.cells.size(),{});
+        streaming_.cells = partitions.cells.size();
+        rebuildMeshes();
+    }
+    bool streams() const { return !cellFile_.empty(); }
+    const Streaming &streaming() const { return streaming_; }
+    // Loads and unloads cells around eye. At most one finished load joins the scene per call.
+    void updateResidency(FXMVECTOR eye)
+    {
+        if (cellFile_.empty())
+            return;
+        const float x = XMVectorGetX(eye), y = XMVectorGetY(eye);
+        const auto &cells = cellIndex_.partitions.cells;
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+            const auto &cell = cells[i];
+            const float dx = std::max({cell.minimum[0]-x,0.0f,x-cell.maximum[0]});
+            const float dy = std::max({cell.minimum[1]-y,0.0f,y-cell.maximum[1]});
+            const float distance = std::hypot(dx,dy);
+            if (resident_[i] && distance > fullRadius+hysteresis) {
+                resident_[i] = false; // its meshes leave the layout at the next rebuild
+                ++streaming_.unloads;
+                pendingChange_ = true;
+            } else if (!resident_[i] && distance < fullRadius && !loads_[i].valid()) {
+                if (inLayout_[i]) {
+                    resident_[i] = true; // back before its unload took effect
+                    --streaming_.unloads;
+                    continue;
+                }
+                requested_[i] = std::chrono::steady_clock::now();
+                loads_[i] = std::async(std::launch::async,[this,i] {
+                    std::ifstream in(cellFile_,std::ios::binary);
+                    return wf::readPlayableCell(in,cellIndex_,i);
+                });
+            }
+        }
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+            if (!loads_[i].valid() || loads_[i].wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                continue;
+            auto meshes = loads_[i].get();
+            if (!meshes) {
+                ++streaming_.failed;
+                continue;
+            }
+            cellMeshes_[i] = std::move(*meshes);
+            resident_[i] = true;
+            ++streaming_.loads;
+            streaming_.longestLoadMs = std::max(streaming_.longestLoadMs,
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-requested_[i]).count());
+            pendingChange_ = true;
+        }
+        // Rebuilding the layout costs a full vertex upload, so changes gather for rebuildFrames frames and apply at once.
+        if (++framesSinceRebuild_ >= rebuildFrames && pendingChange_) {
+            rebuildMeshes();
+            if (renderer_)
+                uploadTextures(*renderer_);
+        }
+    }
+    // playable_.meshes holds the resident cells' meshes, the proxies of the other cells, then the global meshes. The
+    // meshes move back to their owners first (a cell that unloaded drops its own), so only the small proxies are copied.
+    void rebuildMeshes()
+    {
+        // Materials (uploadTextures) travel with their meshes, so only newly loaded meshes look up their textures.
+        const bool drawn = materials_.size() == playable_.meshes.size();
+        cellMaterials_.resize(cellMeshes_.size());
+        for (std::size_t i = 0; i < playable_.meshes.size() && i < meshOrigins_.size(); ++i) {
+            const int origin = meshOrigins_[i];
+            const auto material = drawn ? std::optional<MaterialDraw>(materials_[i]) : std::nullopt;
+            if (origin == -1) {
+                globals_.push_back(std::move(playable_.meshes[i]));
+                globalMaterials_.push_back(material);
+            } else if (origin >= 0 && resident_[std::size_t(origin)]) {
+                cellMeshes_[std::size_t(origin)].push_back(std::move(playable_.meshes[i]));
+                cellMaterials_[std::size_t(origin)].push_back(material);
+            }
+        }
+        playable_.meshes.clear();
+        meshOrigins_.clear();
+        knownMaterials_.clear();
+        const auto &cells = cellIndex_.partitions.cells;
+        streaming_.resident = 0;
+        for (std::size_t cell = 0; cell < cells.size(); ++cell) {
+            if (resident_[cell]) {
+                ++streaming_.resident;
+                auto &known = cellMaterials_[cell];
+                known.resize(cellMeshes_[cell].size()); // a cell that just loaded has none yet
+                for (std::size_t i = 0; i < cellMeshes_[cell].size(); ++i) {
+                    playable_.meshes.push_back(std::move(cellMeshes_[cell][i]));
+                    meshOrigins_.push_back(int(cell));
+                    knownMaterials_.push_back(known[i]);
+                }
+                cellMeshes_[cell].clear();
+            } else {
+                cellMeshes_[cell] = {}; // loaded, then left behind before it joined the layout
+                if (!cells[cell].proxy.empty()) {
+                    playable_.meshes.push_back({-1,cells[cell].proxy});
+                    meshOrigins_.push_back(-2);
+                    knownMaterials_.push_back(std::nullopt);
+                }
+            }
+            cellMaterials_[cell].clear();
+            inLayout_[cell] = resident_[cell];
+        }
+        globalMaterials_.resize(globals_.size());
+        for (std::size_t i = 0; i < globals_.size(); ++i) {
+            playable_.meshes.push_back(std::move(globals_[i]));
+            meshOrigins_.push_back(-1);
+            knownMaterials_.push_back(globalMaterials_[i]);
+        }
+        globals_.clear();
+        globalMaterials_.clear();
+        // Every vertex buffer in the renderer's ring takes the whole new layout once.
+        fullUploads_ = 3;
+        pendingChange_ = false;
+        framesSinceRebuild_ = 0;
     }
 
     void tick(float yaw,int forward,int sideways,bool jump,bool interact)
@@ -645,6 +800,8 @@ public:
     // A camera at eye looking at target, as the editor's camera preview uses for comparisons.
     View viewFrom(FXMVECTOR eye,FXMVECTOR target,float aspect,float time)
     {
+        // Cells that load or unload here change the meshes from the next frame's vertices() on.
+        updateResidency(eye);
         View view{};
         const auto direction = XMVector3Normalize(XMVectorSubtract(eye,target));
         const auto up = std::abs(XMVectorGetZ(direction)) > 0.99995f ? XMVectorSet(0,1,0,0) : XMVectorSet(0,0,1,0);
@@ -706,7 +863,9 @@ public:
         }) ? 1u : 0u;
         view.screenSpaceGi = playable_.screenSpaceGi;
         view.reflectionProbes = playable_.reflectionProbes;
-        if (fixedMeshLayout_ && !meshOffsets_.empty()) {
+        if (fullUploads_ > 0) {
+            --fullUploads_; // a new cell layout: upload every vertex
+        } else if (fixedMeshLayout_ && !meshOffsets_.empty()) {
             view.cachedMeshVertices = meshOffsets_.back();
             view.movingVertices = &movingVertices_;
         }
@@ -882,6 +1041,29 @@ private:
     std::vector<MaterialDraw> materials_;
     int surfaceMaps_ = 0;
     double clipTime_ = 0;
+    // Texture uploads by encoded bytes, which textureOwners_ keeps (uploadTextures).
+    Renderer *renderer_ = nullptr;
+    std::deque<std::string> textureOwners_;
+    std::unordered_map<std::string_view,int> textureCache_;
+    // World partition streaming (prepareStreaming). The loads come last, so their futures finish before the file name
+    // and index they read are destroyed.
+    std::filesystem::path cellFile_;
+    wf::PlayableScene cellIndex_;
+    std::vector<wf::PlayMesh> globals_;
+    std::vector<std::vector<wf::PlayMesh>> cellMeshes_;
+    std::vector<char> resident_;
+    std::vector<int> meshOrigins_; // per mesh in playable_.meshes: its cell, -1 global, -2 a proxy
+    std::vector<std::vector<std::optional<MaterialDraw>>> cellMaterials_;
+    std::vector<std::optional<MaterialDraw>> globalMaterials_, knownMaterials_;
+    std::vector<std::chrono::steady_clock::time_point> requested_;
+    Streaming streaming_;
+    int fullUploads_ = 0;
+    // Residency changes wait for a rebuild (updateResidency): which cells the layout holds, and frames since it changed.
+    static constexpr int rebuildFrames = 30;
+    std::vector<char> inLayout_;
+    bool pendingChange_ = false;
+    int framesSinceRebuild_ = rebuildFrames;
+    std::vector<std::future<std::optional<std::vector<wf::PlayMesh>>>> loads_;
     bool clipMoved_ = false, clipLooped_ = false;
     int textured_ = 0;
     int jumpBuffer_ = 0;
@@ -978,7 +1160,7 @@ struct StreetRun {
             << "  \"frameMs\": {\"average\": " << average(frameMs) << ", \"p95\": " << percentile(frameMs,0.95)
             << ", \"p99\": " << percentile(frameMs,0.99) << ", \"max\": " << percentile(frameMs,1) << "},\n"
             << "  \"gpuMs\": {";
-        const char *passNames[RenderStats::passCount]{"sunShadows","skyMaps","pointShadows","scene","postProcess"};
+        const char *passNames[RenderStats::passCount]{"sunShadows","skyMaps","pointShadows","fogVolume","scene","postProcess"};
         for (std::size_t pass = 0; pass < gpuMs.size(); ++pass)
             out << (pass ? ", " : "") << '"' << passNames[pass] << "\": " << gpuMs[pass]/double(std::max<std::size_t>(frameMs.size(),1));
         out << "},\n"
@@ -1015,6 +1197,10 @@ struct DistrictRun {
     // GPU time per pass (RenderStats::gpuMs), summed over the street and rooftop halves of the route.
     std::array<double,RenderStats::passCount> streetGpu{}, rooftopGpu{};
     std::size_t streetFrames = 0, rooftopFrames = 0;
+    // Laps of the route (WORLDFORGE_DISTRICT_LAPS, default 1) and the working set at the end of each, which must not
+    // climb from lap to lap when cells stream in and out.
+    int laps = 1;
+    std::vector<double> lapWorkingSetMiB, lapPrivateMiB; // private: committed memory, which Windows does not trim
 
     // The camera at fraction t of the route, and where it looks.
     std::pair<XMVECTOR,XMVECTOR> camera(float t) const
@@ -1055,7 +1241,7 @@ struct DistrictRun {
         const auto percentile = StreetRun::percentile;
         const double frames = double(std::max<std::size_t>(frameMs.size(),1));
         const auto gpuJson = [](const std::array<double,RenderStats::passCount> &totals,std::size_t count) {
-            const char *names[RenderStats::passCount]{"sunShadows","skyMaps","pointShadows","scene","postProcess"};
+            const char *names[RenderStats::passCount]{"sunShadows","skyMaps","pointShadows","fogVolume","scene","postProcess"};
             std::ostringstream json;
             json << '{';
             for (std::size_t pass = 0; pass < totals.size(); ++pass)
@@ -1097,7 +1283,17 @@ struct DistrictRun {
             << gpuJson(rooftopGpu,rooftopFrames) << "},\n"
             << "  \"workingSetMiB\": " << double(memory.WorkingSetSize)/1048576
             << ",\n  \"peakWorkingSetMiB\": " << double(memory.PeakWorkingSetSize)/1048576
-            << ",\n  \"privateMiB\": " << double(memory.PrivateUsage)/1048576 << "\n}\n";
+            << ",\n  \"privateMiB\": " << double(memory.PrivateUsage)/1048576
+            << ",\n  \"laps\": " << laps << ", \"lapWorkingSetMiB\": [";
+        for (std::size_t i = 0; i < lapWorkingSetMiB.size(); ++i)
+            out << (i ? ", " : "") << lapWorkingSetMiB[i];
+        out << "], \"lapPrivateMiB\": [";
+        for (std::size_t i = 0; i < lapPrivateMiB.size(); ++i)
+            out << (i ? ", " : "") << lapPrivateMiB[i];
+        const auto &cells = scene.streaming();
+        out << "],\n  \"cellStreaming\": {\"enabled\": " << (scene.streams() ? "true" : "false") << ", \"cells\": " << cells.cells
+            << ", \"resident\": " << cells.resident << ", \"loads\": " << cells.loads << ", \"unloads\": " << cells.unloads
+            << ", \"failed\": " << cells.failed << ", \"longestLoadMs\": " << cells.longestLoadMs << "}\n}\n";
         return bool(out);
     }
 };
@@ -1147,6 +1343,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
     if (districtRun) {
         district.inset = float(std::clamp(_wtof(args[4]),0.0,1000.0));
         district.rooftop = float(std::clamp(_wtof(args[5]),2.0,2000.0));
+        wchar_t laps[8]{};
+        if (GetEnvironmentVariableW(L"WORLDFORGE_DISTRICT_LAPS",laps,8))
+            district.laps = std::clamp(_wtoi(laps),1,10);
     }
     LocalFree(args);
     if (argc < 2 || packagedStreet) {
@@ -1172,11 +1371,17 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
     };
     if (FAILED(CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED)))
         return fail(L"Could not start Windows imaging.");
-    std::ifstream input(file);
-    auto playable = wf::readPlayable(input);
+    // WORLDFORGE_CELL_STREAMING=1 reads a partitioned scene's index and streams its cells (Scene::prepareStreaming).
+    wchar_t streamCells[4]{};
+    const bool cellStreaming = GetEnvironmentVariableW(L"WORLDFORGE_CELL_STREAMING",streamCells,4) && streamCells[0] == L'1';
+    std::ifstream input(file,cellStreaming ? std::ios::binary : std::ios::in);
+    auto playable = cellStreaming ? wf::readPlayableIndex(input) : wf::readPlayable(input);
     if (!playable)
         return fail(L"The playable scene could not be read. Export it from WorldForge Editor.");
+    const bool partitioned = !playable->partitions.cells.empty();
     Scene scene(std::move(*playable));
+    if (cellStreaming && partitioned)
+        scene.prepareStreaming(file);
     if (districtRun) {
         // The route follows the bounds of the static geometry.
         district.minimum = {std::numeric_limits<float>::max(),std::numeric_limits<float>::max(),std::numeric_limits<float>::max()};
@@ -1409,7 +1614,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
         }
         const float aspect = float(client.right)/client.bottom;
         const float seconds = std::chrono::duration<float>(now-launched).count();
-        const float routeFraction = std::clamp(float(frames-DistrictRun::warmUpFrames)/float(DistrictRun::routeFrames),0.0f,1.0f);
+        // Each lap runs the whole route; the last frame holds its end.
+        const float routeProgress = std::max(0.0f,float(frames-DistrictRun::warmUpFrames)/float(DistrictRun::routeFrames));
+        const float routeFraction = routeProgress >= float(district.laps) ? 1.0f : routeProgress-std::floor(routeProgress);
         const auto &vertices = scene.vertices();
         auto view = districtRun
             ? scene.viewFrom(district.camera(routeFraction).first,district.camera(routeFraction).second,aspect,seconds)
@@ -1449,7 +1656,14 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
                     gpu[pass] += stats.gpuMs[pass];
                 ++(onStreet ? district.streetFrames : district.rooftopFrames);
             }
-            if (frames >= DistrictRun::warmUpFrames+DistrictRun::routeFrames)
+            if (frames > DistrictRun::warmUpFrames && (frames-DistrictRun::warmUpFrames)%DistrictRun::routeFrames == 0) {
+                PROCESS_MEMORY_COUNTERS_EX memory{};
+                memory.cb = sizeof(memory);
+                GetProcessMemoryInfo(GetCurrentProcess(),reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&memory),sizeof(memory));
+                district.lapWorkingSetMiB.push_back(double(memory.WorkingSetSize)/1048576);
+                district.lapPrivateMiB.push_back(double(memory.PrivateUsage)/1048576);
+            }
+            if (frames >= DistrictRun::warmUpFrames+district.laps*DistrictRun::routeFrames)
                 return district.write(reportFile,*renderer,scene) ? 0 : 3;
         }
         if (smoke && ++frames == 90) {

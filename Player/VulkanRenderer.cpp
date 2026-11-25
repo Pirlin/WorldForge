@@ -1602,6 +1602,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
     }
     pointShadowsRendered_ = clusters_.shadowed;
 
+    stamp(RenderStats::PointShadows);
     // The fog volume reads the shadow maps drawn above.
     if (fogVolumeNeeded_) {
         vk::FogVolume::View volumeView;
@@ -1612,7 +1613,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
     } else {
         fogVolume_.prepare(command);
     }
-    stamp(RenderStats::PointShadows);
+    stamp(RenderStats::FogVolume);
     const auto background = color::srgbToLinear({0.05f,0.06f,0.07f});
     target.begin(command,output,background.data());
     VkPipeline boundScene = scene_;

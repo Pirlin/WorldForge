@@ -1033,6 +1033,52 @@ int main(int argc,char *argv[])
             && loaded->foliage[0].seed == 42 && loaded->meshes[0].vertices.size() == 36
             && loaded->meshes[0].clearCoat == 0 && loaded->meshes[0].clearCoatRoughness == 0,
             "Standalone package restores terrain, foliage, rigid bodies and render geometry");
+    {
+        // Format 30: static meshes grouped into 64 m cells, which a reader can load one at a time.
+        PlayableScene city;
+        city.simulation.bodies.push_back({{0,0,2},{0.3f,0.3f,0.85f},{},0,true});
+        city.simulation.bodies[0].lockRotation = true; // a player body
+        const auto block = makePlayVertices(cube);
+        for (int i = 0; i < 6; ++i) {
+            auto moved = block;
+            for (auto &vertex : moved) {
+                vertex.position[0] += float(i)*40;
+                if (i == 0)
+                    vertex.color = {1,1,1}; // a white mesh: its mean color must not round past 1
+            }
+            city.meshes.push_back({-1,moved});
+        }
+        city.meshes.push_back({0,block}); // follows a body, so it stays global
+        city.gameplay.routes.push_back({{{0,0,0},{10,0,0}},5});
+        city.partitions.cellSize = 64;
+        std::stringstream file;
+        require(writePlayable(file,city) && file.str().starts_with("WORLDFORGE_PLAY 30\n"),"Cells select playable format 30");
+        std::stringstream fullCopy(file.str()), indexCopy(file.str());
+        const auto full = readPlayable(fullCopy);
+        const auto &cells = full ? full->partitions.cells : std::vector<PlayCell>{};
+
+        require(full && full->meshes.size() == 7 && full->partitions.globalMeshes == 1 && full->meshes[0].body == 0
+                && cells.size() == 4 && cells[0].meshCount == 2 && cells[2].meshCount == 1 && full->gameplay.routes.size() == 1,
+                "A full read of format 30 restores every mesh, global ones first, and four cells along x");
+        require(std::ranges::all_of(cells,[](const PlayCell &cell) { return !cell.proxy.empty() && cell.proxy.size() <= 36*cell.meshCount; })
+                && cells[1].minimum[0] > 60 && cells[1].maximum[0] < 130,
+                "Each cell carries its bounds and a proxy no larger than a box per mesh");
+        const auto index = readPlayableIndex(indexCopy);
+        require(index && index->meshes.size() == 1 && index->partitions.cells.size() == 4 && index->gameplay.routes.size() == 1,
+                "The index skips the cells' meshes and still reads what follows them");
+        bool matching = index.has_value();
+        for (std::size_t cell = 0; matching && cell < cells.size(); ++cell) {
+            const auto meshes = readPlayableCell(indexCopy,*index,cell);
+            matching = meshes && meshes->size() == cells[cell].meshCount;
+            for (std::size_t i = 0; matching && i < meshes->size(); ++i) {
+                const auto &expected = full->meshes[cells[cell].firstMesh+i].vertices;
+                const auto &actual = (*meshes)[i].vertices;
+                matching = actual.size() == expected.size() && std::ranges::equal(actual,expected,{},&PlayVertex::position,
+                    &PlayVertex::position);
+            }
+        }
+        require(matching,"Each cell reads on its own exactly as in the full read");
+    }
     playable.meshes[0].clearCoat = 0.75f;
     playable.meshes[0].clearCoatRoughness = 0.19f;
     std::stringstream coatedPackage;

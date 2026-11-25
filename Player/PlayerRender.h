@@ -116,9 +116,9 @@ struct RenderStats {
     std::uint32_t sceneDraws = 0, depthDraws = 0;
     std::uint64_t sceneTriangles = 0, depthTriangles = 0;
     // GPU time in milliseconds of a recent frame (a frame or two behind, when the GPU has finished it) for each pass:
-    // sun shadow cascades, sky visibility maps, point light shadows, the scene pass, and everything after it (ambient
+    // sun shadow cascades, sky visibility maps, point light shadows, the fog volume, the scene pass, and everything after it (ambient
     // occlusion, bloom, TAA, camera effects and the display step). All zero when the device cannot time.
-    enum Pass { SunShadows, SkyMaps, PointShadows, Scene, PostProcess, passCount };
+    enum Pass { SunShadows, SkyMaps, PointShadows, FogVolume, Scene, PostProcess, passCount };
     std::array<float,passCount> gpuMs{};
 };
 

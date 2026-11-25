@@ -2892,12 +2892,13 @@ void r3PerformanceWorkflow(const QDir &output,Audit &audit,bool profile = false)
 // (--verify-district). It records the baseline that culling, indirect drawing and streaming are measured against.
 struct DistrictAuditOptions {
     bool profile = false, large = false, textured = false, compareDirect = false, compareOcclusion = false, streamTextures = false;
+    bool streamCells = false; // R4.6: fly three laps with world partition cells streaming against full residency
     QString meshlets;
 };
 
 void districtWorkflow(const QDir &output,Audit &audit,const DistrictAuditOptions &options)
 {
-    const auto &[profile,large,textured,compareDirect,compareOcclusion,streamTextures,meshlets] = options;
+    const auto &[profile,large,textured,compareDirect,compareOcclusion,streamTextures,streamCells,meshlets] = options;
     const QString page = "City district";
     QTemporaryDir directory;
     QString error;
@@ -2952,7 +2953,8 @@ void districtWorkflow(const QDir &output,Audit &audit,const DistrictAuditOptions
                     QString("%1 unique textures, %2 textured meshes, %3 MiB playable")
                         .arg(textures.size()).arg(texturedMeshes).arg(double(bytes.size())/1048576,0,'f',2));
     }
-    const auto runDistrict = [&](const QString &name,const QString &path,bool direct = false,bool withOcclusion = false) {
+    const auto runDistrict = [&](const QString &name,const QString &path,bool direct = false,bool withOcclusion = false,
+                                 bool cells = false) {
         QProcess player;
         const auto reportPath = output.filePath(name+"-player.json");
         QFile::remove(reportPath);
@@ -2963,6 +2965,8 @@ void districtWorkflow(const QDir &output,Audit &audit,const DistrictAuditOptions
         environment.insert("WORLDFORGE_OCCLUSION",withOcclusion ? "1" : "0");
         environment.insert("WORLDFORGE_TEXTURE_STREAMING",streamTextures ? "1" : "0");
         environment.insert("WORLDFORGE_MESHLETS",meshlets);
+        environment.insert("WORLDFORGE_CELL_STREAMING",cells ? "1" : "0");
+        environment.insert("WORLDFORGE_DISTRICT_LAPS",cells ? "3" : "1");
         player.setProcessEnvironment(environment);
         player.start(QDir(QCoreApplication::applicationDirPath()).filePath("WorldForgePlayer.exe"),options);
         if (!player.waitForFinished(300000)) {
@@ -3030,6 +3034,45 @@ void districtWorkflow(const QDir &output,Audit &audit,const DistrictAuditOptions
     // The frame-time baseline that R4 improves on; it is recorded, not yet held to the street budget.
     audit.record(page,"performance","District frame-time baseline (budget: p95 under 16.7 ms)",
                  completed && stat("frameMs","p95") < 16.7 ? "PASS" : "INFO",summary);
+    if (streamCells && completed) {
+        // R4.6: the export is partitioned (format 30); fly three laps keeping only the cells within 160 m loaded.
+        QFile header(scene.fileName());
+        const bool partitioned = header.open(QIODevice::ReadOnly) && header.readLine().startsWith("WORLDFORGE_PLAY 30");
+        header.close();
+        audit.check(page,"partitions","The district exports in world partition cells (playable format 30)",partitioned,
+                    scene.fileName());
+        const auto streamed = runDistrict("district-cells-route",scene.fileName(),false,compareOcclusion,true);
+        const auto cells = streamed.value("cellStreaming").toObject();
+        // Committed (private) memory shows growth; the working set also moves when Windows trims pages.
+        const auto laps = streamed.value("lapPrivateMiB").toArray();
+        const auto lapSets = streamed.value("lapWorkingSetMiB").toArray();
+        const double lap2 = laps.size() >= 3 ? laps[1].toDouble() : 0, lap3 = laps.size() >= 3 ? laps[2].toDouble() : 0;
+        audit.check(page,"partitions","Cells stream in and out over three laps without failing",
+                    completedRoute(streamed) && cells.value("enabled").toBool() && cells.value("loads").toInt() > cells.value("cells").toInt()
+                        && cells.value("unloads").toInt() > 0 && cells.value("failed").toInt() == 0,
+                    QString("%1 cells, %2 loads, %3 unloads, %4 failed, longest load %5 ms, %6 resident at the end")
+                        .arg(cells.value("cells").toInt()).arg(cells.value("loads").toInt()).arg(cells.value("unloads").toInt())
+                        .arg(cells.value("failed").toInt()).arg(cells.value("longestLoadMs").toDouble(),0,'f',0)
+                        .arg(cells.value("resident").toInt()));
+        const auto listed = [](const QJsonArray &values) {
+            QStringList text;
+            for (const auto &value : values)
+                text << QString::number(value.toDouble(),'f',1);
+            return text.join(", ");
+        };
+        audit.check(page,"partitions","Memory holds steady from lap to lap while cells stream",
+                    lap2 > 0 && std::abs(lap3-lap2) <= 0.05*lap2,
+                    QString("Committed memory at the end of each lap: %1 MiB (working set %2 MiB); fully resident: %3 MiB "
+                            "committed, %4 MiB peak working set")
+                        .arg(listed(laps),listed(lapSets)).arg(report.value("privateMiB").toDouble(),0,'f',1)
+                        .arg(report.value("peakWorkingSetMiB").toDouble(),0,'f',1));
+        const double streamedP95 = streamed.value("frameMs").toObject().value("p95").toDouble();
+        const double streamedMax = streamed.value("frameMs").toObject().value("max").toDouble();
+        audit.check(page,"partitions","Streaming cells costs no frame time: p95 within 1.5 ms of full residency, no frame over 50 ms",
+                    completedRoute(streamed) && streamedP95 <= stat("frameMs","p95")+1.5 && streamedMax < 50,
+                    QString("Streamed p95 %1 ms, worst %2 ms; fully resident p95 %3 ms")
+                        .arg(streamedP95,0,'f',2).arg(streamedMax,0,'f',1).arg(stat("frameMs","p95"),0,'f',2));
+    }
     if (compareDirect && completed) {
         const auto direct = runDistrict("district-direct-route",scene.fileName(),true);
         const auto baseline = [&](const char *group) { return direct.value(group).toObject().value("p95").toDouble(); };
@@ -8192,7 +8235,8 @@ int main(int argc, char **argv)
     const bool districtMeshletsIndexed = app.arguments().size() == 4 && app.arguments().last() == "--district-meshlets-indexed";
     const bool districtCompare = app.arguments().size() == 4 && app.arguments().last() == "--district-compare";
     const bool districtOcclusion = app.arguments().size() == 4 && app.arguments().last() == "--district-occlusion";
-    const bool districtAudit = districtProfile || districtLarge || districtTextured || districtCompare || districtOcclusion || districtStreaming
+    const bool districtCells = app.arguments().size() == 4 && app.arguments().last() == "--district-cells";
+    const bool districtAudit = districtProfile || districtLarge || districtTextured || districtCompare || districtOcclusion || districtStreaming || districtCells
         || districtMeshlets || districtMeshletsIndexed
         || (app.arguments().size() == 4 && app.arguments().last() == "--district");
     const bool rendering = app.arguments().size() == 4 && app.arguments().last() == "--rendering";
@@ -8282,10 +8326,10 @@ int main(int argc, char **argv)
     if (districtAudit) {
         if (districtOcclusion)
             qputenv("WORLDFORGE_OCCLUSION","1");
-        const bool textured = districtTextured || districtStreaming;
+        const bool textured = districtTextured || districtStreaming || districtCells;
         const QString meshlets = districtMeshlets ? "1" : districtMeshletsIndexed ? "indexed" : "";
         districtWorkflow(output,audit,{.profile = districtProfile,.large = districtLarge || textured,.textured = textured,
-            .compareDirect = districtCompare,.compareOcclusion = districtOcclusion,.streamTextures = districtStreaming,.meshlets = meshlets});
+            .compareDirect = districtCompare,.compareOcclusion = districtOcclusion,.streamTextures = districtStreaming,.streamCells = districtCells,.meshlets = meshlets});
         controls.flush();
         return audit.failures ? 1 : 0;
     }

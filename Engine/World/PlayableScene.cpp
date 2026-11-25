@@ -6,6 +6,8 @@
 #include <istream>
 #include <limits>
 #include <locale>
+#include <map>
+#include <sstream>
 #include <ostream>
 #include <cstring>
 #include <string>
@@ -85,6 +87,252 @@ bool readText(std::istream &in,std::string &text)
 {
     return bool(in >> std::quoted(text)) && fitsText(text);
 }
+
+bool hasCoat(const PlayMesh &mesh) { return mesh.clearCoat != 0 || mesh.clearCoatRoughness != 0; }
+bool hasLayers(const PlayMesh &mesh) { return mesh.layers != MaterialLayers{}; }
+bool hasLayerMaps(const PlayMesh &mesh)
+{
+    return mesh.layers.coatNormalScale != 1
+        || std::ranges::any_of(std::span(mesh.surfaceMaps).last<LayerMapCount>(),[](const auto &map) { return !map.empty(); });
+}
+
+bool writeMeshEntry(std::ostream &out,const PlayMesh &mesh,int version,std::size_t &remainingClipSamples)
+{
+    if (mesh.baseColorTexture.size() > MeshMaterial::maxTextureBytes || !mesh.layers.valid()
+        || !(mesh.clearCoat >= 0 && mesh.clearCoat <= 1 && mesh.clearCoatRoughness >= 0 && mesh.clearCoatRoughness <= 1))
+        return false;
+    out << mesh.body << ' ' << mesh.vertices.size() << ' ' << mesh.lodVertices.size() << ' ' << mesh.lodDistance << ' ';
+    writeVector(out,mesh.lodOrigin);
+    out << mesh.baseColorTexture.size() << '\n';
+    if (!mesh.baseColorTexture.empty()) {
+        writeBase64(out,mesh.baseColorTexture);
+        out << '\n';
+    }
+    const bool advanced = mesh.advancedSurface || hasCoat(mesh) || hasLayers(mesh) || hasLayerMaps(mesh);
+    out << advanced << '\n';
+    if (advanced) {
+        out << mesh.metallic << ' ' << mesh.roughness << ' ';
+        writeVector(out,mesh.emissive);
+        if (version >= 21)
+            out << mesh.clearCoat << ' ' << mesh.clearCoatRoughness << ' ';
+        if (version >= 22) {
+            writeVector(out,mesh.layers.sheenColor);
+            out << mesh.layers.sheenRoughness << ' ';
+        }
+        if (version >= 23)
+            out << mesh.layers.transmission << ' ' << mesh.layers.ior << ' ';
+        if (version >= 24)
+            out << mesh.layers.subsurface << ' ' << mesh.layers.thickness << ' ' << mesh.layers.scatteringDistance
+                << ' ' << mesh.layers.anisotropy << ' ' << mesh.layers.anisotropyRotation << ' ';
+        if (version >= 25)
+            out << mesh.layers.coatNormalScale << ' ';
+        if (version >= 26) {
+            if (!(mesh.surfaceAlpha >= 0 && mesh.surfaceAlpha <= 1))
+                return false;
+            out << mesh.layers.wetness << ' ' << mesh.layers.puddles << ' ' << mesh.layers.heightScale << ' '
+                << mesh.layers.decal << ' ' << mesh.layers.decalOpacity << ' ' << mesh.surfaceAlpha << ' ';
+        }
+        out << '\n';
+        const auto mapCount = version >= 25 ? mesh.surfaceMaps.size() : baseMaterialTextureCount-1;
+        std::size_t textureBytes = mesh.baseColorTexture.size();
+        for (const auto &map : std::span(mesh.surfaceMaps).first(mapCount)) {
+            if (map.size() > MeshMaterial::maxTextureBytes
+                || (version >= 25 && map.size() > MeshMaterial::maxTextureBytes-textureBytes))
+                return false;
+            textureBytes += map.size();
+            out << map.size() << '\n';
+            if (!map.empty()) {
+                writeBase64(out,map);
+                out << '\n';
+            }
+        }
+    }
+    out << bool(mesh.clip) << '\n';
+    if (mesh.clip) {
+        const auto &clip = *mesh.clip;
+        if (!clip.valid(mesh.vertices.size()) || !mesh.lodVertices.empty() || clip.samples.size() > remainingClipSamples)
+            return false;
+        remainingClipSamples -= clip.samples.size();
+        out << std::quoted(clip.name) << ' ' << clip.framesPerSecond << ' ' << clip.frameCount() << '\n';
+        for (const auto &vertex : clip.samples) {
+            writeVector(out,vertex.position);
+            writeVector(out,vertex.normal);
+            out << '\n';
+        }
+    }
+    for (const auto *vertices : {&mesh.vertices,&mesh.lodVertices})
+        for (const auto &vertex : *vertices) {
+            writeVector(out,vertex.position);
+            writeVector(out,vertex.normal);
+            writeVector(out,vertex.color);
+            writeVector(out,vertex.uv);
+            out << '\n';
+        }
+    return bool(out);
+}
+
+bool readMeshEntry(std::istream &in,PlayMesh &mesh,int version,std::size_t bodies,std::size_t &remaining,
+                   std::size_t &remainingClipSamples)
+{
+    std::size_t count;
+    if (!(in >> mesh.body >> count) || mesh.body < -1 || mesh.body >= int(bodies) || count > remaining || count%3)
+        return false;
+    remaining -= count;
+    std::size_t lodCount = 0;
+    if (version >= 4) {
+        if (!(in >> lodCount) || lodCount > remaining || lodCount%3 || (lodCount && lodCount >= count)
+            || !readValue(in,mesh.lodDistance,0,1000000) || (lodCount && mesh.lodDistance <= 0)
+            || !readVector(in,mesh.lodOrigin))
+            return false;
+        remaining -= lodCount;
+    }
+    if (version >= 5) {
+        std::size_t textureBytes;
+        if (!(in >> textureBytes) || textureBytes > MeshMaterial::maxTextureBytes
+            || (textureBytes && !readBase64(in,textureBytes,mesh.baseColorTexture)))
+            return false;
+    }
+    if (version >= 7) {
+        if (!(in >> mesh.advancedSurface))
+            return false;
+        if (mesh.advancedSurface) {
+            if (!readValue(in,mesh.metallic,0,1) || !readValue(in,mesh.roughness,0,1)
+                || !readVector(in,mesh.emissive,0,64)
+                || (version >= 21 && (!readValue(in,mesh.clearCoat,0,1) || !readValue(in,mesh.clearCoatRoughness,0,1)))
+                || (version >= 22 && (!readVector(in,mesh.layers.sheenColor,0,1) || !readValue(in,mesh.layers.sheenRoughness,0,1)))
+                || (version >= 23 && (!readValue(in,mesh.layers.transmission,0,1) || !readValue(in,mesh.layers.ior,1,3)))
+                || (version >= 24 && (!readValue(in,mesh.layers.subsurface,0,1) || !readValue(in,mesh.layers.thickness,0,2)
+                    || !readValue(in,mesh.layers.scatteringDistance,0.0001f,2) || !readValue(in,mesh.layers.anisotropy,0,1)
+                    || !readValue(in,mesh.layers.anisotropyRotation,-MaterialLayers::fullTurn,MaterialLayers::fullTurn)))
+                || (version >= 25 && !readValue(in,mesh.layers.coatNormalScale,-MaterialLayers::maxCoatNormalScale,MaterialLayers::maxCoatNormalScale))
+                || (version >= 26 && (!readValue(in,mesh.layers.wetness,0,1) || !readValue(in,mesh.layers.puddles,0,1)
+                    || !readValue(in,mesh.layers.heightScale,0,MaterialLayers::maxHeightScale) || !(in >> mesh.layers.decal)
+                    || !readValue(in,mesh.layers.decalOpacity,0,1) || !readValue(in,mesh.surfaceAlpha,0,1))))
+                return false;
+            const auto mapCount = version >= 25 ? mesh.surfaceMaps.size() : baseMaterialTextureCount-1;
+            auto textureBytes = mesh.baseColorTexture.size();
+            for (auto &map : std::span(mesh.surfaceMaps).first(mapCount)) {
+                std::size_t bytes;
+                if (!(in >> bytes) || bytes > MeshMaterial::maxTextureBytes
+                    || (version >= 25 && bytes > MeshMaterial::maxTextureBytes-textureBytes)
+                    || (bytes && !readBase64(in,bytes,map)))
+                    return false;
+                textureBytes += bytes;
+            }
+        }
+    }
+    if (version >= 8) {
+        bool animated;
+        if (!(in >> animated))
+            return false;
+        if (animated) {
+            auto &clip = mesh.clip.emplace();
+            std::size_t frames;
+            if (lodCount || !count || !readText(in,clip.name) || clip.name.empty() || clip.name.size() > 128
+                || !readValue(in,clip.framesPerSecond,1,120) || !(in >> frames) || frames < 2 || frames > MeshClip::maxFrames
+                || count > std::min(remainingClipSamples,MeshClip::maxSamples)/frames)
+                return false;
+            clip.vertexCount = count;
+            clip.samples.resize(count*frames);
+            remainingClipSamples -= clip.samples.size();
+            for (auto &vertex : clip.samples)
+                if (!readVector(in,vertex.position,-1'000'000,1'000'000) || !readVector(in,vertex.normal,-1.01f,1.01f))
+                    return false;
+        }
+    }
+    mesh.vertices.resize(count);
+    mesh.lodVertices.resize(lodCount);
+    for (auto *vertices : {&mesh.vertices,&mesh.lodVertices})
+        for (auto &vertex : *vertices)
+            if (!readVector(in,vertex.position) || !readVector(in,vertex.normal,-1.01f,1.01f)
+                || !readVector(in,vertex.color,0,1) || (version >= 5 && !readVector(in,vertex.uv,-1000,1000)))
+                return false;
+    return true;
+}
+
+// Format 30: the order to write meshes in (global meshes first, then each cell's), and the cells with their proxies.
+struct CellLayout {
+    std::vector<std::size_t> order;
+    std::size_t globals = 0;
+    std::vector<PlayCell> cells;
+};
+
+CellLayout partitionMeshes(const std::vector<PlayMesh> &meshes,float cellSize)
+{
+    CellLayout layout;
+    std::map<std::pair<int,int>,std::vector<std::size_t>> cells;
+    for (std::size_t i = 0; i < meshes.size(); ++i) {
+        const auto &mesh = meshes[i];
+        if (mesh.body >= 0 || mesh.clip || mesh.vertices.empty()) {
+            layout.order.push_back(i);
+            continue;
+        }
+        Point3 low{1e30f,1e30f,1e30f}, high{-1e30f,-1e30f,-1e30f};
+        for (const auto &vertex : mesh.vertices)
+            for (int axis = 0; axis < 3; ++axis) {
+                low[axis] = std::min(low[axis],vertex.position[axis]);
+                high[axis] = std::max(high[axis],vertex.position[axis]);
+            }
+        const int x = int(std::floor((low[0]+high[0])*0.5f/cellSize)), y = int(std::floor((low[1]+high[1])*0.5f/cellSize));
+        // Rows of cells by y, then x, so a cell's neighbors along x sit next to it in the file.
+        cells[{y,x}].push_back(i);
+    }
+    layout.globals = layout.order.size();
+    for (const auto &[key,members] : cells) {
+        PlayCell cell;
+        cell.grid = {key.second,key.first};
+        cell.firstMesh = layout.order.size();
+        cell.meshCount = members.size();
+        cell.minimum = {1e30f,1e30f,1e30f};
+        cell.maximum = {-1e30f,-1e30f,-1e30f};
+        for (const auto index : members) {
+            layout.order.push_back(index);
+            const auto &vertices = meshes[index].vertices;
+            Point3 low{1e30f,1e30f,1e30f}, high{-1e30f,-1e30f,-1e30f}, color{};
+            for (const auto &vertex : vertices)
+                for (int axis = 0; axis < 3; ++axis) {
+                    low[axis] = std::min(low[axis],vertex.position[axis]);
+                    high[axis] = std::max(high[axis],vertex.position[axis]);
+                    color[axis] += vertex.color[axis]/float(vertices.size());
+                }
+            for (int axis = 0; axis < 3; ++axis) {
+                cell.minimum[axis] = std::min(cell.minimum[axis],low[axis]);
+                cell.maximum[axis] = std::max(cell.maximum[axis],high[axis]);
+                // Summed in steps of 1/n, a white mesh can round past 1, which the reader rejects.
+                color[axis] = std::clamp(color[axis],0.0f,1.0f);
+            }
+            // A mesh no larger than its box is its own proxy (in its vertex colors, without textures); a larger one becomes
+            // its bounding box, two triangles per face, wound outward.
+            if (vertices.size() <= 36) {
+                for (auto vertex : vertices) {
+                    vertex.uv = {};
+                    vertex.wind = 0;
+                    cell.proxy.push_back(vertex);
+                }
+                continue;
+            }
+            for (int axis = 0; axis < 3; ++axis)
+                for (const int side : {-1,1}) {
+                    const int u = (axis+1)%3, v = (axis+2)%3;
+                    Point3 normal{};
+                    normal[axis] = float(side);
+                    const auto corner = [&](bool a,bool b) {
+                        Point3 p{};
+                        p[axis] = side < 0 ? low[axis] : high[axis];
+                        p[u] = a ? high[u] : low[u];
+                        p[v] = b ? high[v] : low[v];
+                        return PlayVertex{p,normal,color,0,{}};
+                    };
+                    const std::array quad{corner(false,false),corner(true,false),corner(true,true),corner(false,true)};
+                    const auto triangle = side > 0 ? std::array{0,1,2,0,2,3} : std::array{0,2,1,0,3,2};
+                    for (const auto k : triangle)
+                        cell.proxy.push_back(quad[std::size_t(k)]);
+                }
+        }
+        layout.cells.push_back(std::move(cell));
+    }
+    return layout;
+}
 }
 
 std::vector<PlayVertex> makePlayVertices(const Mesh &mesh,const Heightfield *terrain,float foliageWind,
@@ -128,14 +376,10 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
     const bool display = scene.exposure != 0 || scene.viewTransform != color::ViewTransform::AgX || scene.autoExposure
         || scene.exposureCompensation != 0 || !scene.temporalAntiAliasing || !scene.ambientOcclusion;
     const bool spots = std::ranges::any_of(scene.lights,[](const PlayLight &light) { return light.spotAngle > 0; });
-    const auto hasCoat = [](const PlayMesh &mesh) { return mesh.clearCoat != 0 || mesh.clearCoatRoughness != 0; };
-    const auto hasLayers = [](const PlayMesh &mesh) { return mesh.layers != MaterialLayers{}; };
-    const auto hasLayerMaps = [](const PlayMesh &mesh) {
-        return mesh.layers.coatNormalScale != 1
-            || std::ranges::any_of(std::span(mesh.surfaceMaps).last<LayerMapCount>(),[](const auto &map) { return !map.empty(); });
-    };
     const bool coloredLamps = std::ranges::any_of(scene.lights,[](const PlayLight &light) { return light.color != Point3{1,1,1}; });
-    const int version = coloredLamps ? 29 : scene.weather.authored() ? 28
+    if (scene.partitions.cellSize < 0 || (scene.partitions.cellSize > 0 && !(scene.partitions.cellSize >= 1 && scene.partitions.cellSize <= 100000)))
+        return false;
+    const int version = scene.partitions.cellSize > 0 ? 30 : coloredLamps ? 29 : scene.weather.authored() ? 28
         : scene.probeGi || scene.screenSpaceGi || scene.reflectionProbes ? 27
         : std::ranges::any_of(scene.meshes,[](const PlayMesh &mesh) { return mesh.layers.hasStreetLayers(); }) ? 26
         : std::ranges::any_of(scene.meshes,hasLayerMaps) ? 25
@@ -227,77 +471,43 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
         out << '\n';
     }
     std::size_t remainingClipSamples = MeshClip::maxSamples*3;
-    for (const auto &mesh : scene.meshes) {
-        if (mesh.baseColorTexture.size() > MeshMaterial::maxTextureBytes || !mesh.layers.valid()
-            || !(mesh.clearCoat >= 0 && mesh.clearCoat <= 1 && mesh.clearCoatRoughness >= 0 && mesh.clearCoatRoughness <= 1))
-            return false;
-        out << mesh.body << ' ' << mesh.vertices.size() << ' ' << mesh.lodVertices.size() << ' ' << mesh.lodDistance << ' ';
-        writeVector(out,mesh.lodOrigin);
-        out << mesh.baseColorTexture.size() << '\n';
-        if (!mesh.baseColorTexture.empty()) {
-            writeBase64(out,mesh.baseColorTexture);
-            out << '\n';
-        }
-        const bool advanced = mesh.advancedSurface || hasCoat(mesh) || hasLayers(mesh) || hasLayerMaps(mesh);
-        out << advanced << '\n';
-        if (advanced) {
-            out << mesh.metallic << ' ' << mesh.roughness << ' ';
-            writeVector(out,mesh.emissive);
-            if (version >= 21)
-                out << mesh.clearCoat << ' ' << mesh.clearCoatRoughness << ' ';
-            if (version >= 22) {
-                writeVector(out,mesh.layers.sheenColor);
-                out << mesh.layers.sheenRoughness << ' ';
-            }
-            if (version >= 23)
-                out << mesh.layers.transmission << ' ' << mesh.layers.ior << ' ';
-            if (version >= 24)
-                out << mesh.layers.subsurface << ' ' << mesh.layers.thickness << ' ' << mesh.layers.scatteringDistance
-                    << ' ' << mesh.layers.anisotropy << ' ' << mesh.layers.anisotropyRotation << ' ';
-            if (version >= 25)
-                out << mesh.layers.coatNormalScale << ' ';
-            if (version >= 26) {
-                if (!(mesh.surfaceAlpha >= 0 && mesh.surfaceAlpha <= 1))
-                    return false;
-                out << mesh.layers.wetness << ' ' << mesh.layers.puddles << ' ' << mesh.layers.heightScale << ' '
-                    << mesh.layers.decal << ' ' << mesh.layers.decalOpacity << ' ' << mesh.surfaceAlpha << ' ';
-            }
-            out << '\n';
-            const auto mapCount = version >= 25 ? mesh.surfaceMaps.size() : baseMaterialTextureCount-1;
-            std::size_t textureBytes = mesh.baseColorTexture.size();
-            for (const auto &map : std::span(mesh.surfaceMaps).first(mapCount)) {
-                if (map.size() > MeshMaterial::maxTextureBytes
-                    || (version >= 25 && map.size() > MeshMaterial::maxTextureBytes-textureBytes))
-                    return false;
-                textureBytes += map.size();
-                out << map.size() << '\n';
-                if (!map.empty()) {
-                    writeBase64(out,map);
-                    out << '\n';
-                }
-            }
-        }
-        out << bool(mesh.clip) << '\n';
-        if (mesh.clip) {
-            const auto &clip = *mesh.clip;
-            if (!clip.valid(mesh.vertices.size()) || !mesh.lodVertices.empty() || clip.samples.size() > remainingClipSamples)
+    if (version < 30) {
+        for (const auto &mesh : scene.meshes)
+            if (!writeMeshEntry(out,mesh,version,remainingClipSamples))
                 return false;
-            remainingClipSamples -= clip.samples.size();
-            out << std::quoted(clip.name) << ' ' << clip.framesPerSecond << ' ' << clip.frameCount() << '\n';
-            for (const auto &vertex : clip.samples) {
-                writeVector(out,vertex.position);
-                writeVector(out,vertex.normal);
-                out << '\n';
+    } else {
+        // The cell table, then the mesh section: global meshes, then each cell's meshes as one block.
+        auto layout = partitionMeshes(scene.meshes,scene.partitions.cellSize);
+        std::ostringstream section;
+        section.imbue(std::locale::classic());
+        section << std::setprecision(std::numeric_limits<float>::max_digits10);
+        std::size_t cell = 0;
+        for (std::size_t i = 0; i < layout.order.size(); ++i) {
+            if (cell < layout.cells.size() && layout.cells[cell].firstMesh == i)
+                layout.cells[cell].offset = std::uint64_t(section.tellp());
+            if (!writeMeshEntry(section,scene.meshes[layout.order[i]],version,remainingClipSamples))
+                return false;
+            if (cell < layout.cells.size() && i+1 == layout.cells[cell].firstMesh+layout.cells[cell].meshCount) {
+                layout.cells[cell].bytes = std::uint64_t(section.tellp())-layout.cells[cell].offset;
+                ++cell;
             }
         }
-        for (const auto *vertices : {&mesh.vertices,&mesh.lodVertices})
-            for (const auto &vertex : *vertices) {
+        const auto text = section.str();
+        out << scene.partitions.cellSize << ' ' << layout.globals << ' ' << layout.cells.size() << ' ' << text.size() << '\n';
+        for (const auto &entry : layout.cells) {
+            out << entry.grid[0] << ' ' << entry.grid[1] << ' ' << entry.firstMesh << ' ' << entry.meshCount << ' '
+                << entry.offset << ' ' << entry.bytes << ' ';
+            writeVector(out,entry.minimum);
+            writeVector(out,entry.maximum);
+            out << entry.proxy.size() << '\n';
+            for (const auto &vertex : entry.proxy) {
                 writeVector(out,vertex.position);
                 writeVector(out,vertex.normal);
                 writeVector(out,vertex.color);
-                writeVector(out,vertex.uv);
                 out << '\n';
             }
+        }
+        out << "SECTION\n" << text;
     }
     const auto &play = scene.gameplay;
     if (play.routes.size() > 64 || play.vehicles.size() > 128 || play.missions.size() > 32)
@@ -405,7 +615,8 @@ bool writePlayable(std::ostream &out,const PlayableScene &scene)
     return bool(out);
 }
 
-std::optional<PlayableScene> readPlayable(std::istream &in)
+namespace {
+std::optional<PlayableScene> readPlayableScene(std::istream &in,bool indexOnly)
 {
     in.imbue(std::locale::classic());
     PlayableScene scene;
@@ -413,7 +624,7 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     std::string signature;
     int version;
     std::size_t bodies,terrains,joints,meshes,lights;
-    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 29
+    if (!(in >> std::setw(32) >> signature >> version) || signature != "WORLDFORGE_PLAY" || version < 1 || version > 30
         || !(in >> bodies >> terrains >> joints >> meshes >> lights >> scene.player)
         || bodies > 257 || terrains > 256 || joints > 256 || meshes > 4096 || lights > 256 || scene.player >= bodies
         || !readValue(in,world.gravity,0,50) || !(in >> scene.sky)
@@ -504,83 +715,51 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
             || (version >= 17 && (!readVector(in,light.spotDirection,-1,1) || !readValue(in,light.spotAngle,0,3.1416f)
                                   || !readValue(in,light.spotBlend,0,1))) || (version >= 29 && !readVector(in,light.color,0,1)))
             return {};
+    std::uint64_t sectionEnd = 0;
+    if (version >= 30) {
+        auto &parts = scene.partitions;
+        std::size_t cellCount;
+        std::uint64_t sectionBytes;
+        if (!readValue(in,parts.cellSize,1,100000) || !(in >> parts.globalMeshes >> cellCount >> sectionBytes)
+            || parts.globalMeshes > meshes || cellCount > meshes)
+            return {};
+        parts.cells.resize(cellCount);
+        std::size_t next = parts.globalMeshes;
+        for (auto &cell : parts.cells) {
+            std::size_t proxy;
+            if (!(in >> cell.grid[0] >> cell.grid[1] >> cell.firstMesh >> cell.meshCount >> cell.offset >> cell.bytes)
+                || cell.firstMesh != next || !cell.meshCount || cell.meshCount > meshes-next || cell.offset > sectionBytes
+                || cell.bytes > sectionBytes-cell.offset || !readVector(in,cell.minimum) || !readVector(in,cell.maximum)
+                || !(in >> proxy) || proxy > 36*cell.meshCount || proxy%3)
+                return {};
+            next += cell.meshCount;
+            cell.proxy.resize(proxy);
+            for (auto &vertex : cell.proxy)
+                if (!readVector(in,vertex.position) || !readVector(in,vertex.normal,-1.01f,1.01f) || !readVector(in,vertex.color,0,1))
+                    return {};
+        }
+        std::string marker;
+        if (next != meshes || !(in >> marker) || marker != "SECTION" || in.get() != '\n')
+            return {};
+        const auto start = in.tellg();
+        if (start < 0)
+            return {};
+        parts.section = std::uint64_t(start);
+        sectionEnd = parts.section+sectionBytes;
+    }
     scene.meshes.resize(meshes);
     std::size_t remaining = 1500000;
     std::size_t remainingClipSamples = MeshClip::maxSamples*3;
-    for (auto &mesh : scene.meshes) {
-        std::size_t count;
-        if (!(in >> mesh.body >> count) || mesh.body < -1 || mesh.body >= int(bodies) || count > remaining || count%3)
+    const std::size_t readCount = indexOnly && version >= 30 ? scene.partitions.globalMeshes : meshes;
+    for (std::size_t i = 0; i < readCount; ++i)
+        if (!readMeshEntry(in,scene.meshes[i],version,bodies,remaining,remainingClipSamples))
             return {};
-        remaining -= count;
-        std::size_t lodCount = 0;
-        if (version >= 4) {
-            if (!(in >> lodCount) || lodCount > remaining || lodCount%3 || (lodCount && lodCount >= count)
-                || !readValue(in,mesh.lodDistance,0,1000000) || (lodCount && mesh.lodDistance <= 0)
-                || !readVector(in,mesh.lodOrigin))
-                return {};
-            remaining -= lodCount;
-        }
-        if (version >= 5) {
-            std::size_t textureBytes;
-            if (!(in >> textureBytes) || textureBytes > MeshMaterial::maxTextureBytes
-                || (textureBytes && !readBase64(in,textureBytes,mesh.baseColorTexture)))
-                return {};
-        }
-        if (version >= 7) {
-            if (!(in >> mesh.advancedSurface))
-                return {};
-            if (mesh.advancedSurface) {
-                if (!readValue(in,mesh.metallic,0,1) || !readValue(in,mesh.roughness,0,1)
-                    || !readVector(in,mesh.emissive,0,64)
-                    || (version >= 21 && (!readValue(in,mesh.clearCoat,0,1) || !readValue(in,mesh.clearCoatRoughness,0,1)))
-                    || (version >= 22 && (!readVector(in,mesh.layers.sheenColor,0,1) || !readValue(in,mesh.layers.sheenRoughness,0,1)))
-                    || (version >= 23 && (!readValue(in,mesh.layers.transmission,0,1) || !readValue(in,mesh.layers.ior,1,3)))
-                    || (version >= 24 && (!readValue(in,mesh.layers.subsurface,0,1) || !readValue(in,mesh.layers.thickness,0,2)
-                        || !readValue(in,mesh.layers.scatteringDistance,0.0001f,2) || !readValue(in,mesh.layers.anisotropy,0,1)
-                        || !readValue(in,mesh.layers.anisotropyRotation,-MaterialLayers::fullTurn,MaterialLayers::fullTurn)))
-                    || (version >= 25 && !readValue(in,mesh.layers.coatNormalScale,-MaterialLayers::maxCoatNormalScale,MaterialLayers::maxCoatNormalScale))
-                    || (version >= 26 && (!readValue(in,mesh.layers.wetness,0,1) || !readValue(in,mesh.layers.puddles,0,1)
-                        || !readValue(in,mesh.layers.heightScale,0,MaterialLayers::maxHeightScale) || !(in >> mesh.layers.decal)
-                        || !readValue(in,mesh.layers.decalOpacity,0,1) || !readValue(in,mesh.surfaceAlpha,0,1))))
-                    return {};
-                const auto mapCount = version >= 25 ? mesh.surfaceMaps.size() : baseMaterialTextureCount-1;
-                auto textureBytes = mesh.baseColorTexture.size();
-                for (auto &map : std::span(mesh.surfaceMaps).first(mapCount)) {
-                    std::size_t bytes;
-                    if (!(in >> bytes) || bytes > MeshMaterial::maxTextureBytes
-                        || (version >= 25 && bytes > MeshMaterial::maxTextureBytes-textureBytes)
-                        || (bytes && !readBase64(in,bytes,map)))
-                        return {};
-                    textureBytes += bytes;
-                }
-            }
-        }
-        if (version >= 8) {
-            bool animated;
-            if (!(in >> animated))
-                return {};
-            if (animated) {
-                auto &clip = mesh.clip.emplace();
-                std::size_t frames;
-                if (lodCount || !count || !readText(in,clip.name) || clip.name.empty() || clip.name.size() > 128
-                    || !readValue(in,clip.framesPerSecond,1,120) || !(in >> frames) || frames < 2 || frames > MeshClip::maxFrames
-                    || count > std::min(remainingClipSamples,MeshClip::maxSamples)/frames)
-                    return {};
-                clip.vertexCount = count;
-                clip.samples.resize(count*frames);
-                remainingClipSamples -= clip.samples.size();
-                for (auto &vertex : clip.samples)
-                    if (!readVector(in,vertex.position,-1'000'000,1'000'000) || !readVector(in,vertex.normal,-1.01f,1.01f))
-                        return {};
-            }
-        }
-        mesh.vertices.resize(count);
-        mesh.lodVertices.resize(lodCount);
-        for (auto *vertices : {&mesh.vertices,&mesh.lodVertices})
-            for (auto &vertex : *vertices)
-                if (!readVector(in,vertex.position) || !readVector(in,vertex.normal,-1.01f,1.01f)
-                    || !readVector(in,vertex.color,0,1) || (version >= 5 && !readVector(in,vertex.uv,-1000,1000)))
-                    return {};
+    if (readCount < meshes) {
+        // The index skips the cells' blocks.
+        scene.meshes.resize(readCount);
+        in.seekg(std::streamoff(sectionEnd));
+        if (!in)
+            return {};
     }
     if (version >= 5) {
         auto &play = scene.gameplay;
@@ -709,6 +888,35 @@ std::optional<PlayableScene> readPlayable(std::istream &in)
     if (!in.eof())
         return {};
     return scene;
+}
+}
+
+std::optional<PlayableScene> readPlayable(std::istream &in)
+{
+    return readPlayableScene(in,false);
+}
+
+std::optional<PlayableScene> readPlayableIndex(std::istream &in)
+{
+    return readPlayableScene(in,true);
+}
+
+std::optional<std::vector<PlayMesh>> readPlayableCell(std::istream &in,const PlayableScene &index,std::size_t cell)
+{
+    const auto &parts = index.partitions;
+    if (cell >= parts.cells.size())
+        return {};
+    const auto &entry = parts.cells[cell];
+    in.imbue(std::locale::classic());
+    in.clear();
+    in.seekg(std::streamoff(parts.section+entry.offset));
+    std::vector<PlayMesh> meshes(entry.meshCount);
+    std::size_t remaining = 1500000, remainingClipSamples = MeshClip::maxSamples*3;
+    for (auto &mesh : meshes)
+        if (!in || !readMeshEntry(in,mesh,30,index.simulation.bodies.size(),remaining,remainingClipSamples)
+            || mesh.body >= 0 || mesh.clip)
+            return {};
+    return meshes;
 }
 
 void drivePlayer(BoxBody &body,Point3 spawn,float yaw,int forward,int sideways,bool jump,int &jumpBuffer)

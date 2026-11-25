@@ -19,6 +19,8 @@ public:
     // Starts Play and walks the player into `objectId` from the `approach` side. Gravity is off so
     // the check measures the object's collider rather than the surrounding ground.
     static CollisionProbe probeCollision(const ProjectStore &store, const QString &objectId, QVector3D approach);
+    // Scenes with at least this many static meshes are exported in world partition cells (playable format 30).
+    static constexpr long cellularMeshes = 256;
     static bool exportScene(const ProjectStore &store, std::ostream &output, QString *error = nullptr, bool nativeBindings = false);
     bool stageNative(const QString &path, QString &error);
     void stopNative();
