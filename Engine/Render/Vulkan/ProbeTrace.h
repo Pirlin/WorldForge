@@ -77,7 +77,8 @@ private:
     probes::Vector sun_{}, radiance_{};
     probes::HitLighting lighting_;
     uint64_t revision_ = 0;
-    uint32_t age_ = 0;
+    uint32_t age_ = 0; // calls since the last trace
+    static constexpr uint32_t followFrames = 20;
     bool requested_ = false;
     bool reflections_ = false;
 };

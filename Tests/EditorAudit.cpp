@@ -2803,6 +2803,12 @@ void r3PerformanceWorkflow(const QDir &output,Audit &audit,bool profile = false)
         audit.check(page,"performance","Create the street for the R3 benchmark",false,error);
         return;
     }
+    // The baseline has every R3 feature off, probe GI included (it is on by default).
+    if (store.environment()) {
+        auto off = store.environment()->details;
+        off.insert("probeGi",false);
+        store.setAtmosphere(off);
+    }
     const auto baseline = runStreetPlayer(store,output,"r3-lighting-off");
     auto atmosphere = store.environment() ? store.environment()->details : QJsonObject{};
     atmosphere.insert("probeGi",true);

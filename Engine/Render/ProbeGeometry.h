@@ -98,7 +98,7 @@ static_assert(sizeof(Node) == 48 && sizeof(Triangle) == 80 && sizeof(ProbeDirect
 // range rather than the exposure-dependent one. Without them a night street's walls miss the lamp and sky light the
 // ground bounces onto them.
 struct HitLighting {
-    static constexpr std::size_t maximumLights = 32;
+    static constexpr std::size_t maximumLights = 8; // each hit casts a shadow ray toward every one of them
     std::array<std::array<float,4>,9> sky{};
     std::vector<std::array<float,4>> lights;
     bool operator==(const HitLighting &) const = default;

@@ -175,8 +175,16 @@ bool ProbeField::needsUpdate(bool enabled,bool reflections,probes::Volume volume
         return false;
     }
     // A moving scene refreshes at a reduced rate. Edits and light changes also refresh the field.
-    if (requested_ && reflections == reflections_ && volume == volume_ && coarse == coarse_ && revision == revision_ && sun == sun_ && radiance == radiance_ && lighting == lighting_
-        && (!moving || ++age_ < 45))
+    ++age_;
+    const bool sameScene = requested_ && reflections == reflections_ && revision == revision_ && sun == sun_
+        && radiance == radiance_ && lighting.sky == lighting_.sky;
+    // The lamps near the grids change as they follow the camera, so they count with the place.
+    const bool samePlace = volume == volume_ && coarse == coarse_ && lighting.lights == lighting_.lights;
+    if (sameScene && samePlace && (!moving || age_ < 45))
+        return false;
+    // The grids follow the camera at most every followFrames frames, so a walk does not retrace at every step; the last
+    // trace keeps lighting meanwhile.
+    if (sameScene && !samePlace && age_ < followFrames)
         return false;
     volume_ = volume;
     coarse_ = coarse;
