@@ -862,6 +862,7 @@ public:
     void invalidate()
     {
         dirty_ = true;
+        ++editRevision_;
         requestUpdate();
     }
     void cameraChanged()
@@ -2119,6 +2120,9 @@ private:
     LiveViewport &owner_;
     bool dirty_ = true;
     quint64 geometryRevision_ = 0;
+    // Changes only with edits, not when moving the camera rebuilds view-dependent geometry (terrain, LOD): the probe field
+    // follows it, so a camera walk does not retrace the probes at every step.
+    quint64 editRevision_ = 0;
     bool framed_ = false;
     bool rendered_ = false;
     // False while a still view is still averaging its TAA samples; captureFrame waits for it.
@@ -2602,7 +2606,7 @@ public:
             std::copy_n(lighting.skyIrradiance[i],4,probeSky[i].begin());
         const auto probeHit = wf::probes::hitLighting(probeSky,wf::lights::probeSources(clusterLights),probeCoarse);
         if (probeField_.needsUpdate(probeCompute_ && !window_.modelOnly_ && (environment.probeGi || environment.reflectionProbes),
-                environment.reflectionProbes,probeVolume,window_.runtime_ ? 0 : window_.geometryRevision_,
+                environment.reflectionProbes,probeVolume,window_.runtime_ ? 0 : window_.editRevision_,
                 {towardSun.x(),towardSun.y(),towardSun.z()},
                 {sunLight[0]*cloudTransmission,sunLight[1]*cloudTransmission,sunLight[2]*cloudTransmission},
                 window_.runtime_.has_value(),probeHit,probeCoarse)) {
