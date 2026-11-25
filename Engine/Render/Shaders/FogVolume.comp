@@ -3,9 +3,11 @@
 // Fills the fog volume (Engine/Render/Vulkan/FogVolume.h) before the scene pass. One invocation walks one froxel
 // column from the eye outward, taking one sun visibility lookup per slice where the fog or the local mist needs it:
 //   slices 0 to fogVolumeSize.z - 1, near the mist: each froxel's lamp light scattered toward the eye (RGB, times
-//     fogVolumeLampScale) and sun visibility (alpha), which the mist's march reads at each step;
-//   the next fogVolumeSize.z slices: in red, the share of the height fog's opacity in the sun's shadow from the eye to
-//     the slice, per unit of that opacity, which a pixel multiplies by its own exact opacity.
+//     fogVolumeLampScale) and sun visibility (alpha); the mist's march reads the lamp light at each step, where lamps
+//     reach it;
+//   the next fogVolumeSize.z slices, from the eye to the slice: the shares of the height fog's (red) and the mist's
+//     (green) opacity in the sun's shadow, per unit of that opacity, which a pixel multiplies by its own exact opacity,
+//     and the strongest lamp light in the mist (blue), which tells a pixel whether to read lamp light at all.
 // The lookup points move within their froxels each TAA frame, so the resolve averages them.
 #define LIGHTING_COMPUTE
 #include "Lighting.glsl"
@@ -55,18 +57,22 @@ void main()
     mist = mist && farHit > nearHit;
 
     bool lamps = mist && lighting.skySettings.z > 0.5 && clusterHeader.x > clusterHeader.y;
+    float radialOffset = radius > 0.0 ? max(0.0,dot(origin,origin)-b*b)/(radius*radius) : 0.0;
 
-    float fogBefore = 1.0, fogBlocked = 0.0, previous = 0.0;
+    float fogBefore = 1.0, fogBlocked = 0.0, mistBefore = 1.0, mistBlocked = 0.0, lampPeak = 0.0, previous = 0.0;
     for (int slice = 0; slice < int(fogVolumeSize.z); ++slice) {
         float depth = fogVolumeDepth((float(slice)+0.5)/fogVolumeSize.z);
         float distance = depth/along;
-        float sampleAt = mix(previous,distance,offset.z);
-        // Near the mist (a slice either side, for filtering), this froxel's own sun visibility and lamp light.
+        // The mist's part of this step, if any: the lookup goes there, where it matters most.
+        float mistStart = clamp(previous,nearHit,farHit), mistEnd = clamp(distance,nearHit,farHit);
+        bool inMist = mist && mistEnd > mistStart;
+        float sampleAt = inMist ? mix(mistStart,mistEnd,offset.z) : mix(previous,distance,offset.z);
+        // Near the mist (a slice either side, for filtering), this froxel's own lamp light.
         float step = distance-previous;
         bool nearMist = mist && sampleAt > nearHit-step && sampleAt < farHit+step;
         bool fogShadow = fog && previous < shadowRange;
         vec3 point = eye+direction*sampleAt;
-        float visible = (fogShadow || nearMist) && sunlit ? sunVisibility(point,vec3(0.0),false) : 1.0;
+        float visible = (fogShadow || inMist) && sunlit ? sunVisibility(point,vec3(0.0),false) : 1.0;
         if (fog) {
             // The fog's opacity counts all the way out; its shadow only within the cascades' range.
             float after = heightFogTransmission(distance,logAtEye,logSlope,density);
@@ -74,11 +80,21 @@ void main()
                 fogBlocked += (fogBefore-after)*(1.0-visible)*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
             fogBefore = after;
         }
+        if (inMist) {
+            float place = (b+sampleAt)/radius;
+            float local = 1.0-smoothstep(0.60,1.0,sqrt(radialOffset+place*place));
+            float after = mistBefore*exp(-lighting.settings.x*(mistEnd-mistStart)*local);
+            mistBlocked += (mistBefore-after)*(1.0-visible);
+            mistBefore = after;
+        }
         vec3 lamplight = nearMist && lamps ? lampMistLight(point,direction,sampleAt*along) : vec3(0.0);
+        lampPeak = max(lampPeak,max(lamplight.r,max(lamplight.g,lamplight.b)));
         imageStore(volume,ivec3(column,slice),vec4(min(lamplight*fogVolumeLampScale,vec3(60000.0)),visible));
-        // The fog's shadowed share per unit of its opacity so far: a pixel multiplies it by its own exact opacity, so
-        // where its surface falls within the slice does not matter.
-        imageStore(volume,ivec3(column,slice+int(fogVolumeSize.z)),vec4(min(fogBlocked/max(1.0-fogBefore,1e-6),1.0),0.0,0.0,0.0));
+        // The fog's and the mist's shadowed shares per unit of their opacity so far, which a pixel multiplies by its own
+        // exact opacity (so where its surface falls within the slice does not matter), and the strongest lamp light in
+        // the mist so far, which tells a pixel whether to read the lamp light at all.
+        imageStore(volume,ivec3(column,slice+int(fogVolumeSize.z)),vec4(min(fogBlocked/max(1.0-fogBefore,1e-6),1.0),
+            min(mistBlocked/max(1.0-mistBefore,1e-6),1.0),min(lampPeak,60000.0),0.0));
         previous = distance;
     }
 }

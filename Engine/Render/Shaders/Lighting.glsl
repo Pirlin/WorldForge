@@ -389,15 +389,20 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
     bool volume = lighting.probeSettings.w > 0.0;
     bool shadowed = volume && lighting.settings.y > 0.5 && any(greaterThan(direct,vec3(0.0)));
     bool lamps = volume && physical && clusterHeader.x > clusterHeader.y;
-    // Ten density samples (five segments of two in physical mode) give the mist's opacity along this pixel's ray. Each
-    // segment's share of it takes the sun's visibility and the lamp light from the fog volume at its middle.
+    // The mist's shadowed share and its strongest lamp light along this froxel column (FogVolume.comp), at the far side
+    // of the mist or the surface.
+    float forwardShare = dot(direction,lighting.clusterForward.xyz);
+    vec4 column = shadowed || lamps ? fogVolumeAt(farHit*forwardShare,1) : vec4(0.0);
+    // Lamp light needs a read at each step (it changes too steeply within a slice for a share); skip them where no lamp
+    // reaches the mist, as by day, when lamps reach a few meters.
+    bool lit = lamps && column.b > 2e-6;
+    // Ten density samples (five segments of two in physical mode) give the mist's opacity along this pixel's ray.
     int segments = physical ? 5 : 10;
     float stepSize = (farHit-nearHit)/float(segments);
-    float transmission = 1.0, blocked = 0.0;
+    float transmission = 1.0;
     vec3 lamplight = vec3(0.0);
     float radialOffset = max(0.0,dot(origin,origin)-b*b)/(radius*radius);
     float densityStep = lighting.settings.x*stepSize;
-    float forwardShare = dot(direction,lighting.clusterForward.xyz);
     for (int i = 0; i < segments; ++i) {
         float start = nearHit+float(i)*stepSize;
         float fraction = physical ? 0.25 : 0.5;
@@ -409,18 +414,14 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
         }
         float after = transmission*exp(-densityStep*density);
         float weight = transmission-after;
-        if ((shadowed || lamps) && weight > 0.00001) {
-            // The middle of the segment, alike for neighboring pixels so their reads share the texture cache; the
-            // volume's own lookup points turn each TAA frame.
-            vec4 froxel = fogVolumeAt((start+0.5*stepSize)*forwardShare,0);
-            if (shadowed)
-                blocked += weight*(1.0-froxel.a);
-            if (lamps)
-                lamplight += weight*froxel.rgb/fogVolumeLampScale;
-        }
+        // The middle of the segment, alike for neighboring pixels so their reads share the texture cache; the volume's
+        // own lookup points turn each TAA frame.
+        if (lit && weight > 0.00001)
+            lamplight += weight*fogVolumeAt((start+0.5*stepSize)*forwardShare,0).rgb/fogVolumeLampScale;
         transmission = after;
     }
     float opacity = 1.0-transmission;
+    float blocked = shadowed ? column.g*opacity : 0.0;
     return vec4(ambient*opacity+direct*max(0.0,opacity-blocked)+tint*lamplight,opacity);
 }
 
