@@ -618,6 +618,7 @@ public:
         rebuildMeshes();
     }
     bool streams() const { return !cellFile_.empty(); }
+    std::size_t rebuilds() const { return rebuilds_; }
     const Streaming &streaming() const { return streaming_; }
     // Loads and unloads cells around eye. At most one finished load joins the scene per call.
     void updateResidency(FXMVECTOR eye)
@@ -706,8 +707,11 @@ public:
                 cellMeshes_[cell].clear();
             } else {
                 cellMeshes_[cell] = {}; // loaded, then left behind before it joined the layout
-                if (!cells[cell].proxy.empty()) {
-                    playable_.meshes.push_back({-1,cells[cell].proxy});
+                // Chunks of up to 12 boxes, each drawn and culled on its own.
+                const auto &proxy = cells[cell].proxy;
+                for (std::size_t first = 0; first < proxy.size(); first += proxyChunk) {
+                    const auto end = std::min(proxy.size(),first+proxyChunk);
+                    playable_.meshes.push_back({-1,std::vector<wf::PlayVertex>(proxy.begin()+std::ptrdiff_t(first),proxy.begin()+std::ptrdiff_t(end))});
                     meshOrigins_.push_back(-2);
                     knownMaterials_.push_back(std::nullopt);
                 }
@@ -727,6 +731,7 @@ public:
         fullUploads_ = 3;
         pendingChange_ = false;
         framesSinceRebuild_ = 0;
+        ++rebuilds_;
     }
 
     void tick(float yaw,int forward,int sideways,bool jump,bool interact)
@@ -938,7 +943,9 @@ public:
             const auto &vertices = distant ? mesh.lodVertices : mesh.vertices;
             if (mesh.body < 0 && !mesh.clip) {
                 vertices_.insert(vertices_.end(),vertices.begin(),vertices.end());
-                mark(start,material);
+                // Each proxy chunk keeps its own range: merged with its neighbors (they share the default material) the
+                // proxies of every unloaded cell would form one range across the district, which no cascade can cull.
+                mark(start,material,index < meshOrigins_.size() && meshOrigins_[index] == -2);
                 continue;
             }
             const auto *body = mesh.body >= 0 ? &world.bodies[mesh.body] : nullptr;
@@ -1046,7 +1053,19 @@ private:
     // Texture uploads by encoded bytes, which textureOwners_ keeps (uploadTextures).
     Renderer *renderer_ = nullptr;
     std::deque<std::string> textureOwners_;
-    std::unordered_map<std::string_view,int> textureCache_;
+    // Hashing a facade's whole encoded bytes for every mesh that joins with a streamed cell took tens of milliseconds;
+    // the size and 64 evenly spaced chunks find the candidate, and the map's equality still compares every byte.
+    struct SampledHash {
+        std::size_t operator()(std::string_view bytes) const
+        {
+            std::size_t hash = std::hash<std::size_t>{}(bytes.size());
+            const std::size_t chunk = 16, step = std::max<std::size_t>(1,bytes.size()/64);
+            for (std::size_t at = 0; at < bytes.size(); at += step)
+                hash = hash*1099511628211ull^std::hash<std::string_view>{}(bytes.substr(at,chunk));
+            return hash;
+        }
+    };
+    std::unordered_map<std::string_view,int,SampledHash> textureCache_;
     // World partition streaming (prepareStreaming). The loads come last, so their futures finish before the file name
     // and index they read are destroyed.
     std::filesystem::path cellFile_;
@@ -1062,8 +1081,10 @@ private:
     int fullUploads_ = 0;
     // Residency changes wait for a rebuild (updateResidency): which cells the layout holds, and frames since it changed.
     static constexpr int rebuildFrames = 30;
+    static constexpr std::size_t proxyChunk = 12*36;
     std::vector<char> inLayout_;
     bool pendingChange_ = false;
+    std::size_t rebuilds_ = 0;
     int framesSinceRebuild_ = rebuildFrames;
     std::vector<std::future<std::optional<std::vector<wf::PlayMesh>>>> loads_;
     bool clipMoved_ = false, clipLooped_ = false;
@@ -1203,6 +1224,10 @@ struct DistrictRun {
     // climb from lap to lap when cells stream in and out.
     int laps = 1;
     std::vector<double> lapWorkingSetMiB, lapPrivateMiB; // private: committed memory, which Windows does not trim
+    // Frames over 40 ms: route frame, frame and CPU time, GPU time per pass (a frame or two behind), and whether the
+    // cell layout was rebuilt in that frame.
+    struct SlowFrame { std::size_t frame; double ms, cpuMs; std::array<float,RenderStats::passCount> gpuMs; bool rebuilt; };
+    std::vector<SlowFrame> slowFrames;
 
     // The camera at fraction t of the route, and where it looks.
     std::pair<XMVECTOR,XMVECTOR> camera(float t) const
@@ -1292,6 +1317,15 @@ struct DistrictRun {
         out << "], \"lapPrivateMiB\": [";
         for (std::size_t i = 0; i < lapPrivateMiB.size(); ++i)
             out << (i ? ", " : "") << lapPrivateMiB[i];
+        out << "],\n  \"slowFrames\": [";
+        for (std::size_t i = 0; i < slowFrames.size() && i < 64; ++i) {
+            const auto &slow = slowFrames[i];
+            out << (i ? ", " : "") << "{\"frame\": " << slow.frame << ", \"ms\": " << slow.ms << ", \"cpuMs\": " << slow.cpuMs
+                << ", \"rebuilt\": " << (slow.rebuilt ? "true" : "false") << ", \"gpuMs\": [";
+            for (std::size_t pass = 0; pass < slow.gpuMs.size(); ++pass)
+                out << (pass ? ", " : "") << slow.gpuMs[pass];
+            out << "]}";
+        }
         const auto &cells = scene.streaming();
         out << "],\n  \"cellStreaming\": {\"enabled\": " << (scene.streams() ? "true" : "false") << ", \"cells\": " << cells.cells
             << ", \"resident\": " << cells.resident << ", \"loads\": " << cells.loads << ", \"unloads\": " << cells.unloads
@@ -1342,6 +1376,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
     const auto reportFile = street ? std::filesystem::path(args[packagedStreet ? 2 : 3])
         : districtRun ? std::filesystem::path(args[3]) : std::filesystem::path();
     DistrictRun district;
+    std::size_t districtRebuilds = 0; // cell layout rebuilds seen so far (slow-frame log)
     if (districtRun) {
         district.inset = float(std::clamp(_wtof(args[4]),0.0,1000.0));
         district.rooftop = float(std::clamp(_wtof(args[5]),2.0,2000.0));
@@ -1638,6 +1673,11 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
             if (++frames > DistrictRun::warmUpFrames) {
                 const double frameMs = std::chrono::duration<double,std::milli>(end-frameStart).count();
                 district.frameMs.push_back(frameMs);
+                if (frameMs > 40)
+                    district.slowFrames.push_back({std::size_t(frames-DistrictRun::warmUpFrames),frameMs,
+                        std::chrono::duration<double,std::milli>(beforePresent-frameStart).count(),stats.gpuMs,
+                        scene.rebuilds() != districtRebuilds});
+                districtRebuilds = scene.rebuilds();
                 (routeFraction < 0.6f ? district.streetMs : district.rooftopMs).push_back(frameMs);
                 district.cpuMs.push_back(std::chrono::duration<double,std::milli>(beforePresent-frameStart).count());
                 district.sceneDraws += stats.sceneDraws;

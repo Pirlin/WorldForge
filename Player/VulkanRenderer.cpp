@@ -338,6 +338,7 @@ private:
     VkFramebuffer pointShadowFramebuffer_{};
     std::vector<std::array<float,4>> pointShadowsRendered_;
     uint32_t pointShadowAge_ = 0;
+    std::size_t pointShadowCycle_ = 0; // the next shadowed lamp the periodic refresh redraws
     bool pointShadowsInitialized_ = false;
     lights::Clusters clusters_; // the clusters prepare built for this frame
     vk::Buffer readback_;
@@ -1567,9 +1568,17 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
     stamp(RenderStats::SkyMaps);
 
 
-    // Refresh changed cubemaps immediately. The periodic refresh also accounts for moving casters.
-    const bool refreshAll = !pointShadowsInitialized_ || (!clusters_.shadowed.empty() && ++pointShadowAge_ >= skyRefreshFrames);
-    const auto dirtySlots = lights::shadowUpdates(clusters_.shadowed,pointShadowsRendered_,refreshAll);
+    // Refresh changed cubemaps immediately. The periodic refresh for moving casters takes one lamp's cube at a time,
+    // cycling through them over about skyRefreshFrames: all 48 faces in one frame cost 14 ms on the GTX 1650. Without
+    // the partial-update pass every refresh clears and redraws the whole atlas.
+    const bool periodic = !clusters_.shadowed.empty() && ++pointShadowAge_ >= (pointUpdatePass_
+        ? std::max<uint32_t>(1,skyRefreshFrames/uint32_t(lights::shadowSlots)) : skyRefreshFrames);
+    const bool refreshAll = !pointShadowsInitialized_ || (periodic && !pointUpdatePass_);
+    auto dirtySlots = lights::shadowUpdates(clusters_.shadowed,pointShadowsRendered_,refreshAll);
+    if (periodic && pointUpdatePass_) {
+        pointShadowAge_ = 0;
+        dirtySlots[pointShadowCycle_++ % clusters_.shadowed.size()] = true;
+    }
     if (refreshAll || std::ranges::any_of(dirtySlots,std::identity{})) {
         pointShadowsInitialized_ = true;
         const bool clearAll = refreshAll || !pointUpdatePass_;

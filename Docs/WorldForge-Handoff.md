@@ -77,6 +77,8 @@ Read the playbook's section 10.0.3 for the next 10 hours (pending items listed t
 - **New checks:** `--aerial-perspective`; in `--rendering`, lamp falloff and shadow, auto exposure walking into a lit room, cloud transitions at five play times (`WORLDFORGE_CAPTURE_SECONDS`), and golden images `fog-sunset.png` and `lamp-mist.png`. The rendering ctest timeout is now 300 s.
 - **World partitions (R4.6, Player side):** playable format 30 groups static meshes into 64 m cells (`readPlayableIndex`, `readPlayableCell`); the Player streams them with `WORLDFORGE_CELL_STREAMING=1`; `--district-cells` checks three laps.
 
+**Quiet session, 2026-11-25 23:45** (one session, back to back): street 10.0–10.2 ms p95; with all R3 lighting 12.1 ms; with height fog and local mist 13.6 ms; the 6 × 6 district 10.5 ms. Earlier sessions the same day ran 2–4 ms slower on every route.
+
 **Frame times** (GTX 1650, Windows "Power saver"):
 - The street is about 13 ms p95; with all R3 lighting about 13.9 ms. With height fog and a 9 m local mist it is 15.95 ms (16.4 last night).
 - The 6 × 6 district is 13.6–14.2 ms p95; the textured 12 × 12 district is 17–18 ms p95 fully resident in this session, 18.9 ms streaming cells.
