@@ -69,7 +69,7 @@ Settings flow through these files:
 - Player `View`: `Player/PlayerRender.h`, which must stay a multiple of 16 bytes for D3D11
 
 ## Status (2026-11-25, day)
-Read the playbook's section 10.0.2 for what comes next.
+Read the playbook's section 10.0.3 for the next 10 hours (pending items listed there) and 10.0.4 for the 10 after.
 
 **What changed today:**
 - **Fog volume** (`FogVolume.comp`, `Engine/Render/Vulkan/FogVolume.*`): height fog's sun shadows come from a 160 × 90 × 64 froxel volume filled after the shadow maps, read once per pixel. Height fog now costs about 0.14 ms of the street's scene pass. The local mist reads the volume's point values at each step of its march.

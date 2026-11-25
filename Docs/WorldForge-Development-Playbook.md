@@ -382,7 +382,7 @@ In order. The same rules as section 10.0: each block ends with its checks passin
 
 Same rules: each block ends with its checks passing and a pushed commit.
 
-1. **Mist cost (about 1 h).** **Done 2026-11-25:** the mist's sun shadow now comes from a column share like the height fog's (sun shadows change gently, so the share does not band; only the lamps did), and the compute pass records the strongest lamp light along each column, so a pixel reads lamp light at each step only where lamps reach the mist. The misty street's scene pass is 9.0 ms again (10.4–10.7 ms with five reads per pixel); the fog-volume compute is 0.48 ms; `lamp-mist.png` and `fog-sunset.png` still match. Frame times this session were noisy (R3 off alone measured 16.3 ms p95), so the p95 target is not yet confirmed. The street with fog and mist is 15.95 ms p95; its scene pass is 10.5 ms against 9.0 ms for the ring-prone column version. The fog-volume dispatch now has its own GPU timestamp (0.46 ms), so the 1.5 ms is in the mist's five reads per pixel; cut it (for example: one read per two segments, or lamps only in froxels the mist reaches). Keep `lamp-mist.png` and `fog-sunset.png` matching. Target: 14.5 ms p95.
+1. **Mist cost (about 1 h).** **Done 2026-11-25:** the mist's sun shadow now comes from a column share like the height fog's (sun shadows change gently, so the share does not band; only the lamps did), and the compute pass records the strongest lamp light along each column, so a pixel reads lamp light at each step only where lamps reach the mist. The misty street's scene pass is 9.0 ms again (10.4–10.7 ms with five reads per pixel); the fog-volume compute is 0.48 ms; `lamp-mist.png` and `fog-sunset.png` still match. Frame times this session were noisy (R3 off alone measured 16.3 ms p95), so the p95 target is not yet confirmed.
 2. **Night bounce light (about 2 h).** The night walls miss bounce light (Cycles with no diffuse bounces shows the same gap). Grow the probe field: a second, coarser grid (8 m spacing, about 50 m across) blended beyond the 2 m grid, both traced with `HitLighting`. Turn probe GI on in the realism views (the `WORLDFORGE_REALISM_PROBE_GI` switch does it for experiments) only if all four views improve or hold. Target: night FLIP under 0.065 and walls within 3 levels of Cycles.
 3. **R4.6 follow-ups (about 2 h).**
    - Sun-shadow cost while streaming (1.6 against 0.7 ms): give each proxy its own draw range, or keep proxies out of the finer cascades.
@@ -391,6 +391,33 @@ Same rules: each block ends with its checks passing and a pushed commit.
 4. **R4.7 combined check (about 1 h).** Run district, street and realism together on the GTX 1650 and record sustained frame times, worst frames and memory in the roadmap.
 5. **R4.4 cluster LOD design (about 1 h).** Write the design for a meshlet LOD hierarchy (cluster groups simplified per level, selected by projected error) into section 10.3 before coding.
 6. **Realism review (about 1 h).** The realism pass's last item: record stills and moving shots on the GTX 1650 (settings, reference comparisons, editor/Player differences, frame-time percentiles, worst frames, peak memory) in the roadmap.
+
+### 10.0.3 The next 10 hours (planned 2026-11-25 night)
+
+The user is asleep. Work through these blocks in order without asking; each ends with its checks passing and a pushed commit, so an interruption loses at most one block. If a block cannot be finished, write down what is left and move on.
+
+**Pending when this plan was written:**
+- 10.0.2 block 2, night bounce light: the coarse probe grid (8 × 8 × 4 probes at 6 m, `ProbeGeometry.h` `CoarseVolume`) is written and builds; rendering 62/62. Not yet measured against Cycles, and the engine-session ctest overran its 120 s limit on the first run with it (it passed all day before).
+- R4.6: sun-shadow cost while streaming (1.6 against 0.7 ms), CPU spikes of 31–78 ms during streaming, an unsettled frame-time check, content too simple to save memory, no editor streaming, no impostors.
+- R4.4: cluster LOD (meshlet levels); R4.7: the combined check; the realism pass's GTX 1650 review.
+- Unconfirmed budgets: the misty street's p95 after the mist fix was measured only in a noisy session.
+
+**Blocks:**
+1. **Probe field and engine session (about 1.5 h).** Time the engine-session audit alone. If the coarse field is the cause, trace it less often (the fine grid every refresh, the coarse grid only when it moves a cell or the lights change) and cap the lamps per hit (8 nearest). Then compare the night view with Cycles with probe GI on (`WORLDFORGE_REALISM_PROBE_GI=1`): walls and FLIP. Enable probe GI in the realism views only if all four views improve or hold. Commit.
+2. **Quiet-session budgets (about 0.5 h).** Run `street`, `r3-performance` and `district` back to back and record the p95s in the handoff. If any route is over 16.7 ms, measure the previous commit in the same session before changing anything (section 5.4).
+3. **Streaming hitches (about 2 h).** Time each part of a layout rebuild in the Player (moving meshes, materials, `vertices()`, the renderer's full upload and cull-bound recompute) and log frames over 30 ms with what ran in them. Remove the largest cost: for example, give each cell its own slab in the vertex buffer so a swap uploads only that cell, and keep cull bounds per mesh across rebuilds. Then the sun-shadow cost: give each proxy mesh its own draw range so cascades cull it like the mesh it stands for. Accept when `--district-cells` passes twice in one session.
+4. **Dense district content (about 2 h).** Add a district option with per-building detail (window insets, ledges, rooftop units; a few thousand vertices per building) and a unique facade texture per building, within the format's limits. Record full residency against streaming on it: memory, p95, worst frame. Tick R4.6 for the Player if section 10.3 item 5 holds.
+5. **R4.7 combined check (about 1 h).** Run district, street and realism together and record sustained frame times, worst frames and memory in the roadmap.
+6. **R4.4 cluster LOD (about 2 h).** Write the design into section 10.3 (meshlet groups simplified level by level, each level's error bound; the cull shader picks the coarsest level whose projected error is under a pixel). Build the offline part first: the hierarchy from `Meshlets.h` with a core test that every level covers the same surface within its error.
+7. **Realism review (about 1 h).** Record stills and moving shots on the GTX 1650 in the roadmap (settings, Cycles comparisons, editor/Player differences, frame-time percentiles, worst frames, peak memory) and tick the realism pass's last item.
+
+### 10.0.4 The 10 hours after that
+
+1. **R4.4 cluster LOD at run time (about 3 h):** the cull shader selects levels per meshlet group; the indexed fallback draws the same levels; measure triangles and p95 on the dense district; editor and Player match.
+2. **Impostors (about 2 h):** bake an octahedral impostor per building (8 × 8 views of color and normal) into format 30's cell table and draw them beyond `fullRadius` instead of proxies; check the rooftop view for pops while crossing the radius.
+3. **Editor streaming (about 2 h):** the editor's large scenes use the same cells, so editing a district does not hold every cell's GPU data.
+4. **Bounce light everywhere (about 2 h):** if the coarse probe grid closed the night gap, make probe GI the default for new projects and the street starter; otherwise add a third, wider level or screen-space bounce with probe fallback. Record the four Cycles comparisons.
+5. **Docs and a final combined run (about 1 h):** roadmap, handoff and this playbook; ctest, rendering, realism, street, all district modes and the full audit.
 
 ### 10.1 Immediately
 
