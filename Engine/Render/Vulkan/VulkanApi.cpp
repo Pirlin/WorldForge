@@ -137,13 +137,13 @@ void Buffer::destroy(const Device &device)
 }
 
 bool Image::create(const Device &device,VkFormat format,VkExtent2D extent,VkImageUsageFlags usage,
-                   VkImageAspectFlags aspect,uint32_t mipLevels)
+                   VkImageAspectFlags aspect,uint32_t mipLevels,uint32_t depth)
 {
     const auto &vk = *device.api;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    info.imageType = VK_IMAGE_TYPE_2D;
+    info.imageType = depth > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.format = format;
-    info.extent = {extent.width,extent.height,1};
+    info.extent = {extent.width,extent.height,depth};
     info.mipLevels = mipLevels;
     info.arrayLayers = 1;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -162,7 +162,7 @@ bool Image::create(const Device &device,VkFormat format,VkExtent2D extent,VkImag
     }
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = depth > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = format;
     viewInfo.subresourceRange = {aspect,0,mipLevels,0,1};
     if (vk.vkCreateImageView(device.device,&viewInfo,nullptr,&view) != VK_SUCCESS) {

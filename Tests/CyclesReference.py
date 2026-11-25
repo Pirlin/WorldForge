@@ -301,7 +301,8 @@ cycles.use_adaptive_sampling = True
 cycles.adaptive_threshold = 0.01
 cycles.seed = 0
 cycles.max_bounces = 8
-cycles.diffuse_bounces = 4
+# WORLDFORGE_CYCLES_DIFFUSE_BOUNCES overrides the diffuse bounces, to measure how much of a view is bounced light.
+cycles.diffuse_bounces = int(os.environ.get("WORLDFORGE_CYCLES_DIFFUSE_BOUNCES", "4"))
 cycles.glossy_bounces = 4
 cycles.transmission_bounces = 4
 cycles.transparent_max_bounces = 8

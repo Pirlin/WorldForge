@@ -3451,6 +3451,149 @@ void sunSweepWorkflow(const QDir &output,Audit &audit,bool sunrise)
                 QString("Blue channel share above horizon: editor +%1, Player +%2").arg(editorBlue,0,'f',3).arg(playerBlue,0,'f',3));
 }
 
+// Aerial perspective on the 6 x 6 City District (realism pass item 3): seen down the ring road and across the skyline
+// in clear air, haze and dense height fog, contrast must fall with distance (more so in thicker air) while near
+// buildings stay readable, and the editor and the Player must agree. Contrast is the RMS of display luminance in a
+// region: the far region surrounds the vanishing point or the skyline, the near one the closest facades or roofs.
+void aerialPerspectiveWorkflow(const QDir &output,Audit &audit)
+{
+    const QString page = "Aerial perspective";
+    QTemporaryDir directory;
+    QString error;
+    if (!directory.isValid()) {
+        audit.check(page,"workflow","Create temporary storage for the district",false,directory.errorString());
+        return;
+    }
+    ProjectStore store(QDir(directory.filePath("index")));
+    district::Layout layout;
+    if (!store.createStarterProject("City District",{{"location",directory.filePath("City District")},{"starter","district"},
+            {"districtBlocks",layout.blocks}},error)) {
+        audit.check(page,"workflow","Create the City District starter",false,error);
+        return;
+    }
+    const auto setDisplay = [&](const QJsonObject &changes) {
+        auto details = store.environment() ? store.environment()->details : QJsonObject{};
+        for (auto it = changes.begin(); it != changes.end(); ++it)
+            details.insert(it.key(),it.value());
+        store.setAtmosphere(details);
+    };
+    setDisplay({{"skyModel","Physical"},{"sunAzimuth",135},{"sunElevation",35},{"exposureMode","Manual"},{"ev100",14},
+                {"localFogRadius",0},{"cloudCover",0}});
+    store.select({});
+    LiveViewport viewport(store,false);
+    viewport.resize(640,360);
+    viewport.show();
+    if (!waitForRender(viewport)) {
+        audit.check(page,"render","The district renders",false,QStringLiteral("No Vulkan frame"));
+        return;
+    }
+    const auto luminance = [](const QImage &image,QRectF region) {
+        // Mean and RMS deviation of display luminance in region (fractions of the image).
+        const QRect pixels(int(region.x()*image.width()),int(region.y()*image.height()),
+                           int(region.width()*image.width()),int(region.height()*image.height()));
+        double sum = 0, squares = 0;
+        qint64 count = 0;
+        for (int y = pixels.top(); y <= pixels.bottom(); ++y)
+            for (int x = pixels.left(); x <= pixels.right(); ++x) {
+                const QColor pixel = image.pixel(x,y);
+                const double value = 0.2126*pixel.redF()+0.7152*pixel.greenF()+0.0722*pixel.blueF();
+                sum += value;
+                squares += value*value;
+                ++count;
+            }
+        const double mean = count ? sum/double(count) : 0;
+        return std::pair{mean,count ? std::sqrt(std::max(0.0,squares/double(count)-mean*mean)) : 0.0};
+    };
+    const auto settled = [&](QVector3D eye,QVector3D target) {
+        viewport.setCameraPreview(eye,target);
+        QImage previous;
+        int calm = 0;
+        for (int attempt = 0; attempt < 100 && calm < 3; ++attempt) {
+            QTest::qWait(60);
+            const auto next = viewport.captureFrame().convertToFormat(QImage::Format_RGB32);
+            const double change = previous.isNull() ? 1.0
+                : std::abs(luminance(next,{0,0,1,1}).first-luminance(previous,{0,0,1,1}).first);
+            calm = change < 0.0005 ? calm+1 : 0;
+            previous = next;
+        }
+        return previous;
+    };
+    const auto playerCapture = [&](const QString &name,QVector3D eye,QVector3D target,QSize size) {
+        std::ostringstream bytes;
+        QFile package(output.filePath("aerial.wfplay"));
+        if (!WorldRuntime::exportScene(store,bytes) || !package.open(QIODevice::WriteOnly))
+            return QImage{};
+        const auto data = bytes.str();
+        const bool written = package.write(data.data(),qint64(data.size())) == qint64(data.size());
+        package.close();
+        const auto path = output.filePath(QString("aerial-player-%1.png").arg(name));
+        QStringList arguments{"--capture",package.fileName(),path,QString::number(size.width()),QString::number(size.height())};
+        for (const float value : {eye.x(),eye.y(),eye.z(),target.x(),target.y(),target.z()})
+            arguments << QString::number(value,'g',9);
+        QProcess player;
+        player.start(QDir(QCoreApplication::applicationDirPath()).filePath("WorldForgePlayer.exe"),arguments);
+        const bool captured = written && player.waitForFinished(60000) && player.exitStatus() == QProcess::NormalExit
+            && player.exitCode() == 0;
+        return captured ? QImage(path).convertToFormat(QImage::Format_RGB32) : QImage{};
+    };
+    const auto meanDifference = [](const QImage &a,const QImage &b) {
+        if (a.isNull() || a.size() != b.size())
+            return 255.0;
+        double total = 0;
+        for (int y = 0; y < a.height(); ++y)
+            for (int x = 0; x < a.width(); ++x) {
+                const QColor one = a.pixel(x,y), two = b.pixel(x,y);
+                total += std::max({std::abs(one.red()-two.red()),std::abs(one.green()-two.green()),std::abs(one.blue()-two.blue())});
+            }
+        return total/(double(a.width())*a.height());
+    };
+
+    const float edge = (layout.roadWidth-layout.extent())*0.5f; // the ring road's center line
+    struct View { const char *name; QVector3D eye, target; QRectF far, nearLeft, nearRight; };
+    // Down the ring road, the district's far side is 300 m off around the vanishing point; the first lots line the left.
+    // Over the skyline from outside a corner, the far corner (about 440 m off) meets the sky just above the middle.
+    const View views[]{
+        {"ring-road",{edge+12,edge,2},{edge+90,edge,2.5f},{0.42,0.36,0.16,0.18},{0.0,0.15,0.18,0.55},{0.0,0.15,0.18,0.55}},
+        {"skyline",{edge-30,edge-30,40},{-edge,-edge,6},{0.35,0.42,0.35,0.13},{0.25,0.8,0.3,0.19},{0.55,0.76,0.3,0.23}}};
+    // Dense fog is nearly uniform with height (1/e over 170 m), so the skyline seen from 40 m is fogged too.
+    struct Air { const char *name; QJsonObject details; };
+    const Air airs[]{{"clear",{{"fogDensity",0},{"aerialHaze",0}}},{"haze",{{"fogDensity",0},{"aerialHaze",6}}},
+                     {"fog",{{"fogDensity",0.006},{"fogFalloff",0.01},{"fogHeight",0},{"aerialHaze",0}}}};
+    for (const auto &view : views) {
+        double farContrast[3]{}, nearContrast[3]{};
+        QImage lastEditor;
+        for (int i = 0; i < 3; ++i) {
+            setDisplay(airs[i].details);
+            const auto image = settled(view.eye,view.target);
+            image.save(output.filePath(QString("aerial-%1-%2.png").arg(view.name,airs[i].name)));
+            farContrast[i] = luminance(image,view.far).second;
+            nearContrast[i] = 0.5*(luminance(image,view.nearLeft).second+luminance(image,view.nearRight).second);
+            lastEditor = image;
+        }
+        const QString name = view.name;
+        const auto ratios = QString("far/near RMS contrast: clear %1/%2, haze %3/%4, fog %5/%6")
+            .arg(farContrast[0],0,'f',4).arg(nearContrast[0],0,'f',4).arg(farContrast[1],0,'f',4).arg(nearContrast[1],0,'f',4)
+            .arg(farContrast[2],0,'f',4).arg(nearContrast[2],0,'f',4);
+        audit.check(page,"depth cues",QString("Distant buildings keep contrast in clear air (%1)").arg(name),
+                    farContrast[0] >= 0.2*nearContrast[0] && farContrast[0] > 0.01,ratios);
+        // Haze and fog take more contrast from far than near: the far share must fall below the near share.
+        const auto share = [&](int i,const double *values) { return values[0] > 0 ? values[i]/values[0] : 0.0; };
+        audit.check(page,"depth cues",QString("Haze takes more contrast from far than near buildings (%1)").arg(name),
+                    share(1,farContrast) < 0.9 && share(1,farContrast) < share(1,nearContrast)-0.05,
+                    QString("far keeps %1, near keeps %2 of clear air's contrast").arg(share(1,farContrast),0,'f',3)
+                        .arg(share(1,nearContrast),0,'f',3));
+        audit.check(page,"depth cues",QString("Dense fog hides distance while near buildings stay readable (%1)").arg(name),
+                    share(2,farContrast) < 0.5 && share(2,farContrast) < share(2,nearContrast)-0.05
+                        && share(2,nearContrast) > 0.25,
+                    QString("far keeps %1, near keeps %2 of clear air's contrast").arg(share(2,farContrast),0,'f',3)
+                        .arg(share(2,nearContrast),0,'f',3));
+        const auto played = playerCapture(name,view.eye,view.target,lastEditor.size());
+        const double parity = meanDifference(played,lastEditor);
+        audit.check(page,"editor and Player",QString("Editor and Player show the fogged district alike (%1)").arg(name),
+                    parity <= 1.5,QString("mean error %1 levels").arg(parity,0,'f',2));
+    }
+}
+
 // Fixed camera views of the Playable Street, compared with reference images in Tests/Golden.
 // Set WORLDFORGE_UPDATE_GOLDEN=1 to record new references after an intended rendering change.
 void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
@@ -3691,6 +3834,9 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
                 {"localFogRadius",9},{"localFogDensity",0.035}});
     const auto sunsetMist = settled(sunsetShot);
     sunsetMist.save(output.filePath("rendering-physical-fog-sunset.png"));
+    // The mist in front of the shop lies in its shadow. Editor and Player share the fog volume, so only a reference
+    // catches it reading the wrong froxels.
+    checkGolden("Street view with height fog and local mist at sunset","fog-sunset.png",sunsetMist);
     const auto sunsetFog = difference(sunsetMist,sunsetClear,"rendering-physical-fog-sunset-diff.png");
     std::ostringstream sunsetPlayable;
     QFile sunsetFile(playablePath);
@@ -7881,6 +8027,7 @@ int main(int argc, char **argv)
     const bool rendering = app.arguments().size() == 4 && app.arguments().last() == "--rendering";
     const bool sunrise = app.arguments().size() == 4 && app.arguments().last() == "--sunrise";
     const bool sunset = app.arguments().size() == 4 && app.arguments().last() == "--sunset";
+    const bool aerialPerspective = app.arguments().size() == 4 && app.arguments().last() == "--aerial-perspective";
     const bool realism = app.arguments().size() == 4 && app.arguments().last() == "--realism";
     const bool engineSession = app.arguments().size() == 4 && app.arguments().last() == "--engine-session";
     const bool programming = app.arguments().size() == 4 && app.arguments().last() == "--programming";
@@ -7888,7 +8035,7 @@ int main(int argc, char **argv)
     const bool surfaceLibrary = app.arguments().size() == 4 && app.arguments().last() == "--surface-library";
     const bool studioUv = app.arguments().size() == 4 && app.arguments().last() == "--studio-uv";
     const bool studioCharacter = app.arguments().size() == 4 && app.arguments().last() == "--studio-character";
-    if (!authoring && !benchmark && !studio && !forgeAi && !streetAudit && !r3Performance && !streetProfile && !districtAudit && !rendering && !sunrise && !sunset && !realism && !engineSession
+    if (!authoring && !benchmark && !studio && !forgeAi && !streetAudit && !r3Performance && !streetProfile && !districtAudit && !rendering && !sunrise && !sunset && !aerialPerspective && !realism && !engineSession
         && !surfaceLibrary && !studioUv && !studioCharacter && !programming && !nativeGameplay && app.arguments().size() != 3)
         return 2;
     const QDir output(app.arguments().at(1));
@@ -7943,6 +8090,11 @@ int main(int argc, char **argv)
     }
     if (realism) {
         realismWorkflow(output,root,audit);
+        controls.flush();
+        return audit.failures ? 1 : 0;
+    }
+    if (aerialPerspective) {
+        aerialPerspectiveWorkflow(output,audit);
         controls.flush();
         return audit.failures ? 1 : 0;
     }

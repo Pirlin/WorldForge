@@ -1,0 +1,91 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Fills the fog volume (Engine/Render/Vulkan/FogVolume.h) before the scene pass. One invocation walks one froxel
+// column from the eye outward, taking one sun visibility lookup per slice (and the lamp light inside the local mist),
+// and stores the running totals at each slice's center depth:
+//   slices 0 to fogVolumeSize.z - 1: the mist's lamp light in RGB (times fogVolumeLampScale), and in alpha the share of
+//     the mist's opacity that is in the sun's shadow;
+//   the next fogVolumeSize.z slices: in red, the share of the height fog's opacity that is in the sun's shadow.
+// A pixel reads both at its own depth (Lighting.glsl fogVolumeAt), one filtered texel each, while its own fog and mist
+// transmission stays exact. The lookup points move within their slices each TAA frame, so the resolve averages them.
+#define LIGHTING_COMPUTE
+#include "Lighting.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image3D volume;
+layout(push_constant) uniform VolumeView {
+    mat4 inverseViewProjection; // clip space (with this frame's jitter) to world space
+    vec4 eye;
+    vec4 fog;                   // height fog density, falloff and base height, as heightFog takes them
+} volumeView;
+
+vec3 worldAt(vec2 uv,float z)
+{
+    vec4 p = volumeView.inverseViewProjection*vec4(uv*2.0-1.0,z,1.0);
+    return p.xyz/p.w;
+}
+
+void main()
+{
+    ivec2 column = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(column,ivec2(fogVolumeSize.xy))))
+        return;
+    // An R3 low-discrepancy offset per TAA frame, the same for every column.
+    vec3 offset = fract(vec3(0.5)+lighting.settings.z*vec3(0.81917251,0.67104360,0.54970047));
+    vec2 uv = (vec2(column)+offset.xy)/fogVolumeSize.xy;
+    lightingCoord = vec4(uv*lighting.clusterViewport.xy,0.5,1.0);
+    vec3 eye = volumeView.eye.xyz;
+    vec3 direction = normalize(worldAt(uv,1.0)-worldAt(uv,0.0));
+    float along = max(dot(direction,lighting.clusterForward.xyz),0.05);
+    bool sunlit = lighting.sun.w > 0.0 && lighting.settings.y > 0.5;
+
+    // Height fog, as heightFog integrates it, within the sun cascades' range.
+    float density = volumeView.fog.x, falloff = volumeView.fog.y;
+    bool fog = sunlit && density > 0.0;
+    float logAtEye = (volumeView.fog.z-eye.z)*falloff, logSlope = -direction.z*falloff;
+    float shadowRange = lighting.cascadeScales[3].z/max(0.2,along);
+
+    // The local mist's sphere along the column, as localMist finds it.
+    float radius = lighting.fogCenterRadius.w;
+    vec3 origin = eye-lighting.fogCenterRadius.xyz;
+    float b = dot(origin,direction);
+    float d = b*b-dot(origin,origin)+radius*radius;
+    bool mist = radius > 0.0 && lighting.settings.x > 0.0 && d > 0.0;
+    float halfChord = sqrt(max(d,0.0));
+    float nearHit = max(0.0,-b-halfChord), farHit = max(0.0,-b+halfChord);
+    mist = mist && farHit > nearHit;
+    float radialOffset = radius > 0.0 ? max(0.0,dot(origin,origin)-b*b)/(radius*radius) : 0.0;
+    bool lamps = mist && lighting.skySettings.z > 0.5 && clusterHeader.x > clusterHeader.y;
+
+    float fogBefore = 1.0, mistBefore = 1.0, fogBlocked = 0.0, mistBlocked = 0.0, previous = 0.0;
+    vec3 lamplight = vec3(0.0);
+    for (int slice = 0; slice < int(fogVolumeSize.z); ++slice) {
+        float depth = fogVolumeDepth((float(slice)+0.5)/fogVolumeSize.z);
+        float distance = depth/along;
+        // The mist's part of this step, if any; the lookup goes there, where it matters most.
+        float mistStart = clamp(previous,nearHit,farHit), mistEnd = clamp(distance,nearHit,farHit);
+        bool inMist = mist && mistEnd > mistStart;
+        float sampleAt = inMist ? mix(mistStart,mistEnd,offset.z) : mix(previous,distance,offset.z);
+        bool fogStep = fog && previous < shadowRange;
+        vec3 point = eye+direction*sampleAt;
+        float shadow = (fogStep || inMist) && sunlit ? 1.0-sunVisibility(point,vec3(0.0),false) : 0.0;
+        if (fogStep) {
+            float after = heightFogTransmission(distance,logAtEye,logSlope,density);
+            fogBlocked += (fogBefore-after)*shadow*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
+            fogBefore = after;
+        }
+        if (inMist) {
+            float place = (b+sampleAt)/radius;
+            float local = 1.0-smoothstep(0.60,1.0,sqrt(radialOffset+place*place));
+            float after = mistBefore*exp(-lighting.settings.x*(mistEnd-mistStart)*local);
+            float weight = mistBefore-after;
+            mistBlocked += weight*shadow;
+            if (lamps)
+                lamplight += weight*lampMistLight(point,direction,sampleAt*along);
+            mistBefore = after;
+        }
+        imageStore(volume,ivec3(column,slice),vec4(min(lamplight*fogVolumeLampScale,vec3(60000.0)),mistBlocked));
+        imageStore(volume,ivec3(column,slice+int(fogVolumeSize.z)),vec4(fogBlocked,0.0,0.0,0.0));
+        previous = distance;
+    }
+}

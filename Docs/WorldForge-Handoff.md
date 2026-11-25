@@ -33,6 +33,7 @@ Put Qt on PATH first (`%LOCALAPPDATA%/WorldForge/Qt/6.8.3/msvc2022_64/bin`), the
 | `--street` | Needs `WORLDFORGE_STUDIO_TEST_FORGE=1`. Reports frame times. |
 | `--r3-performance` | The street mission in the Player with R3 lighting off, then on. |
 | `--district` | Generates the City District (R4 test scene), flies the Player's `--verify-district` route, and records frame, CPU and per-pass GPU times, draw calls, triangles and memory. |
+| `--aerial-perspective` | The district in clear air, haze and fog: contrast must fall with distance, near buildings stay readable, editor and Player match. |
 
 `Tests/Run-Verification.ps1` builds and runs any of these one after another and prints a summary (see the playbook, section 4).
 
@@ -42,6 +43,7 @@ Put Qt on PATH first (`%LOCALAPPDATA%/WorldForge/Qt/6.8.3/msvc2022_64/bin`), the
 - Timings depend on the Windows power plan. Before blaming a change, measure the previous commit in the same session.
 
 ## Frame architecture (`Engine/Render/Vulkan/HdrFrame.*`, shared by the editor and the Player)
+0. **Fog volume** (`FogVolume.comp`, `Vulkan/FogVolume.*`). After the shadow maps, a compute pass sums the shadowed share of height fog and local mist and the mist's lamp light along each of 160 × 90 froxel columns (64 log-spaced slices to `probeSettings.w` meters). The scene and sky shaders read it at set 0 binding 12.
 1. **Scene pass.** Writes four color targets (scene; indirect sky light with the depth along the camera's forward axis in alpha; albedo plus fog transmission; each surface's own motion, from previous vertex positions as a second vertex stream, see `SceneMotion.glsl`) and depth. Shading is in `Shaders/Shading.glsl` and `Lighting.glsl`. Screen-space reflections and contact shadows trace the previous frame's TAA result here (binding 8, `HdrFrame::previousFrame`), which the renderers rebind every frame. The editor restarts the TAA average one frame after a camera move or edit, so averaged frames never trace another view.
 2. **Occlusion pass.** GTAO plus screen-space bounce light (`Ambient.frag`).
 3. **Bloom.** Built from the previous frame's history (`BloomDown`/`BloomUp.frag`).

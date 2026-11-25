@@ -116,10 +116,13 @@ if(Vulkan_INCLUDE_DIR AND WORLDFORGE_GLSLANG)
     worldforge_spirv(Engine/Render/Shaders/CullDraws.comp "${cull_shader}" spirv_CullDraws_comp)
     set(reduce_depth_shader "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders/ReduceDepth_comp.h")
     worldforge_spirv(Engine/Render/Shaders/ReduceDepth.comp "${reduce_depth_shader}" spirv_ReduceDepth_comp)
+    set(fog_volume_shader "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders/FogVolume_comp.h")
+    worldforge_spirv(Engine/Render/Shaders/FogVolume.comp "${fog_volume_shader}" spirv_FogVolume_comp)
     target_sources(WorldForgeVulkan PRIVATE
         Engine/Render/Vulkan/ProbeTrace.cpp Engine/Render/Vulkan/ProbeTrace.h "${probe_shader}"
         Engine/Render/Vulkan/DrawCulling.cpp Engine/Render/Vulkan/DrawCulling.h "${cull_shader}"
-        Engine/Render/Vulkan/OcclusionDepth.cpp Engine/Render/Vulkan/OcclusionDepth.h "${reduce_depth_shader}")
+        Engine/Render/Vulkan/OcclusionDepth.cpp Engine/Render/Vulkan/OcclusionDepth.h "${reduce_depth_shader}"
+        Engine/Render/Vulkan/FogVolume.cpp Engine/Render/Vulkan/FogVolume.h "${fog_volume_shader}")
     target_include_directories(WorldForgeVulkan PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders")
     target_link_libraries(WorldForgeVulkan PRIVATE ${CMAKE_DL_LIBS})
 endif()

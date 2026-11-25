@@ -6,6 +6,7 @@
 #include "Engine/Render/Vulkan/ProbeTrace.h"
 #include "Engine/Render/Vulkan/DrawCulling.h"
 #include "Engine/Render/Vulkan/OcclusionDepth.h"
+#include "Engine/Render/Vulkan/FogVolume.h"
 
 #include <vulkan/vulkan_win32.h>
 
@@ -259,6 +260,8 @@ private:
     vk::ProbeField probeField_;
     vk::DrawCulling drawCulling_;
     vk::OcclusionDepth occlusionDepth_;
+    vk::FogVolume fogVolume_;
+    bool fogVolumeNeeded_ = false; // this frame fills the fog volume (updateProbes)
     std::vector<vk::DrawBounds> cullBatches_;
     std::vector<std::pair<float,uint32_t>> opaqueOrder_; // squared distance to the camera, range index
     std::vector<vk::DrawBounds> orderBounds_; // range boxes for that order when the frame is not GPU-culled
@@ -405,7 +408,7 @@ bool VulkanRenderer::start(HWND window,std::wstring &error)
         error = L"Vulkan could not create the HDR frame pass.";
         return false;
     }
-    if (!createLayouts() || !createPipelines() || !createFrames()) {
+    if (!createLayouts() || !fogVolume_.create(device_,frameLayout_) || !createPipelines() || !createFrames()) {
         error = L"Vulkan could not create the Player pipelines.";
         return false;
     }
@@ -579,22 +582,24 @@ bool VulkanRenderer::createLayouts()
     constexpr auto both = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     const VkShaderStageFlags geometryStages = both | (meshShaders_ ? uint32_t(VK_SHADER_STAGE_MESH_BIT_EXT) : 0u);
     const VkDescriptorSetLayoutBinding frameBindings[]{
-        {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,geometryStages,nullptr},
+        // FogVolume.comp reads the shadow map, the Lighting block, the lamps and their shadows.
+        {0,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+        {1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,geometryStages | VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
         {3,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,geometryStages,nullptr},
         {4,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
-        {7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+        {7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
         {8,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {9,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
+        {vk::FogVolume::binding,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr},
         {10,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_MESH_BIT_EXT,nullptr},
         {11,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_MESH_BIT_EXT,nullptr}};
     std::array<VkDescriptorSetLayoutBinding,materialTextureCount> materialBindings{};
     for (uint32_t i = 0; i < materialBindings.size(); ++i)
         materialBindings[i] = {i,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
     const VkDescriptorSetLayoutCreateInfo frameInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,
-        meshShaders_ ? 11u : 9u,frameBindings};
+        meshShaders_ ? 12u : 10u,frameBindings};
     const VkDescriptorSetLayoutCreateInfo materialInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,
         uint32_t(materialBindings.size()),materialBindings.data()};
     if (api_.vkCreateDescriptorSetLayout(device,&frameInfo,nullptr,&frameLayout_) != VK_SUCCESS
@@ -756,7 +761,7 @@ bool VulkanRenderer::createPipelines()
 
 bool VulkanRenderer::createFrames()
 {
-    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,4*framesInFlight},
+    const VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,5*framesInFlight},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,2*framesInFlight},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,(meshShaders_ ? 5u : 3u)*framesInFlight}};
     const VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,nullptr,0,framesInFlight,3,sizes};
@@ -808,6 +813,7 @@ bool VulkanRenderer::createFrames()
         const VkDescriptorBufferInfo view{frame.view.buffer,0,sizeof(PlayViewBlock)};
         const VkDescriptorBufferInfo environment{frame.environment.buffer,0,color::mapTexels*sizeof(std::array<float,4>)};
         const VkDescriptorBufferInfo clusters{frame.clusters.buffer,0,lights::Clusters::bufferBytes};
+        const auto fogVolume = fogVolume_.descriptor();
         const VkWriteDescriptorSet writes[]{
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,0,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&shadow,nullptr,nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,1,0,1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,nullptr,&lighting,nullptr},
@@ -815,8 +821,9 @@ bool VulkanRenderer::createFrames()
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,4,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&skyMaps,nullptr,nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,5,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&environment,nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,6,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&clusters,nullptr},
-            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,7,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&pointShadows,nullptr,nullptr}};
-        api_.vkUpdateDescriptorSets(device,7,writes,0,nullptr);
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,7,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&pointShadows,nullptr,nullptr},
+            {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,vk::FogVolume::binding,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&fogVolume,nullptr,nullptr}};
+        api_.vkUpdateDescriptorSets(device,8,writes,0,nullptr);
     }
     return true;
 }
@@ -1377,7 +1384,12 @@ void VulkanRenderer::updateProbes(Frame &frame,std::span<const PlayVertex> verti
     }
     frame.probes = probeField_.trace();
     const auto grid = probeField_.grid();
-    const std::array settings{view.probeGi ? 1.f : 0.f,view.reflectionProbes ? 1.f : 0.f,view.sky.y > 0.5f ? 1.f : 0.f,0.f};
+    // w: how far the fog volume reaches, when this frame fills it.
+    const float mist[4]{view.fogCenterRadius.x,view.fogCenterRadius.y,view.fogCenterRadius.z,view.fogCenterRadius.w};
+    const float eye[3]{view.eye.x,view.eye.y,view.eye.z};
+    fogVolumeNeeded_ = fogVolume_.ready() && vk::FogVolume::needed(view.fog.w,view.lighting.y > 0.5f,view.sun.w,mist,view.lighting.x);
+    const std::array settings{view.probeGi ? 1.f : 0.f,view.reflectionProbes ? 1.f : 0.f,view.sky.y > 0.5f ? 1.f : 0.f,
+        fogVolumeNeeded_ ? vk::FogVolume::reach(view.cascades.scales[3][2],eye,mist) : 0.f};
     std::memcpy(data+offsetof(LightingBlock,probeGrid),grid.data(),sizeof(grid));
     std::memcpy(data+offsetof(LightingBlock,probeSettings),settings.data(),sizeof(settings));
     const VkDescriptorBufferInfo info{frame.probes ? frame.probes->output().buffer : frame.clusters.buffer,0,
@@ -1584,6 +1596,16 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
     }
     pointShadowsRendered_ = clusters_.shadowed;
 
+    // The fog volume reads the shadow maps drawn above.
+    if (fogVolumeNeeded_) {
+        vk::FogVolume::View volumeView;
+        volumeView.inverseViewProjection = occlusion.inverseViewProjection;
+        volumeView.eye = {view.eye.x,view.eye.y,view.eye.z,0};
+        volumeView.fog = {view.fog.w,view.horizon.w,view.zenith.w,0};
+        fogVolume_.record(command,frame.set,volumeView);
+    } else {
+        fogVolume_.prepare(command);
+    }
     stamp(RenderStats::PointShadows);
     const auto background = color::srgbToLinear({0.05f,0.06f,0.07f});
     target.begin(command,output,background.data());
@@ -1946,6 +1968,7 @@ void VulkanRenderer::release()
         ringCachedMeshVertices_ = {};
         drawCulling_.destroy();
         occlusionDepth_.destroy();
+        fogVolume_.destroy();
         probeField_.clear();
         for (auto &frame : frames_) {
             frame.probes.reset();

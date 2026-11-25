@@ -33,6 +33,7 @@
 #include "Engine/Render/Vulkan/ProbeTrace.h"
 #include "Engine/Render/Vulkan/DrawCulling.h"
 #include "Engine/Render/Vulkan/OcclusionDepth.h"
+#include "Engine/Render/Vulkan/FogVolume.h"
 
 #include <algorithm>
 #include <cmath>
@@ -2277,6 +2278,10 @@ public:
             window_.report(QObject::tr("Vulkan could not create the HDR scene pass."));
         else {
             probeCompute_ = frame_.device().supportsCompute(window_.graphicsQueueFamilyIndex());
+            if (fogVolume_.create(frame_.device(),lighting_.layout()))
+                lighting_.bindFogVolume(fogVolume_.descriptor());
+            else
+                window_.report(QObject::tr("Vulkan could not create the fog volume."));
             if (probeCompute_ && !window_.modelOnly_) {
                 VkPhysicalDeviceFeatures features{};
                 const auto &device = frame_.device();
@@ -2342,6 +2347,7 @@ public:
     {
         drawCulling_.destroy();
         occlusionDepth_.destroy();
+        fogVolume_.destroy();
         cullBatches_.clear();
         probeFrames_.clear();
         probeField_.clear();
@@ -2613,6 +2619,12 @@ public:
         // TAA averages lookups split across frames; the rendering audit compares flicker with every lookup taken.
         const bool fullLookups = qEnvironmentVariableIntValue("WORLDFORGE_FULL_LOOKUPS") == 1;
         lighting.probeSettings[2] = environment.temporalAntiAliasing && !fullLookups ? 1.0f : 0.0f;
+        // How far the fog volume reaches, on frames that fill it (FogVolume.h).
+        const bool fogVolumeNeeded = fogVolume_.ready() && wf::vk::FogVolume::needed(environment.fogDensity,shadows,sunStrength,
+            lighting.fogCenterRadius,lighting.settings[0]);
+        const float viewerPosition[3]{viewer.x(),viewer.y(),viewer.z()};
+        lighting.probeSettings[3] = fogVolumeNeeded
+            ? wf::vk::FogVolume::reach(cascades.scales[3][2],viewerPosition,lighting.fogCenterRadius) : 0.0f;
         auto &probeFrame = probeFrames_[std::size_t(frameIndex)];
         probeFrame = probeField_.trace();
         lighting_.bindProbes(frameIndex,probeFrame ? probeFrame->output().buffer : VK_NULL_HANDLE,
@@ -2697,9 +2709,19 @@ public:
                 }
             }
             pointShadowsRendered_ = lightClusters.shadowed;
+            // The fog volume reads the shadow maps drawn above, through the jittered camera the scene uses.
+            if (fogVolumeNeeded) {
+                wf::vk::FogVolume::View volumeView;
+                const auto inverse = sceneCamera.inverted();
+                std::copy_n(inverse.constData(),16,volumeView.inverseViewProjection.begin());
+                volumeView.eye = {viewer.x(),viewer.y(),viewer.z(),0};
+                volumeView.fog = {environment.fogDensity,environment.fogFalloff,environment.fogHeight,0};
+                fogVolume_.record(command,lighting_.descriptor(frameIndex),volumeView);
+            }
         } else {
             skyValid_ = false; // nothing was drawn; render the maps on the next ready frame
         }
+        fogVolume_.prepare(command); // a no-op once the volume has its layout
         frame_.begin(command,window_.currentSwapChainImageIndex(),background.data());
         if (ready) {
             const VkViewport viewport{0, 0, float(size.width()), float(size.height()), 0, 1};
@@ -3197,6 +3219,7 @@ private:
     wf::vk::ProbeField probeField_;
     wf::vk::DrawCulling drawCulling_;
     wf::vk::OcclusionDepth occlusionDepth_;
+    wf::vk::FogVolume fogVolume_;
     std::vector<wf::vk::DrawBounds> cullBatches_;
     quint64 cullRevision_ = 0;
     bool culledWithGlass_ = false;

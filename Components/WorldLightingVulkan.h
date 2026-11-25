@@ -56,6 +56,8 @@ public:
     // Binding 8: the previous frame's TAA result (HdrFrame::previousFrame), which changes every frame.
     void bindPreviousFrame(int frame,VkSampler sampler,VkImageView view);
     void bindProbes(int frame,VkBuffer buffer,VkDeviceSize bytes);
+    // Binding 12: the fog volume (Engine/Render/Vulkan/FogVolume.h), shared by all frames. Bind it before the first frame.
+    void bindFogVolume(const VkDescriptorImageInfo &volume);
     // The sky visibility maps (Engine/Render/SkyVisibility.h), rendered with pass() like the shadow atlas.
     // One set shared by all frames: the viewport re-renders it only when the scene changes.
     VkFramebuffer skyFramebuffer() const { return sky_.framebuffer; }

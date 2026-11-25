@@ -5,6 +5,15 @@
 // shadows (PCSS): a blocker search finds how far the occluders are, and the filter then spans the penumbra the
 // sun's disc casts over that distance, so contact shadows are sharp and long ones soften as they do in Cycles.
 // The filter pattern turns each TAA frame, which averages it out.
+//
+// FogVolume.comp includes this file with LIGHTING_COMPUTE defined: its froxel's pixel position stands in for
+// gl_FragCoord, which compute shaders lack.
+#ifdef LIGHTING_COMPUTE
+vec4 lightingCoord;
+#define LIGHTING_COORD lightingCoord
+#else
+#define LIGHTING_COORD gl_FragCoord
+#endif
 layout(set = 0, binding = 0) uniform sampler2D shadowMap; // the cascade atlas, 2 x 2 tiles, nearest
 layout(std140, set = 0, binding = 1) uniform Lighting {
     mat4 cascadeMatrices[4]; // world space to each cascade: x, y in [-1, 1], depth in [0, 1] away from the sun
@@ -34,7 +43,9 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     mat4 previousViewProjection;
     vec4 reflectionSettings;
     vec4 probeGrid;        // origin in world meters, spacing (0 when disabled)
-    vec4 probeSettings;    // diffuse GI on, reflection probes on, TAA on (split lookups average over its frames)
+    // diffuse GI on, reflection probes on, TAA on (split lookups average over its frames), and how far the fog volume
+    // reaches along the camera's forward axis in meters (0 when it was not filled this frame)
+    vec4 probeSettings;
     vec4 skyIrradianceBand4[9]; // band-4 coefficients of sky irradiance / pi (SkyLight.h shBasis4)
 } lighting;
 layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles, one per sky direction, nearest
@@ -59,11 +70,46 @@ layout(set = 0, binding = 7) uniform sampler2D pointShadowMap;
 layout(set = 0, binding = 8) uniform sampler2D previousFrame;
 layout(std430, set = 0, binding = 9) readonly buffer LightProbes { vec4 probeData[]; };
 
+// The fog volume (Engine/Render/Vulkan/FogVolume.h, filled by FogVolume.comp): froxels over the view, fogVolumeSize.xy
+// tiles of the viewport and fogVolumeSize.z slices spaced evenly in log depth from fogVolumeNear to
+// lighting.probeSettings.w meters along the camera's forward axis. Its depth holds two stacks of fogVolumeSize.z
+// slices: the local mist's lamp light (RGB, times fogVolumeLampScale) and shadowed share of opacity (alpha), then the
+// height fog's shadowed share of opacity (red), each summed from the eye to the slice. So the fog and the mist read one
+// filtered texel at the pixel's depth instead of marching shadow lookups and the lamp loop.
+const vec3 fogVolumeSize = vec3(160.0,90.0,64.0);
+const float fogVolumeNear = 0.5;
+const float fogVolumeLampScale = 1.0/1024.0;
+#ifndef LIGHTING_COMPUTE
+layout(set = 0, binding = 12) uniform sampler3D fogVolume;
+#endif
+
+// The volume's slice coordinate in [0, 1] at depth meters along the camera's forward axis, and back.
+float fogVolumeSlice(float depth)
+{
+    return log(max(depth,fogVolumeNear)/fogVolumeNear)/log(max(lighting.probeSettings.w,2.0*fogVolumeNear)/fogVolumeNear);
+}
+
+float fogVolumeDepth(float slice)
+{
+    return fogVolumeNear*pow(max(lighting.probeSettings.w,2.0*fogVolumeNear)/fogVolumeNear,slice);
+}
+
+#ifndef LIGHTING_COMPUTE
+// The volume on this pixel's ray at depth meters along the camera's forward axis: stack 0 (mist) or 1 (height fog),
+// filtered within the stack.
+vec4 fogVolumeAt(float depth,int stack)
+{
+    vec2 uv = LIGHTING_COORD.xy/max(lighting.clusterViewport.xy,vec2(1.0));
+    float slice = clamp(fogVolumeSlice(depth)*fogVolumeSize.z,0.5,fogVolumeSize.z-0.5);
+    return textureLod(fogVolume,vec3(uv,(slice+float(stack)*fogVolumeSize.z)/(2.0*fogVolumeSize.z)),0.0);
+}
+#endif
+
 uvec2 pointLightCluster(float depth)
 {
     const float nearDepth = 0.1, farDepth = 1000.0;
     int slice = depth <= nearDepth ? 0 : clamp(int(log(depth/nearDepth)/log(farDepth/nearDepth)*24.0),0,23);
-    ivec2 tile = clamp(ivec2(gl_FragCoord.xy/max(lighting.clusterViewport.xy,vec2(1.0))*vec2(16.0,9.0)),ivec2(0),ivec2(15,8));
+    ivec2 tile = clamp(ivec2(LIGHTING_COORD.xy/max(lighting.clusterViewport.xy,vec2(1.0))*vec2(16.0,9.0)),ivec2(0),ivec2(15,8));
     return clusterRanges[(slice*9+tile.y)*16+tile.x];
 }
 
@@ -197,7 +243,7 @@ float sunVisibility(vec3 position,vec3 normal,bool soft)
         return 1.0;
     float noise = 0.5;
     if (soft) {
-        vec2 pixel = gl_FragCoord.xy+5.588238*lighting.settings.z;
+        vec2 pixel = LIGHTING_COORD.xy+5.588238*lighting.settings.z;
         noise = fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
     }
     vec3 coordinates;
@@ -231,7 +277,7 @@ float sunVisibility(vec3 position,vec3 normal,bool soft)
     // With TAA each pixel takes every other tap of both disks, alternating in a
     // checkerboard that flips each frame, and the resolve averages the halves. Without TAA every tap is taken.
     int stride = lighting.probeSettings.z > 0.5 ? 2 : 1;
-    int first = stride == 2 ? (int(gl_FragCoord.x)+int(gl_FragCoord.y)+int(lighting.settings.z)) & 1 : 0;
+    int first = stride == 2 ? (int(LIGHTING_COORD.x)+int(LIGHTING_COORD.y)+int(lighting.settings.z)) & 1 : 0;
     float blockers = 0.0, count = 0.0;
     for (int i = first; i < 16; i += stride) {
         float depth = cascadeDepth(cascade,coordinates.xy+rotation*shadowDisk[i]*searchTexels/texels);
@@ -276,12 +322,7 @@ void physicalFogLighting(vec3 direction,vec3 tint,out vec3 ambient,out vec3 dire
     direct = tint*lighting.sunTint.rgb*lighting.sun.w*phase;
 }
 
-float fogShadowJitter()
-{
-    float pixelNoise = fract(52.9829189*fract(dot(gl_FragCoord.xy,vec2(0.06711056,0.00583715))));
-    return fract(pixelNoise+lighting.settings.z*0.61803399);
-}
-
+#ifndef LIGHTING_COMPUTE
 // RGB is in-scattered light and alpha is the fraction of the background that reaches the eye.
 vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,float falloff,float base)
 {
@@ -302,60 +343,11 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
         scatter = tint*(1.0-sunShare);
         sunlight = tint*lighting.sunTint.rgb*sunShare;
     }
+    // The share of the fog's opacity in the sun's shadow, summed along this froxel column up to the surface (within the
+    // sun cascades' range; fog beyond it still attenuates and scatters light).
     float blocked = 0.0;
-    if (lighting.settings.y > 0.5 && lighting.sun.w > 0.0 && opacity > 0.0001) {
-        // Spend the samples within shadow map range. Fog beyond it still attenuates and scatters light.
-        float shadowRange = lighting.cascadeScales[3].z/max(0.2,dot(direction,lighting.clusterForward.xyz));
-        float marchEnd = min(distance,shadowRange);
-        vec2 pixel = gl_FragCoord.xy+5.588238*lighting.settings.z;
-        float jitter = physical ? fogShadowJitter() : fract(52.9829189*fract(dot(pixel,vec2(0.06711056,0.00583715))));
-        const int steps = 8; // TAA turns the jitter each frame, so a still view averages 128 samples
-        // With TAA, neighboring segments share one shadow lookup, placed in either by its
-        // share of their extinction, as the local mist does. Without TAA each segment takes its own.
-        bool paired = lighting.probeSettings.z > 0.5;
-        // Pairs also alternate between frames (the same pairs across the screen, so neighboring pixels branch
-        // alike), each taking its lookup at twice the weight.
-        int parity = int(lighting.settings.z) & 1;
-        float start = 0.0, before = 1.0;
-        for (int i = 0; i < steps; i += 2) {
-            float middle = marchEnd*float((i+1)*(i+1))/float(steps*steps);
-            float end = marchEnd*float((i+2)*(i+2))/float(steps*steps);
-            float between = heightFogTransmission(middle,logAtEye,logSlope,density);
-            float after = heightFogTransmission(end,logAtEye,logSlope,density);
-            float nearWeight = before-between, farWeight = between-after;
-            if (paired) {
-                float weight = nearWeight+farWeight;
-                if (weight > 0.00001 && ((i/2+parity) & 1) == 0) {
-                    float share = nearWeight/weight;
-                    float sampleAt = jitter < share ? mix(start,middle,jitter/max(share,1e-6))
-                        : mix(middle,end,(jitter-share)/max(1.0-share,1e-6));
-                    float shadow = 1.0-sunVisibility(eye+direction*sampleAt,vec3(0.0),false);
-                    blocked += 2.0*weight*shadow*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
-                }
-                if (physical)
-                    jitter = fract(jitter+0.61803399);
-            } else {
-                if (nearWeight > 0.00001) {
-                    float sampleAt = mix(start,middle,jitter);
-                    float shadow = 1.0-sunVisibility(eye+direction*sampleAt,vec3(0.0),false);
-                    blocked += nearWeight*shadow*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
-                }
-                if (physical)
-                    jitter = fract(jitter+0.61803399);
-                if (farWeight > 0.00001) {
-                    float sampleAt = mix(middle,end,jitter);
-                    float shadow = 1.0-sunVisibility(eye+direction*sampleAt,vec3(0.0),false);
-                    blocked += farWeight*shadow*(1.0-smoothstep(0.75*shadowRange,shadowRange,sampleAt));
-                }
-                if (physical)
-                    jitter = fract(jitter+0.61803399);
-            }
-            if (after < 0.001)
-                break;
-            start = end;
-            before = after;
-        }
-    }
+    if (lighting.settings.y > 0.5 && lighting.sun.w > 0.0 && opacity > 0.0001 && lighting.probeSettings.w > 0.0)
+        blocked = fogVolumeAt(distance*dot(direction,lighting.clusterForward.xyz),1).r;
     return vec4(scatter*opacity+sunlight*max(0.0,opacity-blocked),transmission);
 }
 
@@ -394,59 +386,40 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
     vec3 direct = tint*min(0.73,0.62*sunlight);
     if (physical)
         physicalFogLighting(direction,tint,ambient,direct);
-    bool shadowed = lighting.settings.y > 0.5 && any(greaterThan(direct,vec3(0.0)));
-    bool lamps = physical && clusterHeader.x > clusterHeader.y;
-    float jitter = physical && (shadowed || lamps) ? fogShadowJitter() : 0.5;
-    // Keep ten density samples. In physical mode two neighboring samples share one shadow query,
-    // with each half selected in proportion to its contribution to the segment's optical depth.
+    bool volume = lighting.probeSettings.w > 0.0;
+    bool shadowed = volume && lighting.settings.y > 0.5 && any(greaterThan(direct,vec3(0.0)));
+    bool lamps = volume && physical && clusterHeader.x > clusterHeader.y;
+    // Ten density samples (five segments of two in physical mode) give the mist's opacity along this pixel's ray.
     int segments = physical ? 5 : 10;
     float stepSize = (farHit-nearHit)/float(segments);
     float transmission = 1.0;
-    float blocked = 0.0;
-    vec3 lamplight = vec3(0.0);
     float radialOffset = max(0.0,dot(origin,origin)-b*b)/(radius*radius);
     float densityStep = lighting.settings.x*stepSize;
-    // With TAA each segment takes its lookups on alternate frames at twice the weight, the same segments across the
-    // screen so neighboring pixels branch alike; the resolve averages them. Without TAA every segment takes them.
-    bool alternate = lighting.probeSettings.z > 0.5;
-    int parity = int(lighting.settings.z) & 1;
     for (int i = 0; i < segments; ++i) {
         float start = nearHit+float(i)*stepSize;
         float fraction = physical ? 0.25 : 0.5;
         float along = (b+start+fraction*stepSize)/radius;
-        float first = 1.0-smoothstep(0.60,1.0,sqrt(radialOffset+along*along));
-        float density = first;
+        float density = 1.0-smoothstep(0.60,1.0,sqrt(radialOffset+along*along));
         if (physical) {
             along += 0.5*stepSize/radius;
-            float second = 1.0-smoothstep(0.60,1.0,sqrt(radialOffset+along*along));
-            density = (first+second)*0.5;
+            density = (density+1.0-smoothstep(0.60,1.0,sqrt(radialOffset+along*along)))*0.5;
         }
-        float after = transmission*exp(-densityStep*density);
-        float weight = transmission-after;
-        if ((shadowed || lamps) && weight > 0.00001 && (!alternate || ((i+parity) & 1) == 0)) {
-            float share = alternate ? 2.0*weight : weight;
-            float sampleAt = 0.5;
-            if (physical) {
-                // Pick the subsegment by its extinction weight, including attenuation by the first half.
-                float midpoint = transmission*exp(-0.5*densityStep*first);
-                float nearWeight = (transmission-midpoint)/weight;
-                sampleAt = jitter < nearWeight ? 0.5*jitter/max(nearWeight,1e-6)
-                    : 0.5+0.5*(jitter-nearWeight)/max(1.0-nearWeight,1e-6);
-            }
-            float distance = start+sampleAt*stepSize;
-            vec3 point = eye+direction*distance;
-            if (shadowed)
-                blocked += share*(1.0-sunVisibility(point,vec3(0.0),false));
-            if (lamps)
-                lamplight += share*lampMistLight(point,direction,distance*dot(direction,lighting.clusterForward.xyz));
-        }
-        transmission = after;
-        if (physical)
-            jitter = fract(jitter+0.61803399);
+        transmission *= exp(-densityStep*density);
     }
     float opacity = 1.0-transmission;
+    // The shadowed share of that opacity and the lamp light scattered toward the eye, summed along this froxel column
+    // up to the surface or the far side of the mist.
+    float blocked = 0.0;
+    vec3 lamplight = vec3(0.0);
+    if (shadowed || lamps) {
+        vec4 column = fogVolumeAt(farHit*dot(direction,lighting.clusterForward.xyz),0);
+        blocked = shadowed ? column.a : 0.0;
+        lamplight = lamps ? column.rgb/fogVolumeLampScale : vec3(0.0);
+    }
     return vec4(ambient*opacity+direct*max(0.0,opacity-blocked)+tint*lamplight,opacity);
 }
+
+#endif
 
 // This surface's own motion on the previous frame's screen in UV units (HdrFrame::velocityFormat), from the two clip
 // positions the scene vertex shaders pass (SceneMotion.glsl): where it was and where it is, both through the previous

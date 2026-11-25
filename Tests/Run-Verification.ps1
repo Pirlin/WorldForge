@@ -104,6 +104,7 @@ foreach ($mode in $Modes) {
             ForEach-Object { $_.Value } | Select-Object -Unique
         if ($times) { "times: $($times -join ' | ')" }
         if ($mode -eq "realism") { $csv | Where-Object { $_.Control -match "Realism" } | ForEach-Object { "$($_.Control): $($_.Notes)" } }
+        if ($mode -eq "aerial-perspective") { $csv | ForEach-Object { "$($_.Result) $($_.Control): $($_.Notes)" } }
         if ($mode -like "district*" -or $mode -eq "street-profile") { $csv | Where-Object { $_.Result -eq "INFO" -or $_.Kind -eq "profile" } | ForEach-Object { "$($_.Control): $($_.Notes)" } }
     }
 }

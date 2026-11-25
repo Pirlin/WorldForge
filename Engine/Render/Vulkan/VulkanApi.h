@@ -97,7 +97,7 @@ struct Image {
     VkImageView view = VK_NULL_HANDLE;
 
     bool create(const Device &device,VkFormat format,VkExtent2D extent,VkImageUsageFlags usage,
-                VkImageAspectFlags aspect,uint32_t mipLevels = 1);
+                VkImageAspectFlags aspect,uint32_t mipLevels = 1,uint32_t depth = 1); // 3D when depth > 1
     void destroy(const Device &device);
 };
 
