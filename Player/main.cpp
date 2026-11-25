@@ -69,7 +69,8 @@ struct MaterialConstants {
 // Decodes a PNG or JPEG to RGBA8. Returns an empty image when it cannot be used.
 Image decodeImage(const std::vector<std::uint8_t> &bytes)
 {
-    static ComPtr<IWICImagingFactory> imaging;
+    // One factory per thread: streamed cells decode their textures on worker threads (Scene::updateResidency).
+    static thread_local ComPtr<IWICImagingFactory> imaging;
     Image image;
     if (bytes.empty() || bytes.size() > wf::MeshMaterial::maxTextureBytes)
         return image;
@@ -508,6 +509,13 @@ private:
     UINT capacity_ = 0, width_ = 0, height_ = 0;
 };
 
+// Writes how long its scope took, in milliseconds (the Player's slow-frame log).
+struct SectionTimer {
+    double &milliseconds;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~SectionTimer() { milliseconds = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count(); }
+};
+
 class Scene {
 public:
     explicit Scene(wf::PlayableScene playable) : playable_(std::move(playable)),
@@ -529,10 +537,34 @@ public:
     }
     std::uint64_t nativeSteps() const { return native_.steps(); }
 
+    // The renderer's texture for these encoded bytes, uploading it the first time (decoded already on a worker thread
+    // when a streamed cell brought it). Pass decoded to keep the image, indexed like the renderer's textures.
+    int textureFor(const std::vector<std::uint8_t> &bytes,Renderer &renderer,std::vector<Image> *decoded = nullptr)
+    {
+        const std::string_view source(reinterpret_cast<const char *>(bytes.data()),bytes.size());
+        if (const auto entry = textureCache_.find(source); entry != textureCache_.end())
+            return entry->second;
+        const auto decodedEarlier = decodedTextures_.find(source);
+        auto image = decodedEarlier != decodedTextures_.end() ? std::move(decodedEarlier->second) : decodeImage(bytes);
+        if (decodedEarlier != decodedTextures_.end())
+            decodedTextures_.erase(decodedEarlier);
+        const int texture = renderer.addTexture(image);
+        if (decoded && texture >= 0) {
+            const auto index = std::size_t(texture);
+            decoded->resize(std::max(decoded->size(),index+1));
+            (*decoded)[index] = std::move(image);
+        }
+        // The key views a copy the scene owns: a streamed cell frees its own bytes when it unloads.
+        textureOwners_.emplace_back(source);
+        textureCache_.emplace(std::string_view(textureOwners_.back()),texture);
+        return texture;
+    }
+
     // Returns how many surface maps could not be decoded. Pass decoded to keep the images, indexed like the
     // renderer's textures.
     int uploadTextures(Renderer &renderer,std::vector<Image> *decoded = nullptr)
     {
+        SectionTimer timer{sectionMs_[1]};
         int failed = 0;
         renderer_ = &renderer;
         fixedMeshLayout_ = std::ranges::none_of(playable_.meshes,[](const wf::PlayMesh &mesh) { return !mesh.lodVertices.empty(); });
@@ -542,7 +574,8 @@ public:
         surfaceMaps_ = 0;
         // Playable files embed maps in each material. Reuse the decoded GPU texture for identical bytes, also across calls:
         // streamed cells come and go, and their textures stay uploaded.
-        auto &uploaded = textureCache_;
+        renderer.beginTextureBatch(); // every new texture uploads in one submission
+        const int texturesBefore = int(textureOwners_.size());
         for (std::size_t index = 0; index < playable_.meshes.size(); ++index) {
             const auto &mesh = playable_.meshes[index];
             // A mesh that was already drawn keeps its material (rebuildMeshes): finding a texture hashes its bytes.
@@ -566,27 +599,15 @@ public:
                 const auto &bytes = i == 0 ? mesh.baseColorTexture : mesh.surfaceMaps[i-1];
                 if (bytes.empty())
                     continue;
-                const std::string_view source(reinterpret_cast<const char *>(bytes.data()),bytes.size());
-                auto entry = uploaded.find(source);
-                if (entry == uploaded.end()) {
-                    auto image = decodeImage(bytes);
-                    const int texture = renderer.addTexture(image);
-                    if (decoded && texture >= 0) {
-                        const auto index = std::size_t(texture);
-                        decoded->resize(std::max(decoded->size(),index+1));
-                        (*decoded)[index] = std::move(image);
-                    }
-                    // The key views a copy the scene owns: a streamed cell frees its own bytes when it unloads.
-                    textureOwners_.emplace_back(source);
-                    entry = uploaded.emplace(std::string_view(textureOwners_.back()),texture).first;
-                }
-                material.textures[i] = entry->second;
+                material.textures[i] = textureFor(bytes,renderer,decoded);
                 failed += material.textures[i] < 0;
                 surfaceMaps_ += i > 0 && material.textures[i] >= 0;
             }
             textured_ += material.textures[0] >= 0;
             materials_.push_back(material);
         }
+        renderer.endTextureBatch();
+        newTextures_ = int(textureOwners_.size())-texturesBefore;
         knownMaterials_.clear();
         return failed;
     }
@@ -596,6 +617,9 @@ public:
     // other cell draws its box proxies. Cells unload past fullRadius + hysteresis, so a camera moving back and forth
     // across a boundary does not reload them each time.
     static constexpr float fullRadius = 160, hysteresis = 32;
+    // A cell read on a worker thread: its meshes and their decoded textures (mesh index, texture slot, image).
+    struct DecodedTexture { std::size_t mesh, slot; Image image; };
+    struct CellLoad { std::optional<std::vector<wf::PlayMesh>> meshes; std::vector<DecodedTexture> images; };
     struct Streaming {
         std::size_t cells = 0, resident = 0, loads = 0, unloads = 0, failed = 0;
         double longestLoadMs = 0;
@@ -611,6 +635,8 @@ public:
         cellMeshes_.assign(partitions.cells.size(),{});
         resident_.assign(partitions.cells.size(),false);
         inLayout_.assign(partitions.cells.size(),false);
+        staged_.assign(partitions.cells.size(),false);
+        stagedQueue_.clear();
         loads_.clear();
         loads_.resize(partitions.cells.size());
         requested_.assign(partitions.cells.size(),{});
@@ -618,7 +644,15 @@ public:
         rebuildMeshes();
     }
     bool streams() const { return !cellFile_.empty(); }
+    // Cells being read on worker threads; at most maximumLoads at once (nearest first would be better still).
+    std::size_t loadsInFlight() const
+    {
+        return std::size_t(std::ranges::count_if(loads_,[](const auto &load) { return load.valid(); }));
+    }
     std::size_t rebuilds() const { return rebuilds_; }
+    // The last cell layout rebuild, material pass, vertex build and texture staging, in milliseconds.
+    const std::array<double,4> &sectionMs() const { return sectionMs_; }
+    int newTextures() const { return newTextures_; }
     const Streaming &streaming() const { return streaming_; }
     // Loads and unloads cells around eye. At most one finished load joins the scene per call.
     void updateResidency(FXMVECTOR eye)
@@ -627,6 +661,7 @@ public:
             return;
         const float x = XMVectorGetX(eye), y = XMVectorGetY(eye);
         const auto &cells = cellIndex_.partitions.cells;
+        std::vector<std::pair<float,std::size_t>> wanted;
         for (std::size_t i = 0; i < cells.size(); ++i) {
             const auto &cell = cells[i];
             const float dx = std::max({cell.minimum[0]-x,0.0f,x-cell.maximum[0]});
@@ -636,34 +671,68 @@ public:
                 resident_[i] = false; // its meshes leave the layout at the next rebuild
                 ++streaming_.unloads;
                 pendingChange_ = true;
-            } else if (!resident_[i] && distance < fullRadius && !loads_[i].valid()) {
+            } else if (!resident_[i] && !staged_[i] && distance < fullRadius && !loads_[i].valid()) {
                 if (inLayout_[i]) {
                     resident_[i] = true; // back before its unload took effect
                     --streaming_.unloads;
                     continue;
                 }
+                wanted.push_back({distance,i});
+            }
+        }
+        // The nearest wanted cells first, at most maximumLoads read at once.
+        std::ranges::sort(wanted);
+        for (const auto &candidate : wanted) {
+            if (loadsInFlight() >= maximumLoads)
+                break;
+            const std::size_t i = candidate.second;
+            {
                 requested_[i] = std::chrono::steady_clock::now();
                 loads_[i] = std::async(std::launch::async,[this,i] {
+                    // Below the main thread, so reading and decoding never starve the frame.
+                    const auto thread = GetCurrentThread();
+                    const int priority = GetThreadPriority(thread);
+                    SetThreadPriority(thread,THREAD_PRIORITY_BELOW_NORMAL);
+                    CellLoad load;
                     std::ifstream in(cellFile_,std::ios::binary);
-                    return wf::readPlayableCell(in,cellIndex_,i);
+                    load.meshes = wf::readPlayableCell(in,cellIndex_,i);
+                    // Decode the textures here, off the main thread (each worker its own WIC factory).
+                    CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+                    if (load.meshes)
+                        for (std::size_t mesh = 0; mesh < load.meshes->size(); ++mesh)
+                            for (std::size_t slot = 0; slot < wf::materialTextureCount; ++slot) {
+                                const auto &bytes = slot == 0 ? (*load.meshes)[mesh].baseColorTexture
+                                    : (*load.meshes)[mesh].surfaceMaps[slot-1];
+                                if (!bytes.empty())
+                                    load.images.push_back({mesh,slot,decodeImage(bytes)});
+                            }
+                    SetThreadPriority(thread,priority);
+                    return load;
                 });
             }
         }
         for (std::size_t i = 0; i < cells.size(); ++i) {
             if (!loads_[i].valid() || loads_[i].wait_for(std::chrono::seconds(0)) != std::future_status::ready)
                 continue;
-            auto meshes = loads_[i].get();
-            if (!meshes) {
+            auto load = loads_[i].get();
+            if (!load.meshes) {
                 ++streaming_.failed;
                 continue;
             }
-            cellMeshes_[i] = std::move(*meshes);
-            resident_[i] = true;
-            ++streaming_.loads;
-            streaming_.longestLoadMs = std::max(streaming_.longestLoadMs,
-                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-requested_[i]).count());
-            pendingChange_ = true;
+            cellMeshes_[i] = std::move(*load.meshes);
+            // The decoded images wait for their upload, keyed by the bytes their meshes still hold; the cell waits
+            // in the staging queue until its textures are on the GPU.
+            for (auto &decoded : load.images) {
+                const auto &mesh = cellMeshes_[i][decoded.mesh];
+                const auto &bytes = decoded.slot == 0 ? mesh.baseColorTexture : mesh.surfaceMaps[decoded.slot-1];
+                const std::string_view key(reinterpret_cast<const char *>(bytes.data()),bytes.size());
+                if (!textureCache_.contains(key))
+                    decodedTextures_.emplace(key,std::move(decoded.image));
+            }
+            staged_[i] = true;
+            stagedQueue_.push_back(i);
         }
+        stageTextures();
         // Rebuilding the layout costs a full vertex upload, so changes gather for rebuildFrames frames and apply at once.
         if (++framesSinceRebuild_ >= rebuildFrames && pendingChange_) {
             rebuildMeshes();
@@ -671,10 +740,55 @@ public:
                 uploadTextures(*renderer_);
         }
     }
+    // Uploads the textures of cells waiting to join, at most texturesPerFrame a frame in one batch, and lets a cell join
+    // the layout once all of its textures are on the GPU: uploading a few dozen at a rebuild took 35-100 ms.
+    void stageTextures()
+    {
+        SectionTimer timer{sectionMs_[3]};
+        int budget = texturesPerFrame;
+        bool batch = false;
+        while (!stagedQueue_.empty()) {
+            const auto cell = stagedQueue_.front();
+            bool ready = true;
+            for (const auto &mesh : cellMeshes_[cell]) {
+                for (std::size_t slot = 0; ready && slot < wf::materialTextureCount; ++slot) {
+                    const auto &bytes = slot == 0 ? mesh.baseColorTexture : mesh.surfaceMaps[slot-1];
+                    if (bytes.empty() || !renderer_
+                        || textureCache_.contains(std::string_view(reinterpret_cast<const char *>(bytes.data()),bytes.size())))
+                        continue;
+                    if (budget == 0) {
+                        ready = false;
+                        break;
+                    }
+                    if (!batch) {
+                        renderer_->beginTextureBatch();
+                        batch = true;
+                    }
+                    textureFor(bytes,*renderer_);
+                    --budget;
+                }
+                if (!ready)
+                    break;
+            }
+            if (!ready)
+                break;
+            stagedQueue_.pop_front();
+            staged_[cell] = false;
+            resident_[cell] = true; // a cell the camera has left meanwhile unloads at the next updateResidency
+            pendingChange_ = true;
+            ++streaming_.loads;
+            streaming_.longestLoadMs = std::max(streaming_.longestLoadMs,
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-requested_[cell]).count());
+        }
+        if (batch)
+            renderer_->endTextureBatch();
+    }
+
     // playable_.meshes holds the resident cells' meshes, the proxies of the other cells, then the global meshes. The
     // meshes move back to their owners first (a cell that unloaded drops its own), so only the small proxies are copied.
     void rebuildMeshes()
     {
+        SectionTimer timer{sectionMs_[0]};
         // Materials (uploadTextures) travel with their meshes, so only newly loaded meshes look up their textures.
         const bool drawn = materials_.size() == playable_.meshes.size();
         cellMaterials_.resize(cellMeshes_.size());
@@ -706,7 +820,16 @@ public:
                 }
                 cellMeshes_[cell].clear();
             } else {
-                cellMeshes_[cell] = {}; // loaded, then left behind before it joined the layout
+                // Loaded, then left behind before it joined the layout: its decoded images go with its bytes. A cell still
+                // staging its textures keeps its meshes until it joins.
+                if (!staged_[cell]) {
+                    for (const auto &mesh : cellMeshes_[cell])
+                        for (std::size_t slot = 0; slot < wf::materialTextureCount; ++slot) {
+                            const auto &bytes = slot == 0 ? mesh.baseColorTexture : mesh.surfaceMaps[slot-1];
+                            decodedTextures_.erase(std::string_view(reinterpret_cast<const char *>(bytes.data()),bytes.size()));
+                        }
+                    cellMeshes_[cell] = {};
+                }
                 // Chunks of up to 12 boxes, each drawn and culled on its own.
                 const auto &proxy = cells[cell].proxy;
                 for (std::size_t first = 0; first < proxy.size(); first += proxyChunk) {
@@ -904,6 +1027,7 @@ public:
 
     const std::vector<wf::PlayVertex> &vertices()
     {
+        SectionTimer timer{sectionMs_[2]};
         const bool cached = fixedMeshLayout_ && !meshOffsets_.empty();
         if (cached) {
             vertices_.resize(meshOffsets_.back());
@@ -1066,6 +1190,8 @@ private:
         }
     };
     std::unordered_map<std::string_view,int,SampledHash> textureCache_;
+    // Images decoded on the worker threads for meshes that just joined, consumed by the next uploadTextures.
+    std::unordered_map<std::string_view,Image,SampledHash> decodedTextures_;
     // World partition streaming (prepareStreaming). The loads come last, so their futures finish before the file name
     // and index they read are destroyed.
     std::filesystem::path cellFile_;
@@ -1083,10 +1209,17 @@ private:
     static constexpr int rebuildFrames = 30;
     static constexpr std::size_t proxyChunk = 12*36;
     std::vector<char> inLayout_;
+    // Cells read and waiting for their textures (stageTextures), in the order they finished.
+    static constexpr int texturesPerFrame = 6;
+    static constexpr std::size_t maximumLoads = 2;
+    std::vector<char> staged_;
+    std::deque<std::size_t> stagedQueue_;
     bool pendingChange_ = false;
     std::size_t rebuilds_ = 0;
+    std::array<double,4> sectionMs_{};
+    int newTextures_ = 0; // textures the last material pass uploaded
     int framesSinceRebuild_ = rebuildFrames;
-    std::vector<std::future<std::optional<std::vector<wf::PlayMesh>>>> loads_;
+    std::vector<std::future<CellLoad>> loads_;
     bool clipMoved_ = false, clipLooped_ = false;
     int textured_ = 0;
     int jumpBuffer_ = 0;
@@ -1226,7 +1359,14 @@ struct DistrictRun {
     std::vector<double> lapWorkingSetMiB, lapPrivateMiB; // private: committed memory, which Windows does not trim
     // Frames over 40 ms: route frame, frame and CPU time, GPU time per pass (a frame or two behind), and whether the
     // cell layout was rebuilt in that frame.
-    struct SlowFrame { std::size_t frame; double ms, cpuMs; std::array<float,RenderStats::passCount> gpuMs; bool rebuilt; };
+    struct SlowFrame {
+        std::size_t frame;
+        double ms, cpuMs;
+        std::array<float,RenderStats::passCount> gpuMs;
+        bool rebuilt;
+        std::array<double,4> sections; // Scene::sectionMs: the last rebuild, material pass, vertex build and texture wait
+        int newTextures; // Scene::newTextures
+    };
     std::vector<SlowFrame> slowFrames;
 
     // The camera at fraction t of the route, and where it looks.
@@ -1324,7 +1464,9 @@ struct DistrictRun {
                 << ", \"rebuilt\": " << (slow.rebuilt ? "true" : "false") << ", \"gpuMs\": [";
             for (std::size_t pass = 0; pass < slow.gpuMs.size(); ++pass)
                 out << (pass ? ", " : "") << slow.gpuMs[pass];
-            out << "]}";
+            out << "], \"rebuildMs\": " << slow.sections[0] << ", \"materialsMs\": " << slow.sections[1]
+                << ", \"verticesMs\": " << slow.sections[2] << ", \"stageMs\": " << slow.sections[3]
+                << ", \"newTextures\": " << slow.newTextures << "}";
         }
         const auto &cells = scene.streaming();
         out << "],\n  \"cellStreaming\": {\"enabled\": " << (scene.streams() ? "true" : "false") << ", \"cells\": " << cells.cells
@@ -1676,7 +1818,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
                 if (frameMs > 40)
                     district.slowFrames.push_back({std::size_t(frames-DistrictRun::warmUpFrames),frameMs,
                         std::chrono::duration<double,std::milli>(beforePresent-frameStart).count(),stats.gpuMs,
-                        scene.rebuilds() != districtRebuilds});
+                        scene.rebuilds() != districtRebuilds,scene.sectionMs(),scene.newTextures()});
                 districtRebuilds = scene.rebuilds();
                 (routeFraction < 0.6f ? district.streetMs : district.rooftopMs).push_back(frameMs);
                 district.cpuMs.push_back(std::chrono::duration<double,std::milli>(beforePresent-frameStart).count());

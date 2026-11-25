@@ -130,6 +130,9 @@ public:
     virtual RenderStats stats() const { return {}; }
     // Adds a texture with generated mipmaps. Returns its index, or -1 when it cannot be used.
     virtual int addTexture(const Image &image) = 0;
+    // Between these, addTexture may record uploads and wait for them once, at endTextureBatch, instead of once each.
+    virtual void beginTextureBatch() {}
+    virtual void endTextureBatch() {}
     virtual bool draw(const std::vector<PlayVertex> &vertices,const std::vector<DrawRange> &ranges,const View &view,
                       UINT width,UINT height,bool sky,bool verify,UINT sync) = 0;
     // Renders one frame off screen. Backends without capture return false.

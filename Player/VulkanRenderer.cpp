@@ -193,6 +193,8 @@ public:
 
     bool start(HWND window,std::wstring &error);
     int addTexture(const Image &image) override;
+    void beginTextureBatch() override;
+    void endTextureBatch() override;
     bool draw(const std::vector<PlayVertex> &vertices,const std::vector<DrawRange> &ranges,const View &view,
               UINT width,UINT height,bool sky,bool verify,UINT sync) override;
     bool capture(const std::vector<PlayVertex> &vertices,const std::vector<DrawRange> &ranges,const View &view,
@@ -240,6 +242,13 @@ private:
                         VkRenderPass pass,bool scene,bool shadow,vk::MaterialPass materialPass = vk::MaterialPass::Opaque,bool mesh = false);
     VkDescriptorSet materialSet(const MaterialDraw &material);
     bool uploadTexture(const Image &image,vk::Image &texture);
+    // A texture batch (beginTextureBatch): one command buffer for every upload, and the staging buffers it still reads.
+    VkCommandBuffer batchCommand_ = VK_NULL_HANDLE;
+    std::vector<vk::Buffer> batchStaging_;
+    // Submitted texture batches still in flight: their fence, command buffer and staging buffers (retireUploads).
+    struct PendingUpload { VkFence fence; VkCommandBuffer command; std::vector<vk::Buffer> staging; };
+    std::vector<PendingUpload> pendingUploads_;
+    void retireUploads(bool wait);
     void requestTextureDetail(std::span<const PlayVertex> vertices,std::span<const DrawRange> ranges,const View &view,
                               UINT width,UINT height,bool capture);
     void refreshTextureDescriptors(int index);
@@ -987,7 +996,7 @@ bool VulkanRenderer::uploadTexture(const Image &image,vk::Image &texture)
         return false;
     }
     std::memcpy(staging.mapped,image.pixels.data(),bytes);
-    const auto command = beginOneTime();
+    const auto command = batchCommand_ ? batchCommand_ : beginOneTime();
     if (!command) {
         staging.destroy(device_);
         texture.destroy(device_);
@@ -1021,11 +1030,62 @@ bool VulkanRenderer::uploadTexture(const Image &image,vk::Image &texture)
     barrier(levels-1,1,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    if (batchCommand_) {
+        batchStaging_.push_back(staging); // read when the batch is submitted
+        return true;
+    }
     const bool uploaded = submitAndWait(command);
     staging.destroy(device_);
     if (!uploaded)
         texture.destroy(device_);
     return uploaded;
+}
+
+void VulkanRenderer::retireUploads(bool wait)
+{
+    std::erase_if(pendingUploads_,[&](PendingUpload &upload) {
+        if (wait)
+            api_.vkWaitForFences(device,1,&upload.fence,VK_TRUE,UINT64_MAX);
+        else if (api_.vkWaitForFences(device,1,&upload.fence,VK_TRUE,0) != VK_SUCCESS)
+            return false;
+        api_.vkDestroyFence(device,upload.fence,nullptr);
+        api_.vkFreeCommandBuffers(device,pool_,1,&upload.command);
+        for (auto &staging : upload.staging)
+            staging.destroy(device_);
+        return true;
+    });
+}
+
+void VulkanRenderer::beginTextureBatch()
+{
+    retireUploads(false);
+    if (!batchCommand_)
+        batchCommand_ = beginOneTime();
+}
+
+void VulkanRenderer::endTextureBatch()
+{
+    if (!batchCommand_)
+        return;
+    // Submitted without waiting: the queue runs it before any later frame, and its staging buffers are freed once its
+    // fence signals (retireUploads). Waiting here stalled the Player for 9-58 ms whenever cells brought new textures.
+    PendingUpload upload{VK_NULL_HANDLE,batchCommand_,std::move(batchStaging_)};
+    batchCommand_ = VK_NULL_HANDLE;
+    batchStaging_.clear();
+    api_.vkEndCommandBuffer(upload.command);
+    const VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    const VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO,nullptr,0,nullptr,nullptr,1,&upload.command,0,nullptr};
+    if (api_.vkCreateFence(device,&fence,nullptr,&upload.fence) != VK_SUCCESS
+        || api_.vkQueueSubmit(queue_,1,&submit,upload.fence) != VK_SUCCESS) {
+        if (upload.fence)
+            api_.vkDestroyFence(device,upload.fence,nullptr);
+        api_.vkQueueWaitIdle(queue_);
+        api_.vkFreeCommandBuffers(device,pool_,1,&upload.command);
+        for (auto &staging : upload.staging)
+            staging.destroy(device_);
+        return;
+    }
+    pendingUploads_.push_back(std::move(upload));
 }
 
 VkDescriptorSet VulkanRenderer::materialSet(const MaterialDraw &material)
@@ -2023,6 +2083,7 @@ void VulkanRenderer::release()
         meshletData_.destroy(device_);
         ringCounts_ = {};
         ringCachedMeshVertices_ = {};
+        retireUploads(true);
         drawCulling_.destroy();
         occlusionDepth_.destroy();
         fogVolume_.destroy();
