@@ -65,13 +65,29 @@ struct Volume {
     static constexpr std::array<uint32_t,3> dimensions{6,6,4};
     static constexpr uint32_t count = dimensions[0]*dimensions[1]*dimensions[2];
     static constexpr float spacing = 2, range = 20;
-    static constexpr std::size_t triangleBudget = 24'000;
+    static constexpr std::size_t triangleBudget = 60'000; // around the coarse grid (CoarseVolume)
     Vector origin{};
 
     static Volume around(Vector focus);
     std::array<ProbePosition,count> positions() const;
     bool intersects(const std::array<Vector,3> &vertices) const;
     bool operator==(const Volume &) const = default;
+};
+
+// A coarser grid traced with the fine one, reaching about 21 m around its focus, so surfaces beyond the fine grid (a
+// shop front across the street) still get bounce light. Its probes follow the fine grid's in the trace's output, and
+// the shaders blend from the fine grid to it where the fine one ends (Shading.glsl diffuseFromProbes).
+struct CoarseVolume {
+    static constexpr std::array<uint32_t,3> dimensions{8,8,4};
+    static constexpr uint32_t count = dimensions[0]*dimensions[1]*dimensions[2];
+    static constexpr float spacing = 6;
+    Vector origin{};
+
+    static CoarseVolume around(Vector focus);
+    std::array<ProbePosition,count> positions() const;
+    // Also true for every triangle the fine grid around the same camera needs (it lies inside).
+    bool intersects(const std::array<Vector,3> &vertices) const;
+    bool operator==(const CoarseVolume &) const = default;
 };
 
 static_assert(sizeof(Node) == 48 && sizeof(Triangle) == 80 && sizeof(ProbeDirection) == 32);
@@ -98,6 +114,6 @@ struct LightSource {
     std::array<float,2> cone; // cos(cone / 2) and the spot scale (LightClusters.h spotCone)
     float range;
 };
-HitLighting hitLighting(const std::array<std::array<float,4>,9> &sky,std::span<const LightSource> lights,const Volume &volume);
+HitLighting hitLighting(const std::array<std::array<float,4>,9> &sky,std::span<const LightSource> lights,const CoarseVolume &volume);
 
 }

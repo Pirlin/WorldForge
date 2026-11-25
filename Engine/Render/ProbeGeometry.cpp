@@ -192,14 +192,47 @@ bool Volume::intersects(const std::array<Vector,3> &vertices) const
     return true;
 }
 
-HitLighting hitLighting(const std::array<std::array<float,4>,9> &sky,std::span<const LightSource> lights,const Volume &volume)
+CoarseVolume CoarseVolume::around(Vector focus)
+{
+    CoarseVolume volume;
+    // Shift a whole cell at a time, so the field retraces only when the camera has moved that far.
+    for (std::size_t axis = 0; axis < focus.size(); ++axis)
+        volume.origin[axis] = std::round(focus[axis]/spacing)*spacing-float(dimensions[axis]-1)*spacing*0.5f+0.35f;
+    // The lowest probes sit just above the ground under the focus rather than deep below it.
+    volume.origin[2] = std::round(focus[2]/spacing)*spacing-spacing+0.35f;
+    return volume;
+}
+
+std::array<ProbePosition,CoarseVolume::count> CoarseVolume::positions() const
+{
+    std::array<ProbePosition,count> result;
+    for (uint32_t z = 0; z < dimensions[2]; ++z)
+        for (uint32_t y = 0; y < dimensions[1]; ++y)
+            for (uint32_t x = 0; x < dimensions[0]; ++x)
+                result[x+dimensions[0]*(y+dimensions[1]*z)] =
+                    {origin[0]+float(x)*spacing,origin[1]+float(y)*spacing,origin[2]+float(z)*spacing,0};
+    return result;
+}
+
+bool CoarseVolume::intersects(const std::array<Vector,3> &vertices) const
+{
+    for (std::size_t axis = 0; axis < origin.size(); ++axis) {
+        const float a = vertices[0][axis], b = vertices[1][axis], c = vertices[2][axis];
+        if (std::max({a,b,c}) < origin[axis]-Volume::range
+            || std::min({a,b,c}) > origin[axis]+float(dimensions[axis]-1)*spacing+Volume::range)
+            return false;
+    }
+    return true;
+}
+
+HitLighting hitLighting(const std::array<std::array<float,4>,9> &sky,std::span<const LightSource> lights,const CoarseVolume &volume)
 {
     HitLighting result;
     result.sky = sky;
     // Rays leave the probes for up to Volume::range, so a light matters when its range reaches that far around the grid.
     Vector center{}, half{};
     for (std::size_t axis = 0; axis < 3; ++axis) {
-        half[axis] = float(Volume::dimensions[axis]-1)*Volume::spacing*0.5f;
+        half[axis] = float(CoarseVolume::dimensions[axis]-1)*CoarseVolume::spacing*0.5f;
         center[axis] = volume.origin[axis]+half[axis];
     }
     std::vector<std::pair<float,const LightSource *>> reaching;

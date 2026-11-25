@@ -134,7 +134,13 @@ vec3 incomingRadiance(vec3 position,vec3 direction,out float distance)
     }
     // The sky (unoccluded) and the lamps, each lamp with a shadow ray, as Shading.glsl lights a diffuse surface.
     vec3 point = position+direction*distance+normal*(2.0*rayBias);
-    vec3 irradiance = skyIrradianceAt(normal);
+    // The sky reaches the hit only where it is open: one ray halfway between the normal and straight up decides, and
+    // the 64 rays of each probe average many such hits. Without it a shaded wall's bounce counts the whole sky.
+    uint skyBlocker;
+    float skyDistance;
+    bool skyOpen = !traceRayWithin(point,normalize(normal+vec3(0.0,0.0,1.0)+vec3(0.0,0.0,1e-3)),
+                                   settings.sunDirectionRange.w,true,skyBlocker,skyDistance);
+    vec3 irradiance = skyOpen ? skyIrradianceAt(normal) : vec3(0.0);
     for (uint i = 0; i < hitLightCount.x; ++i) {
         vec4 place = hitLights[4u*i];
         vec3 offset = place.xyz-point;

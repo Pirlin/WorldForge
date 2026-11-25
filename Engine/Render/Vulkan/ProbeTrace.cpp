@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
+#include <vector>
 
 namespace worldforge::vk {
 namespace {
@@ -166,17 +168,18 @@ void ProbeTrace::destroy()
 }
 
 bool ProbeField::needsUpdate(bool enabled,bool reflections,probes::Volume volume,uint64_t revision,probes::Vector sun,
-                             probes::Vector radiance,bool moving,const probes::HitLighting &lighting)
+                             probes::Vector radiance,bool moving,const probes::HitLighting &lighting,probes::CoarseVolume coarse)
 {
     if (!enabled) {
         clear();
         return false;
     }
     // A moving scene refreshes at a reduced rate. Edits and light changes also refresh the field.
-    if (requested_ && reflections == reflections_ && volume == volume_ && revision == revision_ && sun == sun_ && radiance == radiance_ && lighting == lighting_
+    if (requested_ && reflections == reflections_ && volume == volume_ && coarse == coarse_ && revision == revision_ && sun == sun_ && radiance == radiance_ && lighting == lighting_
         && (!moving || ++age_ < 45))
         return false;
     volume_ = volume;
+    coarse_ = coarse;
     revision_ = revision;
     sun_ = sun;
     radiance_ = radiance;
@@ -199,8 +202,13 @@ bool ProbeField::update(const Device &device,VkCommandBuffer commands,std::span<
     if (!pipeline_)
         pipeline_ = ProbePipeline::create(device);
     auto next = std::make_shared<ProbeTrace>();
-    if (!geometry || !pipeline_ || !next->create(device,pipeline_,*geometry,volume_.positions(),reflections_)
-        || !next->record(commands,0,probes::Volume::count,sun_,radiance_,probes::Volume::range,lighting_)) {
+    // The fine grid's probes, then the coarse grid's, in one trace.
+    std::vector<probes::ProbePosition> positions;
+    positions.reserve(probes::Volume::count+probes::CoarseVolume::count);
+    std::ranges::copy(volume_.positions(),std::back_inserter(positions));
+    std::ranges::copy(coarse_.positions(),std::back_inserter(positions));
+    if (!geometry || !pipeline_ || !next->create(device,pipeline_,*geometry,positions,reflections_)
+        || !next->record(commands,0,uint32_t(positions.size()),sun_,radiance_,probes::Volume::range,lighting_)) {
         // Try again on the next frame rather than leaving the probes off until something else changes.
         trace_.reset();
         requested_ = false;
@@ -216,6 +224,11 @@ bool ProbeField::update(const Device &device,VkCommandBuffer commands,std::span<
 std::array<float,4> ProbeField::grid() const
 {
     return {volume_.origin[0],volume_.origin[1],volume_.origin[2],trace_ ? probes::Volume::spacing : 0};
+}
+
+std::array<float,4> ProbeField::coarseGrid() const
+{
+    return {coarse_.origin[0],coarse_.origin[1],coarse_.origin[2],trace_ ? probes::CoarseVolume::spacing : 0};
 }
 
 }

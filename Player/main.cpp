@@ -888,6 +888,8 @@ public:
                                           directional*skyLight_->irradianceBand4[i][2],0};
             view.skyIrradiance[i] = {scale*skyLight_->irradiance[i][0],scale*skyLight_->irradiance[i][1],
                                     scale*skyLight_->irradiance[i][2],0};
+            view.skyIrradianceAbove[i] = {scale*skyLight_->irradianceAbove[i][0],scale*skyLight_->irradianceAbove[i][1],
+                                         scale*skyLight_->irradianceAbove[i][2],0};
         }
         view.skyHorizon = parameter(skyLight_->horizon,skyLight_->sunDiscStrength*wf::cloudSunTransmission(clouds));
         view.skyZenith = parameter(skyLight_->zenith,skyLight_->sunHorizon);

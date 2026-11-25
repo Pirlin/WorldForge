@@ -2518,6 +2518,7 @@ public:
             const float scale = wf::cloudSkyScale(clouds,i == 0);
             for (std::size_t c = 0; c < 3; ++c) {
                 lighting.skyIrradiance[i][c] = skyLight.irradiance[i][c]*scale;
+                lighting.skyIrradianceAbove[i][c] = skyLight.irradianceAbove[i][c]*scale;
                 lighting.skyIrradianceBand4[i][c] = skyLight.irradianceBand4[i][c]*wf::cloudSkyScale(clouds,false);
             }
         }
@@ -2592,17 +2593,19 @@ public:
             ? std::span<const wf::vk::TriangleRange>(geometry.transparent) : std::span<const wf::vk::TriangleRange>{};
         const auto focus = viewer+forward*6;
         const auto probeVolume = wf::probes::Volume::around({focus.x(),focus.y(),focus.z()});
+        const auto coarseFocus = viewer+forward*12;
+        const auto probeCoarse = wf::probes::CoarseVolume::around({coarseFocus.x(),coarseFocus.y(),coarseFocus.z()});
         const auto probeTextures = std::span<const uint32_t>(window_.worldTexturePixels_);
         // The sky and the lamps light the surfaces the probe rays hit, so walls get the light the street bounces onto them.
         std::array<std::array<float,4>,9> probeSky{};
         for (std::size_t i = 0; i < probeSky.size(); ++i)
             std::copy_n(lighting.skyIrradiance[i],4,probeSky[i].begin());
-        const auto probeHit = wf::probes::hitLighting(probeSky,wf::lights::probeSources(clusterLights),probeVolume);
+        const auto probeHit = wf::probes::hitLighting(probeSky,wf::lights::probeSources(clusterLights),probeCoarse);
         if (probeField_.needsUpdate(probeCompute_ && !window_.modelOnly_ && (environment.probeGi || environment.reflectionProbes),
                 environment.reflectionProbes,probeVolume,window_.runtime_ ? 0 : window_.geometryRevision_,
                 {towardSun.x(),towardSun.y(),towardSun.z()},
                 {sunLight[0]*cloudTransmission,sunLight[1]*cloudTransmission,sunLight[2]*cloudTransmission},
-                window_.runtime_.has_value(),probeHit)) {
+                window_.runtime_.has_value(),probeHit,probeCoarse)) {
             std::vector<wf::probes::SurfaceTriangle> surfaces;
             wf::vk::drawOpaqueRanges(geometry.triangles.size(),geometry.transparent,[&](uint32_t first,uint32_t count) {
                 for (uint32_t i = first; i+2 < first+count && surfaces.size() < wf::probes::Volume::triangleBudget; i += 3) {
@@ -2610,7 +2613,7 @@ public:
                     wf::probes::SurfaceTriangle surface{};
                     for (uint32_t corner = 0; corner < 3; ++corner)
                         std::copy_n(geometry.triangles[i+corner].position,3,surface.vertices[corner].begin());
-                    if (!probeVolume.intersects(surface.vertices))
+                    if (!probeCoarse.intersects(surface.vertices))
                         continue;
                     const float diffuse = 1-vertex.surfaceFactors[0];
                     const auto emission = std::size_t(vertex.texture[0])+3*wf::materialTextureCount;
@@ -2625,6 +2628,7 @@ public:
             probeField_.update(frame_.device(),command,surfaces);
         }
         lighting.probeGrid = probeField_.grid();
+        lighting.probeGridCoarse = probeField_.coarseGrid();
         lighting.probeSettings[0] = environment.probeGi ? 1.0f : 0.0f;
         lighting.probeSettings[1] = environment.reflectionProbes ? 1.0f : 0.0f;
         // TAA averages lookups split across frames; the rendering audit compares flicker with every lookup taken.

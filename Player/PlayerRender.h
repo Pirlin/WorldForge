@@ -39,6 +39,7 @@ struct View {
     // horizon, the zenith and the ground. Direct3D 11 does not use them.
     DirectX::XMFLOAT4 skyIrradiance[9], skyHorizon, skyZenith, skyGround;
     DirectX::XMFLOAT4 skyIrradianceBand4[9]{}; // band-4 coefficients (SkyLight.h)
+    DirectX::XMFLOAT4 skyIrradianceAbove[9]{}; // bands 0-2 of the sky above the horizon (SkyLight.h irradianceAbove)
     DirectX::XMFLOAT4 sunTint; // the color of sunlight at the ground, luminance 1
     // The sky's environment map (color::SkyLight::environment) and a number that changes whenever it does.
     // Direct3D 11 does not use them.

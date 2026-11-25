@@ -4932,6 +4932,16 @@ void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
         audit.record(page,"reference","Render the Cycles references","SKIP",QStringLiteral("WorldForge Studio is not installed."));
         return;
     }
+    // Probe GI (fine and coarse grids, lamp and sky light at hits, the sky term above the horizon where probes reach)
+    // lights every view: it brought all four closer to Cycles or held them (2026-11-25). WORLDFORGE_REALISM_PROBE_GI=0
+    // turns it off to compare.
+    const bool probeGi = !qEnvironmentVariableIsSet("WORLDFORGE_REALISM_PROBE_GI")
+        || qEnvironmentVariableIntValue("WORLDFORGE_REALISM_PROBE_GI") == 1;
+    if (probeGi && store.environment()) {
+        auto details = store.environment()->details;
+        details.insert("probeGi",true);
+        store.setAtmosphere(details);
+    }
     const auto playablePath = output.filePath("realism.wfplay");
     std::ostringstream playable;
     bool exported = WorldRuntime::exportScene(store,playable,&error);
@@ -4949,8 +4959,7 @@ void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
     nightAtmosphere.insert("skyModel","Physical");
     nightAtmosphere.insert("sunElevation",-6);
     nightAtmosphere.insert("ev100",5);
-    if (qEnvironmentVariableIntValue("WORLDFORGE_REALISM_PROBE_GI") == 1)
-        nightAtmosphere.insert("probeGi",true);
+    nightAtmosphere.insert("probeGi",probeGi);
     if (qEnvironmentVariableIntValue("WORLDFORGE_REALISM_SCREEN_GI") == 1)
         nightAtmosphere.insert("screenSpaceGi",true);
     store.setAtmosphere(nightAtmosphere);

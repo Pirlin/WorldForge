@@ -40,6 +40,18 @@ vec3 skyIrradiance(vec3 n)
     return max(result,vec3(0.0));
 }
 
+// Sky irradiance / pi from the sky above the horizon alone (bands 0-2; SkyLight.h irradianceAbove), for points the
+// probes cover: their rays meet the real ground, which stands in for the atmosphere's.
+vec3 skyIrradianceAboveHorizon(vec3 n)
+{
+    float basis[9] = float[9](0.282095,0.488603*n.y,0.488603*n.z,0.488603*n.x,1.092548*n.x*n.y,1.092548*n.y*n.z,
+                              0.315392*(3.0*n.z*n.z-1.0),1.092548*n.x*n.z,0.546274*(n.x*n.x-n.y*n.y));
+    vec3 result = vec3(0.0);
+    for (int i = 0; i < 9; ++i)
+        result += lighting.skyIrradianceAbove[i].rgb*basis[i];
+    return max(result,vec3(0.0));
+}
+
 // The sky seen in direction r (its radiance map).
 vec3 skyRadianceToward(vec3 r)
 {
@@ -58,13 +70,24 @@ float probeVisibility(vec2 moments,float distance)
     return visibility*visibility*visibility;
 }
 
-float probeCoordinates(vec3 position,out ivec3 base,out vec3 blend)
+// The coarse grid traced with the fine one (ProbeGeometry.h CoarseVolume); its probes follow the fine grid's.
+const ivec3 coarseDimensions = ivec3(8,8,4);
+const int fineProbeCount = 6*6*4, allProbeCount = 6*6*4+8*8*4;
+
+// Where position falls in a grid (origin xyz, spacing w): the lower corner of its cell, the blend across the cell, and
+// how far inside the grid it is (1 well inside, falling to 0 at the outer probes).
+float gridCoordinates(vec4 grid,ivec3 dimensions,vec3 position,out ivec3 base,out vec3 blend)
 {
-    vec3 coordinate = (position-lighting.probeGrid.xyz)/lighting.probeGrid.w;
-    vec3 boundary = min(coordinate,vec3(probeDimensions-1)-coordinate);
-    base = clamp(ivec3(floor(coordinate)),ivec3(0),probeDimensions-2);
+    vec3 coordinate = (position-grid.xyz)/grid.w;
+    vec3 boundary = min(coordinate,vec3(dimensions-1)-coordinate);
+    base = clamp(ivec3(floor(coordinate)),ivec3(0),dimensions-2);
     blend = clamp(coordinate-vec3(base),0.0,1.0);
     return clamp(2.0*min(boundary.x,min(boundary.y,boundary.z)),0.0,1.0);
+}
+
+float probeCoordinates(vec3 position,out ivec3 base,out vec3 blend)
+{
+    return gridCoordinates(lighting.probeGrid,probeDimensions,position,base,blend);
 }
 
 int probeIndex(ivec3 grid)
@@ -72,14 +95,12 @@ int probeIndex(ivec3 grid)
     return grid.x+probeDimensions.x*(grid.y+probeDimensions.y*grid.z);
 }
 
-vec3 diffuseFromProbes(vec3 position,vec3 normal)
+// Bounce light from one grid's probes at samplePosition, and in fade how far inside the grid it is.
+vec3 gridIrradiance(vec4 grid,ivec3 dimensions,int firstProbe,vec3 samplePosition,vec3 normal,out float fade)
 {
-    if (lighting.probeGrid.w <= 0.0 || lighting.probeSettings.x < 0.5)
-        return vec3(0.0);
-    vec3 samplePosition = position+normal*0.12;
     ivec3 base;
     vec3 blend;
-    float fade = probeCoordinates(samplePosition,base,blend);
+    fade = gridCoordinates(grid,dimensions,samplePosition,base,blend);
     if (fade <= 0.0)
         return vec3(0.0);
     vec3 weightNormal = normal*normal;
@@ -88,10 +109,10 @@ vec3 diffuseFromProbes(vec3 position,vec3 normal)
     float total = 0.0, accepted = 0.0;
     for (int corner = 0; corner < 8; ++corner) {
         ivec3 offset = ivec3(corner&1,(corner>>1)&1,(corner>>2)&1);
-        ivec3 grid = base+offset;
-        int probe = 12*probeIndex(grid);
+        ivec3 cell = base+offset;
+        int probe = 12*(firstProbe+cell.x+dimensions.x*(cell.y+dimensions.y*cell.z));
         vec3 part = mix(1.0-blend,blend,vec3(offset));
-        vec3 relative = samplePosition-(lighting.probeGrid.xyz+vec3(grid)*lighting.probeGrid.w);
+        vec3 relative = samplePosition-(grid.xyz+vec3(cell)*grid.w);
         float distance = length(relative);
         vec3 direction = relative/max(1e-5,distance);
         vec3 absolute = abs(direction);
@@ -112,7 +133,27 @@ vec3 diffuseFromProbes(vec3 position,vec3 normal)
         result += irradiance*weight*visible;
     }
     // Fade the result when all nearby probes are occluded.
-    return result*(fade/max(accepted,0.3*total));
+    return result/max(accepted,0.3*total);
+}
+
+// Bounce light from the fine grid, giving way to the coarse grid toward the fine grid's edge and beyond it. coverage
+// is how fully the grids cover the point (0 outside both): there the probes trace the real ground, so the sky term
+// leaves out the atmosphere's ground below the horizon (skyIrradianceAboveHorizon).
+vec3 diffuseFromProbes(vec3 position,vec3 normal,out float coverage)
+{
+    coverage = 0.0;
+    if (lighting.probeGrid.w <= 0.0 || lighting.probeSettings.x < 0.5)
+        return vec3(0.0);
+    vec3 samplePosition = position+normal*0.12;
+    float fineFade, coarseFade = 0.0;
+    vec3 fine = gridIrradiance(lighting.probeGrid,probeDimensions,0,samplePosition,normal,fineFade);
+    if (fineFade >= 1.0 || lighting.probeGridCoarse.w <= 0.0) {
+        coverage = fineFade;
+        return fine*fineFade;
+    }
+    vec3 coarse = gridIrradiance(lighting.probeGridCoarse,coarseDimensions,fineProbeCount,samplePosition,normal,coarseFade);
+    coverage = fineFade+coarseFade*(1.0-fineFade);
+    return fine*fineFade+coarse*coarseFade*(1.0-fineFade);
 }
 
 vec2 octahedralUv(vec3 direction)
@@ -143,7 +184,7 @@ vec4 reflectionFromProbes(vec3 position,vec3 normal,vec3 reflection,float roughn
     if (fade <= 0.0)
         return vec4(0.0);
     vec4 light = vec4(0.0);
-    const int mapStart = 12*probeDimensions.x*probeDimensions.y*probeDimensions.z;
+    const int mapStart = 12*allProbeCount; // the maps follow every probe's lobes, fine and coarse
     ivec2 nearest = clamp(ivec2(octahedralUv(reflection)*8.0),ivec2(0),ivec2(7));
     for (int corner = 0; corner < 8; ++corner) {
         ivec3 offset = ivec3(corner&1,(corner>>1)&1,(corner>>2)&1);
@@ -745,7 +786,10 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,vec3 shadowBiasNormal,o
         vec3 shift = (surface.tangent-r*dot(surface.tangent,r))*(0.65*(alpha.x-alpha.y));
         reflected = 0.5*(skyReflection(normalize(r-shift),surface.roughness)+skyReflection(normalize(r+shift),surface.roughness));
     }
-    vec3 irradiance = skyIrradiance(surface.normal);
+    float probeCoverage;
+    vec3 probeLight = diffuseFromProbes(position,surface.normal,probeCoverage);
+    vec3 irradiance = probeCoverage > 0.0
+        ? mix(skyIrradiance(surface.normal),skyIrradianceAboveHorizon(surface.normal),probeCoverage) : skyIrradiance(surface.normal);
     if (surface.scattering.x > 0.0)
         irradiance = mix(irradiance,skyIrradiance(-surface.normal),0.25*surface.scattering.x*subsurfaceProfile(surface,1.0));
     vec3 diffuse = diffuseAlbedo*(1.0-specularColor)*irradiance;
@@ -782,5 +826,5 @@ vec3 shadeSurface(Surface surface,vec3 position,vec3 eye,vec3 shadowBiasNormal,o
         indirect += coatSky*reflectance*reflectionOcclusion(coatNv,ambient,roughness)*(1.0-coatTrace.a);
         screenLight += coatTrace.rgb*reflectance*coatTrace.a;
     }
-    return result+indirect+screenLight+diffuseAlbedo*diffuseFromProbes(position,surface.normal);
+    return result+indirect+screenLight+diffuseAlbedo*probeLight;
 }

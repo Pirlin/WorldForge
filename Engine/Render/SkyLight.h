@@ -48,6 +48,9 @@ struct SkyLight {
     // bright horizon band (by 11% at twilight, 5% at midday); band 4 brings that to 4.5% and 2% (band 3 of the cosine
     // lobe is zero).
     std::array<std::array<float,4>,9> irradianceBand4{};
+    // Bands 0-2 of the sky above the horizon alone. Where probes trace the real ground and walls (Shading.glsl
+    // diffuseFromProbes), the sky term leaves out the ground below the horizon, or that light would count twice.
+    std::array<std::array<float,4>,9> irradianceAbove{};
     Rgb horizon{}, zenith{}, ground{}; // linear radiance, for reference
     // The radiance map and its prefiltered levels, RGB in xyz (mapTexels entries).
     std::vector<std::array<float,4>> environment;
@@ -148,7 +151,7 @@ SkyLight skyLightFrom(Radiance &&radiance)
         }
     // Irradiance: project the map, weighting each texel by its solid angle, then convolve with the cosine lobe
     // (Ramamoorthi and Hanrahan): band l scales by A_l / pi = 1, 2/3, 1/4, 0, -1/24, which gives irradiance / pi.
-    std::array<Rgb,9> projected{}, projected4{};
+    std::array<Rgb,9> projected{}, projected4{}, projectedAbove{};
     for (int y = 0; y < mapHeight; ++y) {
         const float t = 2*(float(y)+0.5f)/mapHeight-1;
         const float elevation = (t < 0 ? -1.0f : 1.0f)*t*t*pi/2;
@@ -161,6 +164,8 @@ SkyLight skyLightFrom(Radiance &&radiance)
                 for (int c = 0; c < 3; ++c) {
                     projected[i][std::size_t(c)] += value[std::size_t(c)]*basis[i]*solidAngle;
                     projected4[i][std::size_t(c)] += value[std::size_t(c)]*basis4[i]*solidAngle;
+                    if (d[2] > 0)
+                        projectedAbove[i][std::size_t(c)] += value[std::size_t(c)]*basis[i]*solidAngle;
                 }
         }
     }
@@ -169,6 +174,7 @@ SkyLight skyLightFrom(Radiance &&radiance)
         for (int c = 0; c < 3; ++c) {
             light.irradiance[i][std::size_t(c)] = band[i]*projected[i][std::size_t(c)];
             light.irradianceBand4[i][std::size_t(c)] = -projected4[i][std::size_t(c)]/24;
+            light.irradianceAbove[i][std::size_t(c)] = band[i]*projectedAbove[i][std::size_t(c)];
         }
     // Prefiltered levels: GGX importance samples around the reflected direction, weighted by the cosine to it
     // (the split-sum approximation takes the normal and the view along it).

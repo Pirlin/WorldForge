@@ -61,16 +61,19 @@ private:
 class ProbeField {
 public:
     bool needsUpdate(bool enabled,bool reflections,probes::Volume volume,uint64_t revision,probes::Vector sun,
-                     probes::Vector radiance,bool moving,const probes::HitLighting &lighting = {});
+                     probes::Vector radiance,bool moving,const probes::HitLighting &lighting = {},probes::CoarseVolume coarse = {});
     bool update(const Device &device,VkCommandBuffer commands,std::span<const probes::SurfaceTriangle> surfaces);
     void clear() { trace_.reset(); pipeline_.reset(); requested_ = false; }
     std::shared_ptr<const ProbeTrace> trace() const { return trace_; }
     std::array<float,4> grid() const;
+    // The coarse grid (probes::CoarseVolume), whose probes follow the fine grid's in the output.
+    std::array<float,4> coarseGrid() const;
 
 private:
     std::shared_ptr<ProbeTrace> trace_;
     std::shared_ptr<const ProbePipeline> pipeline_;
     probes::Volume volume_;
+    probes::CoarseVolume coarse_;
     probes::Vector sun_{}, radiance_{};
     probes::HitLighting lighting_;
     uint64_t revision_ = 0;

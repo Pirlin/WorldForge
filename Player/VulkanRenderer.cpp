@@ -60,6 +60,8 @@ struct LightingBlock {      // Lighting.glsl
     XMFLOAT4 reflectionSettings;
     std::array<float,4> probeGrid{}, probeSettings{};
     XMFLOAT4 skyIrradianceBand4[9]; // band-4 sky irradiance coefficients
+    std::array<float,4> probeGridCoarse{}; // origin, spacing (ProbeField::coarseGrid)
+    XMFLOAT4 skyIrradianceAbove[9]; // bands 0-2 of the sky above the horizon (SkyLight.h irradianceAbove)
 };
 struct PlayViewBlock {      // PlayView.glsl
     XMFLOAT4X4 viewProjection;
@@ -77,7 +79,7 @@ struct MaterialConstants {  // push constants of PlayScene.frag
     uint32_t padding;
     XMFLOAT4 streetLayers;
 };
-static_assert(sizeof(LightingBlock) == 2160 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
+static_assert(sizeof(LightingBlock) == 2320 && sizeof(PlayViewBlock) == 416 && sizeof(CameraConstants) == 128);
 static_assert(offsetof(MaterialConstants,streetLayers) == 96 && sizeof(MaterialConstants) == 112);
 
 constexpr uint32_t shadowSize = shadow::atlasSize;
@@ -1263,6 +1265,7 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     lighting.skySettings = {view.skyMaps && view.sky.z > 0.5f ? 1.0f : 0.0f,view.skyVisibility.metersPerTexel,view.sky.w,view.weather.x};
     std::copy(std::begin(view.skyIrradiance),std::end(view.skyIrradiance),std::begin(lighting.skyIrradiance));
     std::copy(std::begin(view.skyIrradianceBand4),std::end(view.skyIrradianceBand4),std::begin(lighting.skyIrradianceBand4));
+    std::copy(std::begin(view.skyIrradianceAbove),std::end(view.skyIrradianceAbove),std::begin(lighting.skyIrradianceAbove));
     lighting.skyHorizon = view.skyHorizon;
     lighting.skyZenith = view.skyZenith;
     lighting.skyGround = view.skyGround;
@@ -1359,16 +1362,17 @@ void VulkanRenderer::updateProbes(Frame &frame,std::span<const PlayVertex> verti
     std::memcpy(&lighting,data,sizeof(lighting));
     const auto &forward = lighting.clusterForward;
     const auto volume = probes::Volume::around({view.eye.x+6*forward.x,view.eye.y+6*forward.y,view.eye.z+6*forward.z});
+    const auto coarse = probes::CoarseVolume::around({view.eye.x+12*forward.x,view.eye.y+12*forward.y,view.eye.z+12*forward.z});
     // The sky and the lamps light the surfaces the probe rays hit, so walls get the light the street bounces onto them.
     std::array<std::array<float,4>,9> sky{};
     for (std::size_t i = 0; i < sky.size(); ++i)
         sky[i] = {lighting.skyIrradiance[i].x,lighting.skyIrradiance[i].y,lighting.skyIrradiance[i].z,0};
     const auto hit = probes::hitLighting(sky,lights::probeSources(view.sceneLights ? std::span<const lights::Light>(*view.sceneLights)
-        : std::span<const lights::Light>{}),volume);
+        : std::span<const lights::Light>{}),coarse);
     const auto &sun = lighting.sun;
     const auto &tint = lighting.sunTint;
     if (probeField_.needsUpdate(probeCompute_ && (view.probeGi || view.reflectionProbes),view.reflectionProbes,volume,0,
-            {sun.x,sun.y,sun.z},{sun.w*tint.x,sun.w*tint.y,sun.w*tint.z},view.movingGeometry != 0,hit)) {
+            {sun.x,sun.y,sun.z},{sun.w*tint.x,sun.w*tint.y,sun.w*tint.z},view.movingGeometry != 0,hit,coarse)) {
         std::vector<probes::SurfaceTriangle> surfaces;
         for (const auto &draw : ranges) {
             if (draw.material.layers.isTransparent() || std::size_t(draw.start)+draw.count > vertices.size())
@@ -1378,7 +1382,7 @@ void VulkanRenderer::updateProbes(Frame &frame,std::span<const PlayVertex> verti
             for (std::size_t i = 0; i+2 < range.size() && surfaces.size() < probes::Volume::triangleBudget; i += 3) {
                 probes::SurfaceTriangle surface{{range[i].position,range[i+1].position,range[i+2].position},{},
                     draw.material.emissive};
-                if (!volume.intersects(surface.vertices))
+                if (!coarse.intersects(surface.vertices))
                     continue;
                 const auto linear = color::srgbToLinear(range[i].color);
                 for (int c = 0; c < 3; ++c)
@@ -1397,6 +1401,8 @@ void VulkanRenderer::updateProbes(Frame &frame,std::span<const PlayVertex> verti
     const std::array settings{view.probeGi ? 1.f : 0.f,view.reflectionProbes ? 1.f : 0.f,view.sky.y > 0.5f ? 1.f : 0.f,
         fogVolumeNeeded_ ? vk::FogVolume::reach(view.cascades.scales[3][2],eye,mist) : 0.f};
     std::memcpy(data+offsetof(LightingBlock,probeGrid),grid.data(),sizeof(grid));
+    const auto coarseGrid = probeField_.coarseGrid();
+    std::memcpy(data+offsetof(LightingBlock,probeGridCoarse),coarseGrid.data(),sizeof(coarseGrid));
     std::memcpy(data+offsetof(LightingBlock,probeSettings),settings.data(),sizeof(settings));
     const VkDescriptorBufferInfo info{frame.probes ? frame.probes->output().buffer : frame.clusters.buffer,0,
         frame.probes ? frame.probes->output().size : VkDeviceSize(16)};

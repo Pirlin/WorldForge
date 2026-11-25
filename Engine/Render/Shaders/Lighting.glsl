@@ -47,6 +47,8 @@ layout(std140, set = 0, binding = 1) uniform Lighting {
     // reaches along the camera's forward axis in meters (0 when it was not filled this frame)
     vec4 probeSettings;
     vec4 skyIrradianceBand4[9]; // band-4 coefficients of sky irradiance / pi (SkyLight.h shBasis4)
+    vec4 probeGridCoarse;  // the coarse probe grid: origin in world meters, spacing (0 when disabled; ProbeGeometry.h)
+    vec4 skyIrradianceAbove[9]; // bands 0-2 of the sky above the horizon alone (SkyLight.h irradianceAbove)
 } lighting;
 layout(set = 0, binding = 4) uniform sampler2D skyVisibilityMap; // 4 x 4 tiles, one per sky direction, nearest
 // The sky's environment (Engine/Render/SkyLight.h): a 128 x 64 radiance map with rows closer near the horizon, then

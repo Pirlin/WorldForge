@@ -139,6 +139,18 @@ void checkColorPipeline()
     require(std::abs(uniformSky.ground[0]-color::groundAlbedo*radiance) < 0.01f*radiance, "The ground reflects a quarter of the sky");
     require(std::abs(floorLight[1]-radiance) < 0.06f*radiance, "A floor under a uniform sky reflects the sky's radiance");
     require(std::abs(wallLight[1]-0.5f*(1+color::groundAlbedo)*radiance) < 0.08f*radiance, "A wall sees half sky and half ground");
+    // Where probes trace the real ground, the sky term uses the sky above the horizon alone: a floor still sees all of
+    // it, a wall half the sky and no ground, a ceiling almost nothing.
+    const auto above = [&](float x,float y,float z) {
+        const auto basis = color::shBasis(x,y,z);
+        float value = 0;
+        for (std::size_t i = 0; i < 9; ++i)
+            value += uniformSky.irradianceAbove[i][1]*basis[i];
+        return value;
+    };
+    require(std::abs(above(0,0,1)-radiance) < 0.06f*radiance && std::abs(above(1,0,0)-0.5f*radiance) < 0.08f*radiance
+            && above(0,0,-1) < 0.08f*radiance,
+            "Sky irradiance above the horizon leaves out the ground for surfaces the probes light");
     const auto sunny = color::skyLight({grey,grey,grey},{grey,grey,grey},{0,0,1},1);
     require(sunny.ground[0] > uniformSky.ground[0]+0.2f && color::skyIrradiance(sunny,0,0,1)[0] > floorLight[0],
             "Sunlight brightens the ground and the light it bounces");
