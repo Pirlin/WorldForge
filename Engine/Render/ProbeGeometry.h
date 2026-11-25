@@ -76,4 +76,28 @@ struct Volume {
 
 static_assert(sizeof(Node) == 48 && sizeof(Triangle) == 80 && sizeof(ProbeDirection) == 32);
 
+// Light on the surfaces probe rays hit, besides the sun and their own emission (ProbeTrace.comp): the sky's irradiance
+// over pi as spherical harmonics (SkyLight.h, coefficients 0 to 8, as the scene shaders get them), and the point and
+// spot lights nearest the volume in the clustered-light layout (LightClusters.h: four vec4 per light), with their full
+// range rather than the exposure-dependent one. Without them a night street's walls miss the lamp and sky light the
+// ground bounces onto them.
+struct HitLighting {
+    static constexpr std::size_t maximumLights = 32;
+    std::array<std::array<float,4>,9> sky{};
+    std::vector<std::array<float,4>> lights;
+    bool operator==(const HitLighting &) const = default;
+};
+
+// The lights (positions, intensities, colors and spot cones as LightClusters.h takes them; directional ones are
+// skipped) whose light can reach a surface a probe ray in volume hits, nearest first, up to maximumLights.
+struct LightSource {
+    std::array<float,3> position;
+    float intensity;
+    std::array<float,3> color;
+    std::array<float,3> spotDirection;
+    std::array<float,2> cone; // cos(cone / 2) and the spot scale (LightClusters.h spotCone)
+    float range;
+};
+HitLighting hitLighting(const std::array<std::array<float,4>,9> &sky,std::span<const LightSource> lights,const Volume &volume);
+
 }

@@ -3,6 +3,7 @@
 #include "Engine/Render/ShadowCascades.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace worldforge::probes {
 namespace {
@@ -189,6 +190,40 @@ bool Volume::intersects(const std::array<Vector,3> &vertices) const
             return false;
     }
     return true;
+}
+
+HitLighting hitLighting(const std::array<std::array<float,4>,9> &sky,std::span<const LightSource> lights,const Volume &volume)
+{
+    HitLighting result;
+    result.sky = sky;
+    // Rays leave the probes for up to Volume::range, so a light matters when its range reaches that far around the grid.
+    Vector center{}, half{};
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        half[axis] = float(Volume::dimensions[axis]-1)*Volume::spacing*0.5f;
+        center[axis] = volume.origin[axis]+half[axis];
+    }
+    std::vector<std::pair<float,const LightSource *>> reaching;
+    for (const auto &light : lights) {
+        if (!(light.intensity > 0) || !(light.range > 0))
+            continue;
+        float outside = 0, squared = 0;
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            const float offset = std::abs(light.position[axis]-center[axis]);
+            outside += std::pow(std::max(0.0f,offset-half[axis]-Volume::range),2.0f);
+            squared += offset*offset;
+        }
+        if (outside < light.range*light.range)
+            reaching.push_back({squared,&light});
+    }
+    std::ranges::sort(reaching,{},&std::pair<float,const LightSource *>::first);
+    for (std::size_t i = 0; i < std::min(reaching.size(),HitLighting::maximumLights); ++i) {
+        const auto &light = *reaching[i].second;
+        result.lights.push_back({light.position[0],light.position[1],light.position[2],light.range});
+        result.lights.push_back({light.color[0]*light.intensity,light.color[1]*light.intensity,light.color[2]*light.intensity,0});
+        result.lights.push_back({light.spotDirection[0],light.spotDirection[1],light.spotDirection[2],light.cone[0]});
+        result.lights.push_back({light.cone[1],0,0,0});
+    }
+    return result;
 }
 
 }

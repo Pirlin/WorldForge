@@ -46,6 +46,8 @@ public:
     bool hasRenderedFrame() const;
     QImage captureFrame();
     std::optional<float> captureMeteredLuminance();
+    // The exposure in stops of the last rendered frame; with auto exposure it adapts toward the metered target over time.
+    std::optional<float> currentExposure() const;
     bool start(RunMode mode);
     void stop();
     void pause(bool paused);

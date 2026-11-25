@@ -1139,6 +1139,7 @@ public:
     }
     bool rendered() const { return rendered_; }
     bool temporalSettled() const { return temporalSettled_; }
+    std::optional<float> exposureStops() const { return exposureStops_; }
     std::optional<float> captureMeteredLuminance()
     {
         // The next reuse of each frame slot reads its histogram after the frame fence.
@@ -2123,6 +2124,8 @@ private:
     // False while a still view is still averaging its TAA samples; captureFrame waits for it.
     bool temporalSettled_ = true;
     std::optional<float> meteredLuminance_;
+    // The exposure in stops the last frame used (auto exposure adapts it over time).
+    std::optional<float> exposureStops_;
     ModelDomain domain_ = ModelDomain::Object;
     std::set<ModelComponent> selection_;
     bool xray_ = false, ortho_ = false;
@@ -2408,6 +2411,7 @@ public:
             window_.meteredLuminance_.reset();
             adaptedStops_ = std::numeric_limits<float>::quiet_NaN();
             adaptClock_.invalidate();
+            window_.exposureStops_ = environment.exposure;
             return environment.exposure;
         }
         const float seconds = adaptClock_.isValid() ? float(adaptClock_.restart())*0.001f : 0.0f;
@@ -2423,7 +2427,9 @@ public:
         } else if (std::isnan(adaptedStops_)) {
             window_.requestUpdate();
         }
-        return std::isnan(adaptedStops_) ? environment.exposure : adaptedStops_;
+        const float stops = std::isnan(adaptedStops_) ? environment.exposure : adaptedStops_;
+        window_.exposureStops_ = stops;
+        return stops;
     }
 
     void startNextFrame() override
@@ -2587,11 +2593,16 @@ public:
         const auto focus = viewer+forward*6;
         const auto probeVolume = wf::probes::Volume::around({focus.x(),focus.y(),focus.z()});
         const auto probeTextures = std::span<const uint32_t>(window_.worldTexturePixels_);
+        // The sky and the lamps light the surfaces the probe rays hit, so walls get the light the street bounces onto them.
+        std::array<std::array<float,4>,9> probeSky{};
+        for (std::size_t i = 0; i < probeSky.size(); ++i)
+            std::copy_n(lighting.skyIrradiance[i],4,probeSky[i].begin());
+        const auto probeHit = wf::probes::hitLighting(probeSky,wf::lights::probeSources(clusterLights),probeVolume);
         if (probeField_.needsUpdate(probeCompute_ && !window_.modelOnly_ && (environment.probeGi || environment.reflectionProbes),
                 environment.reflectionProbes,probeVolume,window_.runtime_ ? 0 : window_.geometryRevision_,
                 {towardSun.x(),towardSun.y(),towardSun.z()},
                 {sunLight[0]*cloudTransmission,sunLight[1]*cloudTransmission,sunLight[2]*cloudTransmission},
-                window_.runtime_.has_value())) {
+                window_.runtime_.has_value(),probeHit)) {
             std::vector<wf::probes::SurfaceTriangle> surfaces;
             wf::vk::drawOpaqueRanges(geometry.triangles.size(),geometry.transparent,[&](uint32_t first,uint32_t count) {
                 for (uint32_t i = first; i+2 < first+count && surfaces.size() < wf::probes::Volume::triangleBudget; i += 3) {
@@ -3708,6 +3719,15 @@ QImage LiveViewport::captureFrame()
             image = window_->grab();
         return image;
     }
+#endif
+    return {};
+}
+
+std::optional<float> LiveViewport::currentExposure() const
+{
+#ifdef WORLDFORGE_VULKAN
+    if (window_)
+        return window_->exposureStops();
 #endif
     return {};
 }

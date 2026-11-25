@@ -13,6 +13,8 @@ struct PushConstants {
     uint32_t nodeCount, firstProbe, probeCount, reflections;
 };
 static_assert(sizeof(PushConstants) == 48);
+// ProbeTrace.comp HitLight: the sky's nine coefficients, the light count, then four vec4 per light.
+constexpr VkDeviceSize hitLightingBytes = (9+1+4*probes::HitLighting::maximumLights)*16;
 }
 
 std::shared_ptr<const ProbePipeline> ProbePipeline::create(const Device &device)
@@ -20,7 +22,7 @@ std::shared_ptr<const ProbePipeline> ProbePipeline::create(const Device &device)
     auto result = std::make_shared<ProbePipeline>();
     result->device = &device;
     const auto &api = *device.api;
-    std::array<VkDescriptorSetLayoutBinding,4> bindings;
+    std::array<VkDescriptorSetLayoutBinding,5> bindings;
     for (uint32_t i = 0; i < bindings.size(); ++i)
         bindings[i] = {i,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr};
     const VkDescriptorSetLayoutCreateInfo setLayout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,nullptr,0,
@@ -94,7 +96,8 @@ bool ProbeTrace::create(const Device &device,std::shared_ptr<const ProbePipeline
         || !upload(buffers_[1],std::as_bytes(std::span(geometry.triangles)),sizeof(probes::Triangle))
         || !upload(buffers_[2],std::as_bytes(positions),sizeof(probes::ProbePosition))
         || !buffers_[3].create(device,positions.size()*(sizeof(probes::Probe)+(reflections ? sizeof(probes::ReflectionMap) : 0)),
-                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+        || !buffers_[4].create(device,hitLightingBytes,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
         destroy();
         return false;
     }
@@ -110,8 +113,8 @@ bool ProbeTrace::create(const Device &device,std::shared_ptr<const ProbePipeline
         destroy();
         return false;
     }
-    std::array<VkDescriptorBufferInfo,4> infos;
-    std::array<VkWriteDescriptorSet,4> writes;
+    std::array<VkDescriptorBufferInfo,5> infos;
+    std::array<VkWriteDescriptorSet,5> writes;
     for (uint32_t i = 0; i < buffers_.size(); ++i) {
         infos[i] = {buffers_[i].buffer,0,buffers_[i].size};
         writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,set_,i,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -122,7 +125,7 @@ bool ProbeTrace::create(const Device &device,std::shared_ptr<const ProbePipeline
 }
 
 bool ProbeTrace::record(VkCommandBuffer commands,uint32_t first,uint32_t count,probes::Vector towardSun,
-                        probes::Vector sunRadiance,float range) const
+                        probes::Vector sunRadiance,float range,const probes::HitLighting &lighting) const
 {
     if (!pipeline_ || !set_ || first > probeCount_ || count > probeCount_-first || !count || !(range > 0.004f && range <= 1'000)
         || !std::ranges::all_of(sunRadiance,[](float value) { return value >= 0 && std::isfinite(value); }))
@@ -132,6 +135,13 @@ bool ProbeTrace::record(VkCommandBuffer commands,uint32_t first,uint32_t count,p
         return false;
     const PushConstants constants{{towardSun[0]/length,towardSun[1]/length,towardSun[2]/length,range},
         {sunRadiance[0],sunRadiance[1],sunRadiance[2],0},nodeCount_,first,probeCount_,reflections_ ? 1u : 0u};
+    auto *hit = static_cast<std::byte *>(buffers_[4].mapped);
+    const auto lights = std::min<std::size_t>(lighting.lights.size()/4,probes::HitLighting::maximumLights);
+    const std::array<uint32_t,4> header{uint32_t(lights),0,0,0};
+    std::memcpy(hit,lighting.sky.data(),sizeof(lighting.sky));
+    std::memcpy(hit+sizeof(lighting.sky),header.data(),sizeof(header));
+    if (lights)
+        std::memcpy(hit+sizeof(lighting.sky)+sizeof(header),lighting.lights.data(),lights*4*sizeof(std::array<float,4>));
     const auto &api = *device_->api;
     api.vkCmdBindPipeline(commands,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline_->pipeline);
     api.vkCmdBindDescriptorSets(commands,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline_->layout,0,1,&set_,0,nullptr);
@@ -156,20 +166,21 @@ void ProbeTrace::destroy()
 }
 
 bool ProbeField::needsUpdate(bool enabled,bool reflections,probes::Volume volume,uint64_t revision,probes::Vector sun,
-                             probes::Vector radiance,bool moving)
+                             probes::Vector radiance,bool moving,const probes::HitLighting &lighting)
 {
     if (!enabled) {
         clear();
         return false;
     }
     // A moving scene refreshes at a reduced rate. Edits and light changes also refresh the field.
-    if (requested_ && reflections == reflections_ && volume == volume_ && revision == revision_ && sun == sun_ && radiance == radiance_
+    if (requested_ && reflections == reflections_ && volume == volume_ && revision == revision_ && sun == sun_ && radiance == radiance_ && lighting == lighting_
         && (!moving || ++age_ < 45))
         return false;
     volume_ = volume;
     revision_ = revision;
     sun_ = sun;
     radiance_ = radiance;
+    lighting_ = lighting;
     age_ = 0;
     requested_ = true;
     reflections_ = reflections;
@@ -189,7 +200,7 @@ bool ProbeField::update(const Device &device,VkCommandBuffer commands,std::span<
         pipeline_ = ProbePipeline::create(device);
     auto next = std::make_shared<ProbeTrace>();
     if (!geometry || !pipeline_ || !next->create(device,pipeline_,*geometry,volume_.positions(),reflections_)
-        || !next->record(commands,0,probes::Volume::count,sun_,radiance_,probes::Volume::range)) {
+        || !next->record(commands,0,probes::Volume::count,sun_,radiance_,probes::Volume::range,lighting_)) {
         // Try again on the next frame rather than leaving the probes off until something else changes.
         trace_.reset();
         requested_ = false;

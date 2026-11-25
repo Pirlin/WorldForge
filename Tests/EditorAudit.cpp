@@ -28,6 +28,7 @@
 #include <QDockWidget>
 #include <QDoubleSpinBox>
 #include <QElapsedTimer>
+#include "Engine/Render/CameraProjection.h"
 #include <QFile>
 #include <QFileDialog>
 #include "Engine/World/PlayableScene.h"
@@ -3921,6 +3922,47 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
                 && cloudParity.mean <= 1 && cloudParity.share <= 0.005,
                 QString("Clouds change the view by %1. Editor and Player have %2").arg(describe(cloudChange),describe(cloudParity)));
 
+    // Cloud transitions (realism pass item 4): clear (0.1) to overcast (0.9) over 20 s of play, at street level and at
+    // rooftop height. The Player renders five moments (WORLDFORGE_CAPTURE_SECONDS); the view must change one way only,
+    // without a jump (smoothstep takes at most 34% of the change in a quarter), and halfway it must match the editor
+    // showing the halfway coverage held still.
+    for (const auto &transitionShot : {Shot{"cloud-transition-street",shots[0].eye,shots[0].target},
+                                       Shot{"cloud-transition-rooftop",shots[2].eye,shots[2].target}}) {
+        setDisplay({{"cloudCover",0.1},{"targetCloudCover",0.9},{"cloudTransition",20}});
+        const auto start = settled(transitionShot);
+        std::vector<double> levels;
+        QImage halfway;
+        for (const int seconds : {0,5,10,15,20}) {
+            qputenv("WORLDFORGE_CAPTURE_SECONDS",QByteArray::number(seconds));
+            const auto played = captureWeatherPlayer(transitionShot,start);
+            levels.push_back(played.isNull() ? -1.0 : luminance(played));
+            if (seconds == 10)
+                halfway = played;
+        }
+        qunsetenv("WORLDFORGE_CAPTURE_SECONDS");
+        const double total = levels.back()-levels.front();
+        bool oneWay = std::ranges::none_of(levels,[](double level) { return level < 0; }) && std::abs(total) > 0.005;
+        double largest = 0;
+        for (std::size_t i = 1; i < levels.size(); ++i) {
+            const double step = levels[i]-levels[i-1];
+            oneWay = oneWay && step*total >= -1e-4;
+            largest = std::max(largest,std::abs(step));
+        }
+        const QString name = transitionShot.name;
+        audit.check(page,"weather",QString("Clouds move from clear to overcast smoothly in the Player (%1)").arg(name),
+                    oneWay && largest <= 0.45*std::abs(total),
+                    QString("Mean display luminance at 0, 5, 10, 15 and 20 s: %1, %2, %3, %4, %5")
+                        .arg(levels[0],0,'f',4).arg(levels[1],0,'f',4).arg(levels[2],0,'f',4).arg(levels[3],0,'f',4)
+                        .arg(levels[4],0,'f',4));
+        // The editor holds the coverage at play time 0: show it the halfway coverage (smoothstep(0.5) = 0.5).
+        setDisplay({{"cloudCover",0.5},{"targetCloudCover",0.5},{"cloudTransition",0}});
+        const auto still = settled(transitionShot);
+        const auto alike = difference(halfway,still,QString("rendering-%1-parity.png").arg(name));
+        audit.check(page,"weather",QString("Halfway through the transition the Player matches the editor (%1)").arg(name),
+                    !halfway.isNull() && alike.mean <= 1 && alike.share <= 0.005,describe(alike));
+    }
+    setDisplay({{"cloudCover",0},{"targetCloudCover",0},{"cloudTransition",0}});
+
     const Shot hazeShot{"distance-haze",shots[2].eye,shots[2].target};
     setDisplay({{"cloudCover",0},{"cloudTransition",0}});
     const auto clearAir = settled(hazeShot);
@@ -3948,6 +3990,8 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
         const bool warmReady = store.updateObjects({lamp},"Set warm lamp in the mist",lampError);
         const auto warm = settled(lampShot);
         warm.save(output.filePath("rendering-warm-lamp-mist.png"));
+        // The lamp light comes from the fog volume's froxels; a reference catches banding that parity cannot.
+        checkGolden("Warm lamp in physical mist","lamp-mist.png",warm);
         lamp.details.insert("lightColor","#72b4ff");
         const bool coolReady = store.updateObjects({lamp},"Set cool lamp in the mist",lampError);
         const auto cool = settled(lampShot);
@@ -3962,6 +4006,129 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
                 .arg(describe(lampChange),describe(colorChange),describe(lampParity)));
     } else {
         audit.check(page,"fog","Create a lamp to illuminate physical mist",false);
+    }
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+
+    // Night lighting (realism pass item 2). A 2000 cd lamp 4 m over a floor slab with a 1.5 m block 3 m to its east, seen
+    // from straight above: the ground darkens away from the lamp, the block shadows the ground beyond it (x 3.75 to 6 m),
+    // and the editor and the Player agree.
+    const auto addBlock = [&](QVector3D center,QVector3D size,const QString &name) {
+        store.addCube();
+        if (const auto *selected = store.selectedObject()) {
+            auto block = *selected;
+            block.position = center;
+            block.scale = size;
+            store.updateObject(block,name);
+        }
+    };
+    const auto addLamp = [&](QVector3D position,double candela) {
+        store.addObject("Point Light","Lighting");
+        const auto *selected = store.selectedObject();
+        if (!selected || selected->type != "Point Light")
+            return false;
+        auto lamp = *selected;
+        lamp.position = position;
+        setLightPhotometric(lamp.details,lamp.type,candela);
+        QString lampError;
+        return store.updateObjects({lamp},"Place lamp",lampError);
+    };
+    {
+        const QVector3D foot{-50,-50,0};
+        constexpr float height = 16;
+        // Tilted 7 degrees from straight down: a view along the up axis has no defined orientation.
+        const Shot falloffShot{"lamp-falloff",foot+QVector3D(0,-2,height),foot};
+        setDisplay({{"skyModel","Physical"},{"sunElevation",-12},{"ev100",6},{"exposureMode","Manual"},{"localFogRadius",0},{"fogDensity",0},
+                    {"bloom",false},{"shadows",true}});
+        addBlock(foot+QVector3D(0,0,-0.05f),{30,30,0.1f},"Ground for the lamp");
+        addBlock(foot+QVector3D(3,0,0.75f),{1.5f,1.5f,1.5f},"Lamp shadow caster");
+        const bool lampReady = addLamp(foot+QVector3D(0,0,4),2000);
+        store.select({});
+        const auto lit = settled(falloffShot);
+        lit.save(output.filePath("rendering-lamp-falloff.png"));
+        // Mean display luminance of a 7 x 7 pixel patch on the ground dx, dy meters from the lamp's foot.
+        const auto ground = [&](const QImage &image,float dx,float dy) {
+            if (image.isNull())
+                return 0.0;
+            const float scale = float(image.height())/(2*std::tan(worldforge::camera::verticalFovRadians/2)*height);
+            const int cx = int(float(image.width())/2+dx*scale), cy = int(float(image.height())/2-dy*scale);
+            double total = 0;
+            for (int y = cy-3; y <= cy+3; ++y)
+                for (int x = cx-3; x <= cx+3; ++x) {
+                    const QColor pixel = image.pixel(std::clamp(x,0,image.width()-1),std::clamp(y,0,image.height()-1));
+                    total += 0.2126*pixel.redF()+0.7152*pixel.greenF()+0.0722*pixel.blueF();
+                }
+            return total/49;
+        };
+        const double near = ground(lit,0,-1.5), middle = ground(lit,0,-3.5), far = ground(lit,0,-6.5);
+        audit.check(page,"night","A lamp's light on the ground falls off with distance",
+                    lampReady && near > middle+0.03 && middle > far+0.03 && far > 0.005,
+                    QString("Display luminance 1.5 m, 3.5 m and 6.5 m from the lamp: %1, %2, %3")
+                        .arg(near,0,'f',3).arg(middle,0,'f',3).arg(far,0,'f',3));
+        const double shadowed = ground(lit,4.8f,0), open = ground(lit,-4.8f,0);
+        audit.check(page,"night","A block casts the lamp's shadow on the ground beyond it",
+                    lampReady && shadowed < 0.5*open,
+                    QString("Display luminance 4.8 m from the lamp: %1 behind the block, %2 on the open side")
+                        .arg(shadowed,0,'f',3).arg(open,0,'f',3));
+        const auto lampParity = difference(captureWeatherPlayer(falloffShot,lit),lit,"rendering-lamp-falloff-parity.png");
+        QFile::remove(output.filePath("rendering-lamp-falloff.wfplay"));
+        QFile::copy(playablePath,output.filePath("rendering-lamp-falloff.wfplay"));
+        audit.check(page,"night","Editor and Player show the lamp's falloff and shadow alike",
+                    lampReady && lampParity.mean <= 1 && lampParity.share <= 0.005,describe(lampParity));
+    }
+    while (store.history().index() > historyStart && store.history().canUndo())
+        store.history().undo();
+
+    // Exposure adapting from the street into a lit interior: a closed 6 x 6 m room with a doorway and a 2000 cd lamp
+    // inside, entered from the sunlit street. Auto exposure must open up by more than a stop, without a step over half a
+    // stop between readings 50 ms apart, and settle.
+    {
+        const QVector3D room{-50,-50,0};
+        addBlock(room+QVector3D(0,-6,-0.05f),{30,30,0.1f},"Street in front of the room");
+        addBlock(room+QVector3D(-3.15f,0,1.5f),{0.3f,6.6f,3},"West wall");
+        addBlock(room+QVector3D(3.15f,0,1.5f),{0.3f,6.6f,3},"East wall");
+        addBlock(room+QVector3D(0,3.15f,1.5f),{6,0.3f,3},"North wall");
+        addBlock(room+QVector3D(-2,-3.15f,1.5f),{2,0.3f,3},"South wall west of the door");
+        addBlock(room+QVector3D(2,-3.15f,1.5f),{2,0.3f,3},"South wall east of the door");
+        addBlock(room+QVector3D(0,-3.15f,2.75f),{2,0.3f,0.5f},"Lintel");
+        addBlock(room+QVector3D(0,0,3.15f),{6.6f,6.6f,0.3f},"Roof");
+        const bool lampReady = addLamp(room+QVector3D(0,0,2.6f),2000);
+        store.select({});
+        setDisplay({{"sunElevation",40},{"exposureMode","Auto"},{"exposureCompensation",0}});
+        const QVector3D outside = room+QVector3D(0,-14,1.7f), inside = room+QVector3D(0,-1.5f,1.7f);
+        const auto street = settled({"interior-street",outside,outside+QVector3D(0,12,-0.2f)});
+        QTest::qWait(1500);
+        const float streetStops = view.currentExposure().value_or(std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> readings;
+        QElapsedTimer clock;
+        clock.start();
+        // Walk in over two seconds, then stand inside for four.
+        while (clock.elapsed() < 6000) {
+            const float walked = std::min(1.0f,float(clock.elapsed())/2000.0f);
+            const auto eye = outside+(inside-outside)*walked;
+            view.setCameraPreview(eye,eye+QVector3D(0,12,-0.2f));
+            QTest::qWait(50);
+            if (const auto stops = view.currentExposure())
+                readings.push_back(*stops);
+        }
+        const auto interior = view.captureFrame().convertToFormat(QImage::Format_RGB32);
+        interior.save(output.filePath("rendering-lit-interior.png"));
+        float largestStep = 0, lastSecond = 0;
+        for (std::size_t i = 1; i < readings.size(); ++i)
+            largestStep = std::max(largestStep,std::abs(readings[i]-readings[i-1]));
+        const std::size_t tail = std::min<std::size_t>(readings.size(),20);
+        for (std::size_t i = readings.size()-tail; i < readings.size(); ++i)
+            lastSecond = std::max(lastSecond,std::abs(readings[i]-readings.back()));
+        const float opened = readings.empty() ? 0.0f : std::abs(readings.back()-streetStops);
+        const double interiorLevel = luminance(interior);
+        audit.check(page,"night","Auto exposure adapts smoothly from the sunlit street into a lit interior",
+                    lampReady && !street.isNull() && readings.size() > 40 && std::isfinite(streetStops) && opened > 1
+                        && largestStep <= 0.5f && lastSecond <= 0.15f && interiorLevel > 0.08 && interiorLevel < 0.7,
+                    QString("Exposure %1 stops on the street, %2 inside (%3 readings); largest step %4, last second within %5; "
+                            "interior mean display level %6")
+                        .arg(streetStops,0,'f',2).arg(readings.empty() ? 0.0f : readings.back(),0,'f',2).arg(readings.size())
+                        .arg(largestStep,0,'f',3).arg(lastSecond,0,'f',3).arg(interiorLevel,0,'f',3));
+        setDisplay({{"exposureMode","Manual"}});
     }
     while (store.history().index() > historyStart && store.history().canUndo())
         store.history().undo();
@@ -4739,6 +4906,10 @@ void realismWorkflow(const QDir &output,const QDir &root,Audit &audit)
     nightAtmosphere.insert("skyModel","Physical");
     nightAtmosphere.insert("sunElevation",-6);
     nightAtmosphere.insert("ev100",5);
+    if (qEnvironmentVariableIntValue("WORLDFORGE_REALISM_PROBE_GI") == 1)
+        nightAtmosphere.insert("probeGi",true);
+    if (qEnvironmentVariableIntValue("WORLDFORGE_REALISM_SCREEN_GI") == 1)
+        nightAtmosphere.insert("screenSpaceGi",true);
     store.setAtmosphere(nightAtmosphere);
     bool lampsPlaced = true;
     // The outer lamps are spot lights pointing down with a 120-degree cone, as street lamps are; the middle ones are

@@ -309,7 +309,8 @@ if(BUILD_TESTING AND WORLDFORGE_BUILD_EDITOR_AUDIT)
         set_tests_properties(WorldForge.Authoring PROPERTIES TIMEOUT 180)
         add_test(NAME WorldForge.Rendering
             COMMAND WorldForgeEditorAudit "${CMAKE_CURRENT_BINARY_DIR}/rendering-qa" "${CMAKE_CURRENT_SOURCE_DIR}" --rendering)
-        set_tests_properties(WorldForge.Rendering PROPERTIES TIMEOUT 120)
+        # About 140 s on the GTX 1650 with the night, cloud-transition and fog-volume checks (2026-11-25).
+        set_tests_properties(WorldForge.Rendering PROPERTIES TIMEOUT 300)
         if(TARGET WorldForgePlayer)
             add_test(NAME WorldForge.EngineSession COMMAND WorldForgeEditorAudit
                 "${CMAKE_CURRENT_BINARY_DIR}/engine-session-qa" "${CMAKE_CURRENT_SOURCE_DIR}" --engine-session)

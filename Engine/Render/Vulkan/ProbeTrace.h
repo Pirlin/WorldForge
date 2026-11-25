@@ -38,8 +38,9 @@ public:
 
     // Record before the render pass on a compute-capable queue. The caller must synchronize subsequent reads
     // and wait for all uses before destroying or replacing this object.
+    // lighting lights the surfaces the rays hit besides the sun (ProbeGeometry.h HitLighting).
     bool record(VkCommandBuffer commands,uint32_t first,uint32_t count,probes::Vector towardSun,
-                probes::Vector sunRadiance,float range) const;
+                probes::Vector sunRadiance,float range,const probes::HitLighting &lighting = {}) const;
 
     const Buffer &output() const { return buffers_[3]; }
 
@@ -47,7 +48,7 @@ private:
     void destroy();
 
     const Device *device_ = nullptr;
-    std::array<Buffer,4> buffers_;
+    std::array<Buffer,5> buffers_; // nodes, triangles, positions, output, hit lighting
     std::shared_ptr<const ProbePipeline> pipeline_;
     VkDescriptorPool pool_{};
     VkDescriptorSet set_{};
@@ -60,7 +61,7 @@ private:
 class ProbeField {
 public:
     bool needsUpdate(bool enabled,bool reflections,probes::Volume volume,uint64_t revision,probes::Vector sun,
-                     probes::Vector radiance,bool moving);
+                     probes::Vector radiance,bool moving,const probes::HitLighting &lighting = {});
     bool update(const Device &device,VkCommandBuffer commands,std::span<const probes::SurfaceTriangle> surfaces);
     void clear() { trace_.reset(); pipeline_.reset(); requested_ = false; }
     std::shared_ptr<const ProbeTrace> trace() const { return trace_; }
@@ -71,6 +72,7 @@ private:
     std::shared_ptr<const ProbePipeline> pipeline_;
     probes::Volume volume_;
     probes::Vector sun_{}, radiance_{};
+    probes::HitLighting lighting_;
     uint64_t revision_ = 0;
     uint32_t age_ = 0;
     bool requested_ = false;

@@ -1359,10 +1359,16 @@ void VulkanRenderer::updateProbes(Frame &frame,std::span<const PlayVertex> verti
     std::memcpy(&lighting,data,sizeof(lighting));
     const auto &forward = lighting.clusterForward;
     const auto volume = probes::Volume::around({view.eye.x+6*forward.x,view.eye.y+6*forward.y,view.eye.z+6*forward.z});
+    // The sky and the lamps light the surfaces the probe rays hit, so walls get the light the street bounces onto them.
+    std::array<std::array<float,4>,9> sky{};
+    for (std::size_t i = 0; i < sky.size(); ++i)
+        sky[i] = {lighting.skyIrradiance[i].x,lighting.skyIrradiance[i].y,lighting.skyIrradiance[i].z,0};
+    const auto hit = probes::hitLighting(sky,lights::probeSources(view.sceneLights ? std::span<const lights::Light>(*view.sceneLights)
+        : std::span<const lights::Light>{}),volume);
     const auto &sun = lighting.sun;
     const auto &tint = lighting.sunTint;
     if (probeField_.needsUpdate(probeCompute_ && (view.probeGi || view.reflectionProbes),view.reflectionProbes,volume,0,
-            {sun.x,sun.y,sun.z},{sun.w*tint.x,sun.w*tint.y,sun.w*tint.z},view.movingGeometry != 0)) {
+            {sun.x,sun.y,sun.z},{sun.w*tint.x,sun.w*tint.y,sun.w*tint.z},view.movingGeometry != 0,hit)) {
         std::vector<probes::SurfaceTriangle> surfaces;
         for (const auto &draw : ranges) {
             if (draw.material.layers.isTransparent() || std::size_t(draw.start)+draw.count > vertices.size())

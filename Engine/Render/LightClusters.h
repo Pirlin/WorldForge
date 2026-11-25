@@ -11,6 +11,8 @@
 // enough to vanish even at night exposures; within it the falloff is the physical inverse square, with a smooth
 // window over the last part (Shading.glsl).
 
+#include "Engine/Render/ProbeGeometry.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -362,6 +364,20 @@ inline std::array<bool,shadowSlots> shadowUpdates(std::span<const std::array<flo
     for (std::size_t slot = 0; slot < std::min(active.size(),update.size()); ++slot)
         update[slot] = all || slot >= rendered.size() || active[slot] != rendered[slot];
     return update;
+}
+
+// The point and spot lights as the probe trace lights the surfaces its rays hit (ProbeGeometry.h hitLighting), each
+// with its full range: the probes are traced rarely, so their light must not depend on the frame's exposure.
+inline std::vector<probes::LightSource> probeSources(std::span<const Light> input)
+{
+    std::vector<probes::LightSource> result;
+    for (const auto &light : input) {
+        if (light.directional)
+            continue;
+        const auto cone = spotCone(light);
+        result.push_back({light.vector,light.intensity,light.color,light.spotDirection,cone,range(light.intensity)});
+    }
+    return result;
 }
 
 } // namespace worldforge::lights

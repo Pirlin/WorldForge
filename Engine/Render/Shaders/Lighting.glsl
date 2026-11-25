@@ -343,11 +343,11 @@ vec4 heightFog(vec3 eye,vec3 direction,float distance,vec3 tint,float density,fl
         scatter = tint*(1.0-sunShare);
         sunlight = tint*lighting.sunTint.rgb*sunShare;
     }
-    // The share of the fog's opacity in the sun's shadow, summed along this froxel column up to the surface (within the
+    // The share of the fog's opacity in the sun's shadow along this froxel column up to the surface (within the
     // sun cascades' range; fog beyond it still attenuates and scatters light).
     float blocked = 0.0;
     if (lighting.settings.y > 0.5 && lighting.sun.w > 0.0 && opacity > 0.0001 && lighting.probeSettings.w > 0.0)
-        blocked = fogVolumeAt(distance*dot(direction,lighting.clusterForward.xyz),1).r;
+        blocked = fogVolumeAt(distance*dot(direction,lighting.clusterForward.xyz),1).r*opacity;
     return vec4(scatter*opacity+sunlight*max(0.0,opacity-blocked),transmission);
 }
 
@@ -389,12 +389,15 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
     bool volume = lighting.probeSettings.w > 0.0;
     bool shadowed = volume && lighting.settings.y > 0.5 && any(greaterThan(direct,vec3(0.0)));
     bool lamps = volume && physical && clusterHeader.x > clusterHeader.y;
-    // Ten density samples (five segments of two in physical mode) give the mist's opacity along this pixel's ray.
+    // Ten density samples (five segments of two in physical mode) give the mist's opacity along this pixel's ray. Each
+    // segment's share of it takes the sun's visibility and the lamp light from the fog volume at its middle.
     int segments = physical ? 5 : 10;
     float stepSize = (farHit-nearHit)/float(segments);
-    float transmission = 1.0;
+    float transmission = 1.0, blocked = 0.0;
+    vec3 lamplight = vec3(0.0);
     float radialOffset = max(0.0,dot(origin,origin)-b*b)/(radius*radius);
     float densityStep = lighting.settings.x*stepSize;
+    float forwardShare = dot(direction,lighting.clusterForward.xyz);
     for (int i = 0; i < segments; ++i) {
         float start = nearHit+float(i)*stepSize;
         float fraction = physical ? 0.25 : 0.5;
@@ -404,18 +407,20 @@ vec4 localMist(vec3 eye, vec3 direction, float distanceToSurface, vec3 tint, flo
             along += 0.5*stepSize/radius;
             density = (density+1.0-smoothstep(0.60,1.0,sqrt(radialOffset+along*along)))*0.5;
         }
-        transmission *= exp(-densityStep*density);
+        float after = transmission*exp(-densityStep*density);
+        float weight = transmission-after;
+        if ((shadowed || lamps) && weight > 0.00001) {
+            // The middle of the segment, alike for neighboring pixels so their reads share the texture cache; the
+            // volume's own lookup points turn each TAA frame.
+            vec4 froxel = fogVolumeAt((start+0.5*stepSize)*forwardShare,0);
+            if (shadowed)
+                blocked += weight*(1.0-froxel.a);
+            if (lamps)
+                lamplight += weight*froxel.rgb/fogVolumeLampScale;
+        }
+        transmission = after;
     }
     float opacity = 1.0-transmission;
-    // The shadowed share of that opacity and the lamp light scattered toward the eye, summed along this froxel column
-    // up to the surface or the far side of the mist.
-    float blocked = 0.0;
-    vec3 lamplight = vec3(0.0);
-    if (shadowed || lamps) {
-        vec4 column = fogVolumeAt(farHit*dot(direction,lighting.clusterForward.xyz),0);
-        blocked = shadowed ? column.a : 0.0;
-        lamplight = lamps ? column.rgb/fogVolumeLampScale : vec3(0.0);
-    }
     return vec4(ambient*opacity+direct*max(0.0,opacity-blocked)+tint*lamplight,opacity);
 }
 

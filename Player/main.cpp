@@ -597,6 +597,9 @@ public:
 
     // The realism check compares lighting and materials without fog, which Cycles would need a volume for.
     // The Cycles reference has no fog and no lens: compare the scene's light alone.
+    // The play time in seconds, which drives the weather transition and mesh clips (--capture with WORLDFORGE_CAPTURE_SECONDS).
+    void setClipTime(double seconds) { clipTime_ = std::max(0.0,seconds); }
+
     void clearReferenceEffects()
     {
         playable_.fogDensity = 0;
@@ -1232,6 +1235,10 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show)
     if (capture) {
         const auto eye = XMVectorSet(captureCamera[0],captureCamera[1],captureCamera[2],0);
         const auto target = XMVectorSet(captureCamera[3],captureCamera[4],captureCamera[5],0);
+        // WORLDFORGE_CAPTURE_SECONDS renders the frame at that play time, for example partway through a weather transition.
+        wchar_t seconds[32]{};
+        if (GetEnvironmentVariableW(L"WORLDFORGE_CAPTURE_SECONDS",seconds,32))
+            scene.setClipTime(_wtof(seconds));
         if (reference)
             scene.clearReferenceEffects();
         const auto &vertices = scene.vertices();

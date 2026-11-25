@@ -15,6 +15,13 @@ layout(std430, set = 0, binding = 0) readonly buffer Nodes { Node nodes[]; };
 layout(std430, set = 0, binding = 1) readonly buffer Triangles { Triangle triangles[]; };
 layout(std430, set = 0, binding = 2) readonly buffer Positions { vec4 positions[]; };
 layout(std430, set = 0, binding = 3) writeonly buffer Probes { vec4 probes[]; };
+// Light on the surfaces the rays hit besides the sun (Engine/Render/ProbeGeometry.h HitLighting): sky irradiance / pi as
+// spherical harmonics, then point and spot lights, four vec4 each as in LightClusters.h.
+layout(std430, set = 0, binding = 4) readonly buffer HitLight {
+    vec4 hitSky[9];
+    uvec4 hitLightCount;
+    vec4 hitLights[];
+};
 layout(push_constant) uniform TraceSettings {
     vec4 sunDirectionRange;
     vec4 sunRadiance;
@@ -65,9 +72,10 @@ float triangleDistance(Triangle triangle,vec3 origin,vec3 direction,float limit)
     return distance > rayBias && distance < limit ? distance : limit;
 }
 
-bool traceRay(vec3 origin,vec3 direction,bool shadow,out uint hit,out float closest)
+// The nearest hit within limit meters; a shadow ray stops at the first.
+bool traceRayWithin(vec3 origin,vec3 direction,float limit,bool shadow,out uint hit,out float closest)
 {
-    closest = settings.sunDirectionRange.w;
+    closest = limit;
     hit = 0xffffffffu;
     for (uint current = 0; current < settings.nodeCount;) {
         Node node = nodes[current];
@@ -89,6 +97,22 @@ bool traceRay(vec3 origin,vec3 direction,bool shadow,out uint hit,out float clos
     return hit != 0xffffffffu;
 }
 
+bool traceRay(vec3 origin,vec3 direction,bool shadow,out uint hit,out float closest)
+{
+    return traceRayWithin(origin,direction,settings.sunDirectionRange.w,shadow,hit,closest);
+}
+
+// Sky irradiance / pi on a surface facing n, from the first three spherical-harmonic bands (Shading.glsl skyIrradiance).
+vec3 skyIrradianceAt(vec3 n)
+{
+    float basis[9] = float[9](0.282095,0.488603*n.y,0.488603*n.z,0.488603*n.x,1.092548*n.x*n.y,1.092548*n.y*n.z,
+                              0.315392*(3.0*n.z*n.z-1.0),1.092548*n.x*n.z,0.546274*(n.x*n.x-n.y*n.y));
+    vec3 result = vec3(0.0);
+    for (int i = 0; i < 9; ++i)
+        result += hitSky[i].rgb*basis[i];
+    return max(result,vec3(0.0));
+}
+
 vec3 incomingRadiance(vec3 position,vec3 direction,out float distance)
 {
     uint hit;
@@ -108,6 +132,31 @@ vec3 incomingRadiance(vec3 position,vec3 direction,out float distance)
         if (!traceRay(point,towardSun,true,occluder,shadowDistance))
             radiance += surface.diffuse.rgb*settings.sunRadiance.rgb*cosine;
     }
+    // The sky (unoccluded) and the lamps, each lamp with a shadow ray, as Shading.glsl lights a diffuse surface.
+    vec3 point = position+direction*distance+normal*(2.0*rayBias);
+    vec3 irradiance = skyIrradianceAt(normal);
+    for (uint i = 0; i < hitLightCount.x; ++i) {
+        vec4 place = hitLights[4u*i];
+        vec3 offset = place.xyz-point;
+        float squared = max(dot(offset,offset),0.01);
+        float relative = squared/(place.w*place.w);
+        float facing = dot(normal,offset);
+        if (relative >= 1.0 || facing <= 0.0)
+            continue;
+        float length = sqrt(squared);
+        vec3 toward = offset/length;
+        vec4 cone = hitLights[4u*i+2u];
+        float spot = smoothstep(0.0,1.0,(dot(-toward,cone.xyz)-cone.w)*hitLights[4u*i+3u].x);
+        if (spot <= 0.0)
+            continue;
+        uint occluder;
+        float shadowDistance;
+        if (traceRayWithin(point,toward,length-2.0*rayBias,true,occluder,shadowDistance))
+            continue;
+        float fade = 1.0-relative*relative;
+        irradiance += hitLights[4u*i+1u].rgb*(facing/length)*spot*fade*fade/squared;
+    }
+    radiance += surface.diffuse.rgb*irradiance;
     return radiance;
 }
 
