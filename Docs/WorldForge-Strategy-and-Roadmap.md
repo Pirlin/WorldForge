@@ -260,7 +260,17 @@ Use the Playable Street for fixed clear-day, low-sun, twilight, and lamp-lit nig
 - [x] Profile and reduce the cost of local mist when the camera looks through the volume. Repeat the mission with both fog types enabled against the 16.7 ms p95 street budget.
   - **Result** (2026-11-25, `--r3-performance`): the street mission with all R3 lighting, height fog and a 9 m local mist runs at 16.3 ms p95 (it was 21.1 ms); with R3 lighting alone it is 14.0 ms. `--street-profile` found the cost in shadow lookups, not lamps. Under TAA the sun-shadow, sky-visibility, fog and mist lookups are split across frames and pixels, and the resolve averages them; without TAA every lookup is taken as before.
   - **Flicker:** the rendering audit pans through the misty street with the lookups split and with every lookup taken, including a pan that moves every frame. The split adds at most 0.02 levels of frame-to-frame change.
-- [ ] Review stills and moving shots on the GTX 1650. Record scene settings, reference comparisons, editor and Player differences, frame-time percentiles, worst frames, and peak memory before starting city-scale rendering.
+- [x] Review stills and moving shots on the GTX 1650. Record scene settings, reference comparisons, editor and Player differences, frame-time percentiles, worst frames, and peak memory before starting city-scale rendering.
+  - **Result** (2026-11-26, one session on "Power saver", tag `r47`). Settings: the Playable Street with the physical sky, AgX, TAA, GTAO, contact shadows, screen-space reflections and, in the realism views, probe GI.
+
+    | Check | Result |
+    | --- | --- |
+    | Cycles (LDR-FLIP, 256 samples) | shop front 0.0386, street corner 0.0577, aerial 0.0250, night 0.0708; realism score 95.2 |
+    | Editor and Player | street views 0.09 levels; fog 0.06; lamp falloff 0.05; reflections 0.32; contact shadows 0.22; TAA off 0.20 |
+    | Street mission | p95 9.5–9.6 ms, p99 11 ms, worst 19–38 ms, peak working set 166 MiB |
+    | Street with R3 lighting / with fog and mist | p95 15.0 / 16.1 ms, worst 263 / 70 ms (single frames) |
+    | Moving sun (sunrise, sunset) | 3/3 each: no exposure step over 0.5 stops |
+    | Aerial perspective | 8/8 |
 
 The Vulkan rendering audit passed all 47 checks. In the fixed Playable Street sunset view, height fog and local mist changed the image by 32.49 display levels on average. The editor and Player differed by 0.25 levels. The dusk fixture confirmed that local mist dims with the physical sky, and the updated shadow sampling reduced visible bands in the sunset view.
 
@@ -295,7 +305,17 @@ On the GTX 1650, the 5.5-second street mission with R3 lighting and physical hei
   - **Frame time** (2026-11-25): streaming costs nothing measurable now: p95 13.4–13.9 ms against 13.8–14.1 ms fully resident, worst frame 33.5 ms. Proxy chunks draw as their own ranges, the texture cache samples its hash, and the periodic point-shadow refresh redraws one lamp at a time.
   - **Dense content** (2026-11-26, `--district-cells` on the detailed 12 × 12 district: 576 buildings with ledges, pilasters, rooftop units and their own facades, 749 k vertices): fully resident 22 ms p95 and 700 MiB committed; streaming cells 13.8 ms p95, worst frame 32 ms, 575–586 MiB committed and steady over three laps. Point shadows now draw only the casters within each lamp's range (they drew everything: 17 ms). The section 10.3 acceptance criteria hold for the Player.
   - **Still open:** the editor does not stream, and there are no octahedral impostors yet (distant cells draw box proxies; a building's textures stay on the GPU once loaded).
-- [ ] Run combined district rendering, lighting, streaming, and performance checks on the GTX 1650. Record sustained frame times and memory alongside the Playable Street regression results.
+- [x] Run combined district rendering, lighting, streaming, and performance checks on the GTX 1650. Record sustained frame times and memory alongside the Playable Street regression results.
+  - **Result** (2026-11-26, tag `r47`, run back to back with the street, realism and full audits, all passing; full audit 1375 PASS):
+
+    | Route | p95 | p99 | Worst | Peak working set |
+    | --- | ---: | ---: | ---: | ---: |
+    | 6 × 6 district | 10.5 ms | 16.3 ms | 42 ms | 171 MiB |
+    | 12 × 12 textured district | 10.8 ms | 13.3 ms | 23 ms | 184 MiB |
+    | 12 × 12 detailed district, fully resident | 22.1 ms | 73 ms | 87 ms | 430 MiB |
+    | 12 × 12 detailed district, streaming cells (3 laps) | 13.6 ms | 22.4 ms | 38 ms | 357 MiB (committed 575–597 against 745) |
+
+    Every route but the fully resident detailed district fits the 16.7 ms budget; streaming brings that one under it.
 
 The Living City can't be built without this stage.
 

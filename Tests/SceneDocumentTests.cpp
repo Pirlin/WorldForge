@@ -5,6 +5,7 @@
 #include "Engine/Geometry/MeshRemesh.h"
 #include "Engine/Geometry/SculptBrush.h"
 #include "Engine/Geometry/MeshUv.h"
+#include "Engine/Geometry/ClusterLod.h"
 #include "Engine/World/WorldSimulation.h"
 #include "Engine/World/PlayableScene.h"
 #include "Engine/Render/ColorPipeline.h"
@@ -1283,5 +1284,53 @@ int main(int argc,char *argv[])
                   << " stuck " << pilot.stuck << '\n';
     }
     require(streetLoaded->gameplay.missionsComplete(), "The autopilot completes a mission around a wall");
+    {
+        // Cluster LOD (R4.4): a subdivided 32 x 32 planeLod keeps its outline and area at every level, each level has fewer
+        // triangles, and errors never shrink from a cluster to its parent group.
+        std::vector<Point3> corners;
+        for (int y = 0; y < 32; ++y)
+            for (int x = 0; x < 32; ++x) {
+                const Point3 a{float(x),float(y),0}, b{float(x+1),float(y),0}, c{float(x+1),float(y+1),0}, d{float(x),float(y+1),0};
+                corners.insert(corners.end(),{a,b,c,a,c,d});
+            }
+        const auto planeLod = lod::buildHierarchy(corners);
+        std::vector<std::size_t> perLevel(planeLod.levels,0);
+        std::vector<double> areaPerLevel(planeLod.levels,0);
+        bool monotonic = true, outline = true;
+        for (const auto &cluster : planeLod.clusters) {
+            perLevel[cluster.level] += cluster.triangles.size();
+            monotonic = monotonic && cluster.parentError >= cluster.error;
+            for (const auto &t : cluster.triangles) {
+                const auto &p = planeLod.positions;
+                areaPerLevel[cluster.level] += 0.5*std::abs((p[t[1]][0]-p[t[0]][0])*(p[t[2]][1]-p[t[0]][1])
+                    -(p[t[2]][0]-p[t[0]][0])*(p[t[1]][1]-p[t[0]][1]));
+                for (const auto v : t)
+                    outline = outline && p[v][0] >= 0 && p[v][0] <= 32 && p[v][1] >= 0 && p[v][1] <= 32;
+            }
+        }
+        bool shrinking = planeLod.levels >= 3, areas = true;
+        for (std::size_t level = 1; level < planeLod.levels; ++level) {
+            shrinking = shrinking && perLevel[level] < perLevel[level-1];
+            areas = areas && std::abs(areaPerLevel[level]-1024) < 1;
+        }
+        require(perLevel.size() >= 1 && perLevel[0] == 2048 && shrinking && areas && outline && monotonic,
+                "Cluster LOD simplifies a plane level by level, keeping its outline and area");
+        // A dense sphere: every level stays within its stated error of the true surface (plus a tenth of the radius for
+        // the flat facets of the original).
+        const auto sphere = makePrimitive(Primitive::Sphere,{2,2,2},64,32);
+        std::vector<Point3> sphereCorners;
+        if (sphere)
+            for (const auto &vertex : makePlayVertices(*sphere))
+                sphereCorners.push_back(vertex.position);
+        const auto rounded = lod::buildHierarchy(sphereCorners);
+        bool close = rounded.levels >= 2;
+        for (const auto &cluster : rounded.clusters)
+            for (const auto &t : cluster.triangles)
+                for (const auto v : t) {
+                    const auto &p = rounded.positions[v];
+                    close = close && std::abs(std::sqrt(p[0]*p[0]+p[1]*p[1]+p[2]*p[2])-1) <= cluster.error+0.1f;
+                }
+        require(close,"Cluster LOD keeps a sphere within each level's error of its surface");
+    }
     std::cout << "Scene, mesh and world simulation contracts passed\n";
 }
