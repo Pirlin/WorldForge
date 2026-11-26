@@ -4,8 +4,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 
 namespace worldforge::vk {
@@ -200,6 +204,21 @@ bool ProbeField::needsUpdate(bool enabled,bool reflections,probes::Volume volume
 
 bool ProbeField::update(const Device &device,VkCommandBuffer commands,std::span<const probes::SurfaceTriangle> surfaces)
 {
+    // WORLDFORGE_PROBE_DUMP=<folder> writes each refresh's inputs as probe-<n>.bin for WorldForgeProbeTests --replay.
+    if (const char *folder = std::getenv("WORLDFORGE_PROBE_DUMP")) {
+        static int dumped = 0;
+        std::ofstream out(std::filesystem::path(folder) / ("probe-" + std::to_string(dumped++) + ".bin"),std::ios::binary);
+        const auto write = [&](const void *data,std::size_t bytes) { out.write(static_cast<const char *>(data),std::streamsize(bytes)); };
+        const uint32_t counts[2]{uint32_t(surfaces.size()),uint32_t(lighting_.lights.size())};
+        write(counts,sizeof(counts));
+        write(surfaces.data(),surfaces.size_bytes());
+        write(&volume_.origin,sizeof(volume_.origin));
+        write(&coarse_.origin,sizeof(coarse_.origin));
+        write(&sun_,sizeof(sun_));
+        write(&radiance_,sizeof(radiance_));
+        write(lighting_.sky.data(),sizeof(lighting_.sky));
+        write(lighting_.lights.data(),lighting_.lights.size()*sizeof(lighting_.lights[0]));
+    }
     const auto geometry = probes::buildGeometry(surfaces);
     // Nothing in the volume: no probe light here, and nothing to retry until the volume, scene or light changes.
     if (geometry && geometry->triangles.empty()) {

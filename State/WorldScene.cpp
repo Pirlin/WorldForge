@@ -60,7 +60,8 @@ WorldAtmosphere readAtmosphere(const QJsonObject &details)
     environment.autoExposure = details.value("exposureMode").toString() == "Auto";
     environment.temporalAntiAliasing = details.value("antiAliasing").toString() != "Off";
     environment.ambientOcclusion = details.value("ambientOcclusion").toBool(true);
-    environment.probeGi = details.value("probeGi").toBool();
+    // On unless a project turns it off (2026-11-26, once the editor stopped freeing probe traces still in use).
+    environment.probeGi = details.value("probeGi").toBool(true);
     environment.screenSpaceGi = details.value("screenSpaceGi").toBool();
     environment.reflectionProbes = details.value("reflectionProbes").toBool();
     environment.physicalSky = details.value("skyModel").toString() == QStringLiteral("Physical");

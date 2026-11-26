@@ -4145,10 +4145,16 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
         addBlock(room+QVector3D(0,0,3.15f),{6.6f,6.6f,0.3f},"Roof");
         const bool lampReady = addLamp(room+QVector3D(0,0,2.6f),2000);
         store.select({});
-        setDisplay({{"sunElevation",40},{"exposureMode","Auto"},{"exposureCompensation",0}});
+        // With probe GI on (the default): it refreshes as the grids follow the walk, which once let the editor free a
+        // trace a frame on the GPU still read and stalled this walk. WORLDFORGE_AUDIT_WALK_LOG=<file> logs the walk's
+        // frames (LiveViewport's WORLDFORGE_FRAME_LOG).
+        setDisplay({{"sunElevation",40},{"exposureMode","Auto"},{"exposureCompensation",0},{"probeGi",true}});
         const QVector3D outside = room+QVector3D(0,-14,1.7f), inside = room+QVector3D(0,-1.5f,1.7f);
         const auto street = settled({"interior-street",outside,outside+QVector3D(0,12,-0.2f)});
         QTest::qWait(1500);
+        const auto walkLog = qgetenv("WORLDFORGE_AUDIT_WALK_LOG");
+        if (!walkLog.isEmpty())
+            qputenv("WORLDFORGE_FRAME_LOG",walkLog);
         const float streetStops = view.currentExposure().value_or(std::numeric_limits<float>::quiet_NaN());
         std::vector<float> readings;
         QElapsedTimer clock;
@@ -4162,6 +4168,7 @@ void renderingWorkflow(const QDir &output,const QDir &root,Audit &audit)
             if (const auto stops = view.currentExposure())
                 readings.push_back(*stops);
         }
+        qunsetenv("WORLDFORGE_FRAME_LOG");
         const auto interior = view.captureFrame().convertToFormat(QImage::Format_RGB32);
         interior.save(output.filePath("rendering-lit-interior.png"));
         float largestStep = 0, lastSecond = 0;

@@ -68,6 +68,18 @@ Settings flow through these files:
 - Player format, now v21 for clear coat: `Engine/World/PlayableScene.*`
 - Player `View`: `Player/PlayerRender.h`, which must stay a multiple of 16 bytes for D3D11
 
+## Status (2026-11-26, early morning)
+Read the playbook's section 10.0.5 for the next 10 hours (pending items listed there); 10.0.3 and 10.0.4 record what was done overnight.
+
+**What changed overnight:**
+- **Probe GI is on by default** (`WorldScene.cpp`; projects can still turn it off). The editor's stall walking into a lit room was a use-after-free: QVulkanWindow's frame slots do not wait for the GPU, so freeing a probe trace when its slot moved on let a frame in flight read freed buffers (NVIDIA timeouts, a black frame). Replaced traces now wait in `LiveViewport` `retiredProbeTraces_`. Cost about 2 ms p95 on the street with R3 lighting (14.3 ms) and with fog and mist (14.6 ms).
+- **Reflection-direction sky occlusion** (`Shading.glsl` `skyOpenness` returns a second share for the reflection lobe): the street corner's cast shadow is no longer lit by the reflection of the low sun's glow. Realism 95.4, FLIP 0.0463.
+- **R4.6** Player cell streaming on dense content (detailed district, 13.6–13.8 ms p95 streamed against 22 ms resident, 575–597 MiB committed against 700–745); **R4.7** combined check and the GTX 1650 realism review are recorded in the roadmap; the cluster LOD hierarchy is built offline (`ClusterLod.h`), not yet drawn.
+- **Debug tools:** `WORLDFORGE_FRAME_LOG=<file>` (editor per-frame times and probe refreshes), `WORLDFORGE_PROBE_DUMP=<folder>` with `WorldForgeProbeTests --replay <file>` (time a recorded probe refresh), `WORLDFORGE_AUDIT_WALK_LOG` (frame log of the rendering audit's room walk).
+- **ctest:** `WorldForge.EditorAudit` is the full audit (about 540–630 s) and always exceeds its 360 s limit; run it on its own. The other nine pass.
+
+**Checks:** realism 95.4, rendering 62/62, R3 performance 4/4, ctest 9/9 (without the full audit), full audit 1376 PASS with probe GI on by default (535 s, no GPU timeouts).
+
 ## Status (2026-11-25, day)
 Read the playbook's section 10.0.3 for the next 10 hours (pending items listed there) and 10.0.4 for the 10 after.
 

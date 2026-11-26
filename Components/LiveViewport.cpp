@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <map>
 #include <utility>
@@ -2357,6 +2358,7 @@ public:
         fogVolume_.destroy();
         cullBatches_.clear();
         probeFrames_.clear();
+        retiredProbeTraces_.clear();
         probeField_.clear();
         for (auto &frame : frames_)
             destroy(frame);
@@ -2438,6 +2440,32 @@ public:
 
     void startNextFrame() override
     {
+        // WORLDFORGE_FRAME_LOG=<file> appends one line per frame: milliseconds since the previous frame started, spent
+        // in this function, and the probe field's refresh (triangles traced, -1 when it did not refresh).
+        const QString frameLog = qEnvironmentVariable("WORLDFORGE_FRAME_LOG");
+        struct FrameLog {
+            const QString &path;
+            QElapsedTimer inside;
+            int &probeTriangles;
+            static QElapsedTimer &between() { static QElapsedTimer timer; return timer; }
+            FrameLog(const QString &file,int &triangles) : path(file), probeTriangles(triangles)
+            {
+                inside.start();
+                probeTriangles = -1;
+            }
+            ~FrameLog()
+            {
+                if (path.isEmpty())
+                    return;
+                auto &timer = between();
+                const double interval = timer.isValid() ? double(timer.nsecsElapsed())/1e6 : 0.0;
+                timer.start();
+                QFile file(path);
+                if (file.open(QIODevice::Append | QIODevice::Text))
+                    file.write(QString("%1 %2 %3\n").arg(interval,0,'f',2).arg(double(inside.nsecsElapsed())/1e6,0,'f',2)
+                                   .arg(probeTriangles).toUtf8());
+            }
+        } logFrame(frameLog,loggedProbeTriangles_);
         auto &geometry = window_.geometry();
         if (!window_.framed_ && geometry.hasBounds)
             window_.frame();
@@ -2630,6 +2658,7 @@ public:
                 }
             });
             probeField_.update(frame_.device(),command,surfaces);
+            loggedProbeTriangles_ = int(surfaces.size());
         }
         lighting.probeGrid = probeField_.grid();
         lighting.probeGridCoarse = probeField_.coarseGrid();
@@ -2645,6 +2674,17 @@ public:
         lighting.probeSettings[3] = fogVolumeNeeded
             ? wf::vk::FogVolume::reach(cascades.scales[3][2],viewerPosition,lighting.fogCenterRadius) : 0.0f;
         auto &probeFrame = probeFrames_[std::size_t(frameIndex)];
+        // A trace this slot no longer uses can still be read by frames on the GPU: QVulkanWindow's frame slots do not
+        // wait for the commands submitted with them (it waits per swap chain image), so freeing a trace when its slot
+        // moves on let shading read freed buffers, which faulted the GPU (driver timeouts, a black frame, the editor at
+        // two frames a second while probe GI refreshed). Keep each replaced trace for a few frames more than can be
+        // in flight.
+        ++probeFrameCount_;
+        if (probeFrame && probeFrame != probeField_.trace())
+            retiredProbeTraces_.emplace_back(probeFrame,probeFrameCount_);
+        const auto inFlight = std::uint64_t(window_.swapChainImageCount()+window_.concurrentFrameCount()+1);
+        while (!retiredProbeTraces_.empty() && probeFrameCount_-retiredProbeTraces_.front().second > inFlight)
+            retiredProbeTraces_.pop_front();
         probeFrame = probeField_.trace();
         lighting_.bindProbes(frameIndex,probeFrame ? probeFrame->output().buffer : VK_NULL_HANDLE,
                             probeFrame ? probeFrame->output().size : 0);
@@ -3236,6 +3276,7 @@ private:
     WorldLightingVulkan lighting_;
     ViewportFrameVulkan frame_;
     wf::vk::ProbeField probeField_;
+    int loggedProbeTriangles_ = -1; // WORLDFORGE_FRAME_LOG: triangles of this frame's probe refresh
     wf::vk::DrawCulling drawCulling_;
     wf::vk::OcclusionDepth occlusionDepth_;
     wf::vk::FogVolume fogVolume_;
@@ -3243,6 +3284,9 @@ private:
     quint64 cullRevision_ = 0;
     bool culledWithGlass_ = false;
     std::vector<std::shared_ptr<const wf::vk::ProbeTrace>> probeFrames_;
+    // Traces replaced in a slot, with the frame they were replaced on, kept until no frame in flight can read them.
+    std::deque<std::pair<std::shared_ptr<const wf::vk::ProbeTrace>,std::uint64_t>> retiredProbeTraces_;
+    std::uint64_t probeFrameCount_ = 0;
     bool probeCompute_ = false;
     std::vector<Buffer> frames_;
     // Per frame, the previous frame's vertex positions (uploadMotion), and the triangles' positions as last rendered.
