@@ -317,6 +317,8 @@ On the GTX 1650, the 5.5-second street mission with R3 lighting and physical hei
 
     Every route but the fully resident detailed district fits the 16.7 ms budget; streaming brings that one under it.
 
+    **2026-11-26 07:10:** with the Player's vertices in device-local memory (playbook 10.0.5 block 2) the fully resident detailed district runs at 13.3 ms p95 (worst about 20 ms) in the same session that measured 22.1 ms the old way, so it now fits the budget without streaming too; the streamed laps run at 12.2–13.3 ms p95.
+
 The Living City can't be built without this stage.
 
 ### R5: High-end tier (RTX-class GPU)

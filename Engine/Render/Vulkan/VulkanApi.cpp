@@ -124,6 +124,26 @@ bool Buffer::create(const Device &device,VkDeviceSize bytes,VkBufferUsageFlags u
     return true;
 }
 
+bool Buffer::createDeviceLocal(const Device &device,VkDeviceSize bytes,VkBufferUsageFlags usage)
+{
+    const auto &vk = *device.api;
+    const VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,nullptr,0,bytes,usage,
+        VK_SHARING_MODE_EXCLUSIVE,0,nullptr};
+    if (vk.vkCreateBuffer(device.device,&info,nullptr,&buffer) != VK_SUCCESS)
+        return false;
+    VkMemoryRequirements requirements{};
+    vk.vkGetBufferMemoryRequirements(device.device,buffer,&requirements);
+    const auto type = device.memoryType(requirements.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,nullptr,requirements.size,type};
+    if (type == device.memory.memoryTypeCount || vk.vkAllocateMemory(device.device,&allocation,nullptr,&memory) != VK_SUCCESS
+        || vk.vkBindBufferMemory(device.device,buffer,memory,0) != VK_SUCCESS) {
+        destroy(device);
+        return false;
+    }
+    size = bytes;
+    return true;
+}
+
 void Buffer::destroy(const Device &device)
 {
     if (!device.api)

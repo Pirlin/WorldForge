@@ -15,6 +15,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <cstdint>
 #include <cstring>
@@ -367,6 +368,17 @@ private:
     std::array<vk::Buffer,3> vertexRing_;
     std::array<std::size_t,3> ringCounts_{};
     std::array<std::size_t,3> ringCachedMeshVertices_{};
+    // Device-local mirrors of the ring, which the passes draw from: host-visible memory on a discrete GPU is system
+    // memory, so every pass (the scene, each shadow cascade, point shadows) fetched every vertex over PCIe. Each frame
+    // copies to its mirror only what prepare() wrote to its ring buffer (pendingVertexCopies_), so static geometry
+    // crosses the bus once per ring buffer. WORLDFORGE_HOST_VERTICES=1 draws from the ring itself, to compare.
+    std::array<vk::Buffer,3> deviceRing_;
+    std::vector<VkBufferCopy> pendingVertexCopies_;
+    const bool hostVertices_ = [] { const char *value = std::getenv("WORLDFORGE_HOST_VERTICES"); return value && value[0] == '1'; }();
+    VkBuffer vertexBuffer(std::size_t index) const
+    {
+        return deviceRing_[index].buffer ? deviceRing_[index].buffer : vertexRing_[index].buffer;
+    }
     std::size_t ring_ = 0;
     bool vertexMotion_ = true;
     RenderStats stats_; // what the last recorded frame submitted (stats)
@@ -1265,7 +1277,7 @@ void VulkanRenderer::prepareMeshlets(Frame &frame,std::span<const PlayVertex> ve
     frame.meshletsBound = true;
     if (meshletData_.buffer) {
         const VkDescriptorBufferInfo storage[]{{meshletData_.buffer,0,meshletData_.size},
-            {vertexRing_[ring_].buffer,0,view.cachedMeshVertices*sizeof(PlayVertex)}};
+            {vertexBuffer(ring_),0,view.cachedMeshVertices*sizeof(PlayVertex)}};
         const VkWriteDescriptorSet writes[]{
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,10,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&storage[0],nullptr},
             {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,11,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,nullptr,&storage[1],nullptr}};
@@ -1278,20 +1290,37 @@ bool VulkanRenderer::prepare(Frame &frame,const std::vector<PlayVertex> &vertice
     const auto bytes = VkDeviceSize(vertices.size()*sizeof(PlayVertex));
     if (bytes > 240000000)
         return false;
+    // Copies prepared for a frame that was never recorded: that mirror missed them, so it is copied whole next time.
+    if (!pendingVertexCopies_.empty()) {
+        ringCachedMeshVertices_[ring_] = std::numeric_limits<std::size_t>::max();
+        pendingVertexCopies_.clear();
+    }
     // The next buffer in the ring (vertexRing_); the one before it holds the previous frame's positions.
     ring_ = (ring_+1)%vertexRing_.size();
     auto &buffer = vertexRing_[ring_];
     // Always at least a little, so the scene pipeline has a buffer to bind.
+    auto &mirror = deviceRing_[ring_];
     if (bytes > buffer.size || !buffer.buffer) {
         buffer.destroy(device_);
+        mirror.destroy(device_);
         ringCachedMeshVertices_[ring_] = 0;
         const VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | (meshScene_ ? uint32_t(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) : 0u);
-        if (!buffer.create(device_,std::max<VkDeviceSize>(bytes+bytes/4,4096),usage))
+        // Half again as much, so a streamed scene reaching a new peak of resident cells rarely reallocates (each
+        // reallocation now costs the ring buffer and its mirror).
+        const auto capacity = std::max<VkDeviceSize>(bytes+bytes/2,4096);
+        if (!buffer.create(device_,capacity,usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
             return false;
+        // Without a mirror (out of video memory, or WORLDFORGE_HOST_VERTICES) the passes read the ring buffer.
+        if (!hostVertices_ && !mirror.createDeviceLocal(device_,capacity,usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+            mirror = {};
     }
+    pendingVertexCopies_.clear();
     const auto upload = [&](std::size_t first,std::size_t count) {
-        if (count)
-            std::memcpy(static_cast<PlayVertex *>(buffer.mapped)+first,vertices.data()+first,count*sizeof(PlayVertex));
+        if (!count)
+            return;
+        std::memcpy(static_cast<PlayVertex *>(buffer.mapped)+first,vertices.data()+first,count*sizeof(PlayVertex));
+        if (mirror.buffer)
+            pendingVertexCopies_.push_back({first*sizeof(PlayVertex),first*sizeof(PlayVertex),count*sizeof(PlayVertex)});
     };
     if (view.movingVertices && view.cachedMeshVertices == ringCachedMeshVertices_[ring_]) {
         for (const auto &range : *view.movingVertices)
@@ -1494,9 +1523,20 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
     const VkWriteDescriptorSet previousWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,nullptr,frame.set,8,0,1,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&previousFrame,nullptr,nullptr};
     api_.vkUpdateDescriptorSets(device,1,&previousWrite,0,nullptr);
+    // What prepare() wrote to this frame's ring buffer, copied to its device-local mirror before any pass draws.
+    if (!pendingVertexCopies_.empty() && deviceRing_[ring_].buffer) {
+        api_.vkCmdCopyBuffer(frame.command,vertexRing_[ring_].buffer,deviceRing_[ring_].buffer,
+                             uint32_t(pendingVertexCopies_.size()),pendingVertexCopies_.data());
+        const VkMemoryBarrier copied{VK_STRUCTURE_TYPE_MEMORY_BARRIER,nullptr,VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+        api_.vkCmdPipelineBarrier(frame.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&copied,
+                                  0,nullptr,0,nullptr);
+        pendingVertexCopies_.clear();
+    }
     updateProbes(frame,vertices,ranges,view);
     const auto command = frame.command;
     const VkDeviceSize offset = 0;
+    const VkBuffer vertexSource = vertexBuffer(ring_);
     const auto vertexCount = vertices.size();
     const bool transparencyAvailable = glassTransmission_ && glassRadiance_;
     const auto isTransparent = [transparencyAvailable](const DrawRange &range) {
@@ -1541,7 +1581,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         if (ranges.size() >= 128 && occlusionDepth_.begin(command,slot,size,target.depthFormat(),shadowPass_)) {
             const auto seeds = vk::occlusionSeeds(cullBatches_,drawCulling_.commands(slot,0),matrices[0],{view.eye.x,view.eye.y,view.eye.z});
             api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline_);
-            api_.vkCmdBindVertexBuffers(command,0,1,&vertexRing_[ring_].buffer,&offset);
+            api_.vkCmdBindVertexBuffers(command,0,1,&vertexSource,&offset);
             CameraConstants seedCamera{};
             seedCamera.matrix = camera;
             seedCamera.eye.w = view.lighting.z;
@@ -1576,7 +1616,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
     api_.vkCmdBeginRenderPass(command,&shadowBegin,VK_SUBPASS_CONTENTS_INLINE);
     if (view.lighting.y > 0 && vertexCount) {
         api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline_);
-        api_.vkCmdBindVertexBuffers(command,0,1,&vertexRing_[ring_].buffer,&offset);
+        api_.vkCmdBindVertexBuffers(command,0,1,&vertexSource,&offset);
         // One tile of the atlas per cascade.
         for (int cascade = 0; cascade < shadow::cascadeCount; ++cascade) {
             const auto origin = shadow::tileOrigin(cascade);
@@ -1610,7 +1650,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         api_.vkCmdBeginRenderPass(command,&skyBegin,VK_SUBPASS_CONTENTS_INLINE);
         if (view.skyRefresh && vertexCount) {
             api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline_);
-            api_.vkCmdBindVertexBuffers(command,0,1,&vertexRing_[ring_].buffer,&offset);
+            api_.vkCmdBindVertexBuffers(command,0,1,&vertexSource,&offset);
             for (int direction = 0; direction < sky::directionCount; ++direction) {
                 const auto origin = sky::tileOrigin(direction);
                 const VkViewport viewport{float(origin[0]),float(origin[1]),float(sky::tileSize),float(sky::tileSize),0,1};
@@ -1685,7 +1725,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         };
         if (vertexCount && !clusters_.shadowed.empty()) {
             api_.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,shadowPipeline_);
-            api_.vkCmdBindVertexBuffers(command,0,1,&vertexRing_[ring_].buffer,&offset);
+            api_.vkCmdBindVertexBuffers(command,0,1,&vertexSource,&offset);
             for (std::size_t tile = 0; tile < clusters_.shadowed.size()*6; ++tile) {
                 if (!clearAll && !dirtySlots[tile/6])
                     continue;
@@ -1791,7 +1831,7 @@ void VulkanRenderer::record(Frame &frame,vk::HdrFrame &target,std::size_t output
         // Binding 1: the previous frame's buffer as each vertex's previous position, when it holds the same vertices.
         const std::size_t previous = (ring_+vertexRing_.size()-1)%vertexRing_.size();
         const bool moving = vertexMotion_ && vertexRing_[previous].buffer && ringCounts_[previous] == vertexCount;
-        const VkBuffer buffers[]{vertexRing_[ring_].buffer,moving ? vertexRing_[previous].buffer : vertexRing_[ring_].buffer};
+        const VkBuffer buffers[]{vertexBuffer(ring_),moving ? vertexBuffer(previous) : vertexBuffer(ring_)};
         const VkDeviceSize offsets[]{0,0};
         api_.vkCmdBindVertexBuffers(command,0,2,buffers,offsets);
         if (frame.meshletsBound)
@@ -2077,8 +2117,9 @@ void VulkanRenderer::release()
         api_.vkDeviceWaitIdle(device);
         destroySwapchain();
         frame_.destroy();
-        for (auto &buffer : vertexRing_)
-            buffer.destroy(device_);
+        for (auto *ring : {&vertexRing_,&deviceRing_})
+            for (auto &buffer : *ring)
+                buffer.destroy(device_);
         meshletIndices_.destroy(device_);
         meshletData_.destroy(device_);
         ringCounts_ = {};

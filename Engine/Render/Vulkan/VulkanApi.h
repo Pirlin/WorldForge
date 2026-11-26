@@ -43,7 +43,7 @@ namespace worldforge::vk {
     X(vkCmdClearAttachments) \
     X(vkCmdPushConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawIndirect) X(vkCmdDrawIndirectCountKHR) X(vkCmdDispatch) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdPipelineBarrier) \
-    X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) \
+    X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) \
     X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 struct Api {
@@ -88,6 +88,8 @@ struct Buffer {
 
     // Host-visible, coherent and persistently mapped.
     bool create(const Device &device,VkDeviceSize bytes,VkBufferUsageFlags usage);
+    // Device-local and not mapped: filled by copies on the GPU.
+    bool createDeviceLocal(const Device &device,VkDeviceSize bytes,VkBufferUsageFlags usage);
     void destroy(const Device &device);
 };
 
