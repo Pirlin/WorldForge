@@ -440,6 +440,11 @@ The user wants the work to keep going without them. Same rules as 10.0.3: each b
 4. **Near-street and curb realism (about 1 h).** Find why the near street (bottom rows of the street corner and the shop front) differs from Cycles: texture filtering, the normal at grazing view, or the bright curb faces (shadow-map bias on short vertical faces is a suspect). Keep only changes that improve or hold all four views.
 5. **Docs and a combined run (about 1 h):** roadmap, handoff and this playbook; ctest, rendering, realism, street, the district modes and the full audit.
 
+**Where 10.0.5 stands (2026-11-26 08:00):** blocks 1 and 2 are done (2 in the Player only), plus editor frame-slot fences (block 1 follow-up). Last combined results, all on `954c304` or later: rendering 62/62, R3 performance 4/4, district cells 12/12 twice, realism 95.4, ctest 9/9, full audit 1375 PASS with no failures and no GPU timeouts. Next, in order:
+1. Block 3, runtime cluster LOD, now on device-local vertices; it still needs an index buffer (the mirrors hold vertices only).
+2. Editor geometry that stays put: `cameraChanged()` marks geometry dirty on every camera move in scenes with terrain or LOD, so the editor re-uploads everything each frame. Split terrain and LOD into their own ranges updated alone; then mirror the editor's vertices in device memory as the Player does (tried and reverted: 12.1 → 15.3 ms median in the room walk while every frame re-uploads).
+3. Block 4, near-street and curb realism.
+
 ### 10.1 Immediately
 
 - [ ] **Commit the uncommitted work if it is still uncommitted** (git status). It consists of:
