@@ -2264,6 +2264,12 @@ public:
         if (window_.owner_.rendererName().isEmpty())
             window_.owner_.setRenderDevice(QString::fromUtf8(window_.physicalDeviceProperties()->deviceName), {}, 0, 0);
         frames_.resize(window_.concurrentFrameCount());
+        slotFences_.assign(std::size_t(window_.concurrentFrameCount()),VK_NULL_HANDLE);
+        for (auto &fence : slotFences_) {
+            const VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,nullptr,VK_FENCE_CREATE_SIGNALED_BIT};
+            vk_->vkCreateFence(device_,&info,nullptr,&fence);
+        }
+        previousSlot_ = -1;
         probeFrames_.resize(window_.concurrentFrameCount());
         motionFrames_.resize(window_.concurrentFrameCount());
         motionValid_ = false;
@@ -2353,6 +2359,13 @@ public:
     }
     void releaseResources() override
     {
+        for (auto fence : slotFences_)
+            if (fence) {
+                vk_->vkWaitForFences(device_,1,&fence,VK_TRUE,UINT64_MAX);
+                vk_->vkDestroyFence(device_,fence,nullptr);
+            }
+        slotFences_.clear();
+        previousSlot_ = -1;
         drawCulling_.destroy();
         occlusionDepth_.destroy();
         fogVolume_.destroy();
@@ -2466,6 +2479,22 @@ public:
                                    .arg(probeTriangles).toUtf8());
             }
         } logFrame(frameLog,loggedProbeTriangles_);
+        // QVulkanWindow's per-frame fence only waits for the swap chain image to be acquired, not for the commands last
+        // submitted with this frame slot, so the GPU can still be reading this slot's buffers (uniforms, clusters,
+        // vertices, probe traces) when the slot comes round again. Mark the end of the previous frame's work with an
+        // empty submission and its own fence, and wait for this slot's before touching its resources.
+        const int slot = window_.currentFrame();
+        if (previousSlot_ >= 0 && std::size_t(previousSlot_) < slotFences_.size() && slotFences_[std::size_t(previousSlot_)]) {
+            auto fence = slotFences_[std::size_t(previousSlot_)];
+            vk_->vkResetFences(device_,1,&fence);
+            const VkSubmitInfo marker{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            vk_->vkQueueSubmit(window_.graphicsQueue(),1,&marker,fence);
+        }
+        if (std::size_t(slot) < slotFences_.size() && slotFences_[std::size_t(slot)]) {
+            auto fence = slotFences_[std::size_t(slot)];
+            vk_->vkWaitForFences(device_,1,&fence,VK_TRUE,UINT64_MAX);
+        }
+        previousSlot_ = slot;
         auto &geometry = window_.geometry();
         if (!window_.framed_ && geometry.hasBounds)
             window_.frame();
@@ -2674,11 +2703,10 @@ public:
         lighting.probeSettings[3] = fogVolumeNeeded
             ? wf::vk::FogVolume::reach(cascades.scales[3][2],viewerPosition,lighting.fogCenterRadius) : 0.0f;
         auto &probeFrame = probeFrames_[std::size_t(frameIndex)];
-        // A trace this slot no longer uses can still be read by frames on the GPU: QVulkanWindow's frame slots do not
-        // wait for the commands submitted with them (it waits per swap chain image), so freeing a trace when its slot
-        // moves on let shading read freed buffers, which faulted the GPU (driver timeouts, a black frame, the editor at
-        // two frames a second while probe GI refreshed). Keep each replaced trace for a few frames more than can be
-        // in flight.
+        // Freeing a trace as soon as its slot moved on once let shading read freed buffers, which faulted the GPU
+        // (driver timeouts, a black frame, the editor at two frames a second while probe GI refreshed): QVulkanWindow's
+        // slots did not wait for the GPU. The slot fences above now do; replaced traces are still kept a few frames
+        // longer than can be in flight, as a second guard for the buffers shading reads.
         ++probeFrameCount_;
         if (probeFrame && probeFrame != probeField_.trace())
             retiredProbeTraces_.emplace_back(probeFrame,probeFrameCount_);
@@ -3277,6 +3305,9 @@ private:
     ViewportFrameVulkan frame_;
     wf::vk::ProbeField probeField_;
     int loggedProbeTriangles_ = -1; // WORLDFORGE_FRAME_LOG: triangles of this frame's probe refresh
+    // One fence per frame slot, signaled once the GPU has finished the frame last recorded in that slot (startNextFrame).
+    std::vector<VkFence> slotFences_;
+    int previousSlot_ = -1;
     wf::vk::DrawCulling drawCulling_;
     wf::vk::OcclusionDepth occlusionDepth_;
     wf::vk::FogVolume fogVolume_;
